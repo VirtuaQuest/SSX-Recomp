@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(AnarchyReignsRecomp CXX C)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "The recompiled code requires Clang (clang-cl on Windows).")
+endif()
+
+# XenonRecomp provides the recompiler, XenonUtils (XEX loading) and shared third party libraries.
+set(XENONRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../XenonRecomp" CACHE PATH "Path to the XenonRecomp checkout")
+add_subdirectory(${XENONRECOMP_ROOT} XenonRecomp EXCLUDE_FROM_ALL)
+
+add_library(o1heap STATIC "thirdparty/o1heap/o1heap.c")
+target_include_directories(o1heap PUBLIC "thirdparty/o1heap")
+# o1heap counts leading zeros of size_t with __builtin_clzl by default, which is 32 bit on Windows.
+target_compile_definitions(o1heap PRIVATE O1HEAP_CLZ=__builtin_clzll)
+
+add_subdirectory(ARRecompLib)
+add_subdirectory(ARRecomp)

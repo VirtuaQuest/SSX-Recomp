@@ -1,0 +1,20 @@
+# XenonRecomp configuration for Anarchy Reigns (Xbox 360).
+[main]
+file_path = "../private/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "AR_switch_tables.toml"
+
+# Register save/restore helpers, found with the byte patterns from the XenonRecomp README (each matched once).
+restgprlr_14_address = 0x8244ABA0
+savegprlr_14_address = 0x8244AB50
+restfpr_14_address = 0x8244B2BC
+savefpr_14_address = 0x8244B270
+restvmx_14_address = 0x8244B808
+savevmx_14_address = 0x8244B570
+restvmx_64_address = 0x8244B89C
+savevmx_64_address = 0x8244B604
+
+# setjmp/longjmp are redirected to native implementations. longjmp restores f14-f31, r13-r31, v64-v127, lr, cr and
+# r1 from the jmp_buf and is one of the two callers of RtlUnwind; setjmp is the only function saving that layout.
+longjmp_address = 0x825664C0
+setjmp_address = 0x82566900

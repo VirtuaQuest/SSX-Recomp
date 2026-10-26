@@ -1,0 +1,7 @@
+# Game data and anything generated from it must never be committed.
+ARRecompLib/private/*
+!ARRecompLib/private/.gitkeep
+ARRecompLib/ppc/
+out/
+run/
+user/
