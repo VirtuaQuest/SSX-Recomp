@@ -17,6 +17,7 @@ target_precompile_headers(ARRecompLib PRIVATE "ppc/ppc_recomp_shared.h")
 
 # Guest code relies on exact floating point behavior and type punning through memory.
 target_compile_options(ARRecompLib PRIVATE
+    "/FI${CMAKE_CURRENT_SOURCE_DIR}/ar_memory.h"
     -march=sandybridge
     -fno-strict-aliasing
     /fp:strict

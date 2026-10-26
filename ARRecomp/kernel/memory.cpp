@@ -18,11 +18,14 @@ static uint8_t* ReserveGuestMemory()
     if (virtualAlloc2 == nullptr || mapViewOfFile3 == nullptr)
         return nullptr;
 
+    // One extra 64 KB block past 4 GB, as accesses at the top of the 0xE0000000 view land up to 4 KB past it.
+    constexpr uint64_t RESERVED_SIZE = PPC_MEMORY_SIZE + 0x10000;
+
     HANDLE process = GetCurrentProcess();
     uint8_t* reserved = nullptr;
     for (void* preferred : { (void*)0x100000000ull, (void*)nullptr })
     {
-        reserved = (uint8_t*)virtualAlloc2(process, preferred, PPC_MEMORY_SIZE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        reserved = (uint8_t*)virtualAlloc2(process, preferred, RESERVED_SIZE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
         if (reserved != nullptr)
             break;
     }
@@ -36,6 +39,7 @@ static uint8_t* ReserveGuestMemory()
     VirtualFree(reserved, physicalViews[0], MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
     VirtualFree(reserved + physicalViews[0], GUEST_PHYSICAL_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
     VirtualFree(reserved + physicalViews[1], GUEST_PHYSICAL_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    VirtualFree(reserved + physicalViews[2], GUEST_PHYSICAL_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
 
     if (virtualAlloc2(process, reserved, physicalViews[0], MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr)
         return nullptr;
@@ -49,6 +53,10 @@ static uint8_t* ReserveGuestMemory()
         if (mapViewOfFile3(section, process, reserved + view, 0, GUEST_PHYSICAL_SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr)
             return nullptr;
     }
+
+    // Past the end, physical addresses wrap around.
+    if (mapViewOfFile3(section, process, reserved + PPC_MEMORY_SIZE, 0, 0x10000, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr)
+        return nullptr;
 
     return reserved;
 }

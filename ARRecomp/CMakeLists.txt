@@ -17,9 +17,13 @@ target_link_libraries(ARRecomp PRIVATE
     fmt::fmt
     o1heap
     winmm
+    xinput
+    xaudio2
+    ole32
     dbghelp)
 
 target_compile_options(ARRecomp PRIVATE
+    "/FI${CMAKE_SOURCE_DIR}/ARRecompLib/ar_memory.h"
     -march=sandybridge
     -fno-strict-aliasing
     /EHsc

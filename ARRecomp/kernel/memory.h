@@ -12,7 +12,8 @@
 //   0xC0000000 - 0xE0000000  physical memory, 16 MB pages
 //   0xE0000000 - 0x100000000 physical memory, 4 KB pages
 //
-// The three physical views map the same 512 MB of physical memory, like on the console.
+// The three physical views map the same 512 MB of physical memory, like on the console. Accesses at 0xE0000000
+// and above are moved up by 4 KB (see ARRecompLib/ar_memory.h) to emulate that view's offset.
 
 constexpr uint32_t GUEST_RUNTIME_HEAP_BEGIN = 0x00010000;
 constexpr uint32_t GUEST_RUNTIME_HEAP_END = 0x40000000;
@@ -28,7 +29,7 @@ struct Memory
 
     bool IsInMemoryRange(const void* host) const noexcept
     {
-        return host >= base && host < (base + PPC_MEMORY_SIZE);
+        return host >= base && host < (base + PPC_MEMORY_SIZE + 0x1000);
     }
 
     void* Translate(size_t offset) const noexcept
@@ -36,7 +37,7 @@ struct Memory
         if (offset)
             assert(offset < PPC_MEMORY_SIZE);
 
-        return base + offset;
+        return base + PPCHostOffset(uint32_t(offset));
     }
 
     template<typename T>
@@ -50,7 +51,9 @@ struct Memory
         if (host)
             assert(IsInMemoryRange(host));
 
-        return static_cast<uint32_t>(static_cast<const uint8_t*>(host) - base);
+        // Inverse of PPCHostOffset: host memory from 0xE0001000 up belongs to guest addresses 4 KB lower.
+        uint64_t offset = uint64_t(static_cast<const uint8_t*>(host) - base);
+        return static_cast<uint32_t>(offset >= 0xE0001000ull ? offset - 0x1000 : offset);
     }
 
     PPCFunc* FindFunction(uint32_t guest) const noexcept
@@ -113,21 +116,25 @@ inline bool IsPhysicalAddress(uint32_t address)
     return address >= PHYSICAL_VIEW_64K;
 }
 
-// Offset of a physical view address in the physical memory backing, as used by g_physicalAllocator.
-inline uint32_t PhysicalMemoryOffset(uint32_t address)
-{
-    return address & (GUEST_PHYSICAL_SIZE - 1);
-}
-
-// Physical memory as the hardware sees it. The 4 KB page view at 0xE0000000 is offset by 4 KB on the console:
-// virtual 0xE0000000 + X is physical X + 0x1000, and titles compute GPU addresses with that rule. Host views must
-// be 64 KB aligned, so the offset is applied in these translations instead: allocations in that view are tracked
-// (with a guard page after each, keeping translations unambiguous).
+// Physical memory allocation in one of the views; returns the virtual address.
 uint32_t AllocatePhysicalMemory(uint32_t size, uint32_t alignment, uint32_t view, uint32_t protect, bool topDown);
 void FreePhysicalMemory(uint32_t address);
 
-// Virtual address in a physical view to the address the GPU and DMA engines use.
-uint32_t VirtualToPhysical(uint32_t address);
+// Virtual address in a physical view to the physical address, as used by the GPU and DMA engines.
+inline uint32_t VirtualToPhysical(uint32_t address)
+{
+    if (!IsPhysicalAddress(address))
+        return address;
 
-// GPU address to a virtual address the host can access.
-uint32_t PhysicalToVirtual(uint32_t physical);
+    uint32_t physical = address & (GUEST_PHYSICAL_SIZE - 1);
+    if (address >= PHYSICAL_VIEW_4K)
+        physical = (physical + 0x1000) & (GUEST_PHYSICAL_SIZE - 1);
+
+    return physical;
+}
+
+// Physical address to a virtual address in the 64 KB page view, which maps physical memory without an offset.
+inline uint32_t PhysicalToVirtual(uint32_t physical)
+{
+    return PHYSICAL_VIEW_64K + (physical & (GUEST_PHYSICAL_SIZE - 1));
+}

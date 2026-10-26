@@ -58,7 +58,7 @@ struct ArgTranslator
             }
         }
 
-        return *reinterpret_cast<be<uint32_t>*>(base + ctx.r1.u32 + 0x54 + ((arg - 8) * 8));
+        return *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(ctx.r1.u32 + 0x54 + ((arg - 8) * 8)));
     }
 
     static double GetPrecisionArgumentValue(const PPCContext& ctx, uint8_t* base, size_t arg) noexcept
@@ -151,7 +151,7 @@ struct ArgTranslator
             return nullptr;
         }
 
-        return reinterpret_cast<T>(base + static_cast<uint32_t>(v));
+        return reinterpret_cast<T>(g_memory.Translate(static_cast<uint32_t>(v)));
     }
 
     template<typename T>
@@ -290,7 +290,7 @@ PPC_FUNC(HostToGuestFunction)
         {
             if (v != nullptr)
             {
-                ctx.r3.u64 = static_cast<uint32_t>(reinterpret_cast<size_t>(v) - reinterpret_cast<size_t>(base));
+                ctx.r3.u64 = g_memory.MapVirtual(v);
             }
             else
             {

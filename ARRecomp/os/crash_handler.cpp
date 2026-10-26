@@ -47,7 +47,16 @@ static void PrintStack(HANDLE thread, CONTEXT context, int maxFrames)
         DWORD64 displacement = 0;
 
         if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol))
-            fmt::print(stderr, "  #{:2} {}+0x{:X}\n", i, symbol->Name, displacement);
+        {
+            // The line in the generated code identifies the guest instruction (each one is preceded by a comment).
+            IMAGEHLP_LINE64 line{};
+            line.SizeOfStruct = sizeof(line);
+            DWORD lineDisplacement = 0;
+            if (SymGetLineFromAddr64(process, frame.AddrPC.Offset, &lineDisplacement, &line))
+                fmt::print(stderr, "  #{:2} {}+0x{:X} ({}:{})\n", i, symbol->Name, displacement, std::filesystem::path(line.FileName).filename().string(), line.LineNumber);
+            else
+                fmt::print(stderr, "  #{:2} {}+0x{:X}\n", i, symbol->Name, displacement);
+        }
         else
             fmt::print(stderr, "  #{:2} 0x{:X}\n", i, frame.AddrPC.Offset);
     }
@@ -97,8 +106,18 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* info)
     {
         fmt::print(stderr, "     guest r1 0x{:08X} r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} lr 0x{:08X}\n",
             ctx->r1.u32, ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, uint32_t(ctx->lr));
-        fmt::print(stderr, "     guest r26 0x{:08X} r27 0x{:08X} r28 0x{:08X} r29 0x{:08X} r30 0x{:08X} r31 0x{:08X}\n",
-            ctx->r26.u32, ctx->r27.u32, ctx->r28.u32, ctx->r29.u32, ctx->r30.u32, ctx->r31.u32);
+        // The context does not store the registers in order.
+        const PPCRegister* gprs[] = { &ctx->r0, &ctx->r1, &ctx->r2, &ctx->r3, &ctx->r4, &ctx->r5, &ctx->r6, &ctx->r7,
+            &ctx->r8, &ctx->r9, &ctx->r10, &ctx->r11, &ctx->r12, &ctx->r13, &ctx->r14, &ctx->r15, &ctx->r16, &ctx->r17,
+            &ctx->r18, &ctx->r19, &ctx->r20, &ctx->r21, &ctx->r22, &ctx->r23, &ctx->r24, &ctx->r25, &ctx->r26, &ctx->r27,
+            &ctx->r28, &ctx->r29, &ctx->r30, &ctx->r31 };
+        for (int row = 0; row < 32; row += 8)
+        {
+            fmt::print(stderr, "    ");
+            for (int i = row; i < row + 8; i++)
+                fmt::print(stderr, " r{:<2} {:08X}", i, gprs[i]->u32);
+            fmt::print(stderr, "\n");
+        }
     }
 
     PrintStack(GetCurrentThread(), *info->ContextRecord, 48);

@@ -2,6 +2,7 @@
 #include <stdafx.h>
 #include <kernel/imports.h>
 #include <kernel/vfs.h>
+#include <kernel/xam.h>
 #include <kernel/xex_loader.h>
 #include <xex.h>
 
@@ -77,12 +78,8 @@ struct ListenerObject : KernelObject
 static std::mutex g_listenersMutex;
 static std::vector<std::weak_ptr<ListenerObject>> g_listeners;
 
-constexpr uint32_t XN_SYS_UI = 0x00000009;
-constexpr uint32_t XN_SYS_SIGNINCHANGED = 0x0000000A;
-constexpr uint32_t XN_SYS_INPUTDEVICESCHANGED = 0x00000012;
-constexpr uint32_t XN_LIVE_CONNECTIONCHANGED = 0x02000001;
 
-static void PostNotification(uint32_t id, uint32_t parameter)
+void PostNotification(uint32_t id, uint32_t parameter)
 {
     std::lock_guard lock(g_listenersMutex);
     for (const auto& weak : g_listeners)
@@ -403,52 +400,6 @@ namespace imports
         return result;
     }
 
-    // ---- Input ----
-
-    // Until host input is connected, the first controller is reported as present and idle. The XAMINPUT structures
-    // in xbox.h mirror the host XInput layout, so multi-byte fields are byte swapped by hand.
-    uint32_t XamInputGetCapabilities(uint32_t userIndex, uint32_t flags, XAMINPUT_CAPABILITIES* capabilities)
-    {
-        if ((userIndex & 0xFF) != 0)
-            return X_ERROR_DEVICE_NOT_CONNECTED;
-
-        memset(capabilities, 0, sizeof(*capabilities));
-        capabilities->Type = XAMINPUT_DEVTYPE_GAMEPAD;
-        capabilities->SubType = XAMINPUT_DEVSUBTYPE_GAMEPAD;
-        capabilities->Gamepad.wButtons = ByteSwap(uint16_t(0xF3FF));
-        capabilities->Gamepad.bLeftTrigger = 0xFF;
-        capabilities->Gamepad.bRightTrigger = 0xFF;
-        capabilities->Gamepad.sThumbLX = int16_t(ByteSwap(uint16_t(0xFFC0)));
-        capabilities->Gamepad.sThumbLY = int16_t(ByteSwap(uint16_t(0xFFC0)));
-        capabilities->Gamepad.sThumbRX = int16_t(ByteSwap(uint16_t(0xFFC0)));
-        capabilities->Gamepad.sThumbRY = int16_t(ByteSwap(uint16_t(0xFFC0)));
-        capabilities->Vibration.wLeftMotorSpeed = 0xFFFF;
-        capabilities->Vibration.wRightMotorSpeed = 0xFFFF;
-        return X_ERROR_SUCCESS;
-    }
-
-    static std::atomic<uint32_t> g_inputPacket;
-
-    uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* state)
-    {
-        if ((userIndex & 0xFF) != 0)
-            return X_ERROR_DEVICE_NOT_CONNECTED;
-
-        memset(state, 0, sizeof(*state));
-        state->dwPacketNumber = ByteSwap(g_inputPacket.load());
-        return X_ERROR_SUCCESS;
-    }
-
-    uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION* vibration)
-    {
-        return (userIndex & 0xFF) == 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
-    }
-
-    uint32_t XamInputGetKeystrokeEx(be<uint32_t>* userIndex, uint32_t flags, uint8_t* keystroke)
-    {
-        return X_ERROR_EMPTY;
-    }
-
     // ---- Content ----
 
     uint32_t XamContentGetDeviceData(uint32_t deviceId, XDEVICE_DATA* data)
@@ -739,10 +690,6 @@ AR_IMPORT(XamUserReadProfileSettings);
 AR_IMPORT(XamUserCreateAchievementEnumerator);
 AR_IMPORT(XamUserCreateStatsEnumerator);
 AR_IMPORT(XamEnumerate);
-AR_IMPORT(XamInputGetCapabilities);
-AR_IMPORT(XamInputGetState);
-AR_IMPORT(XamInputSetState);
-AR_IMPORT(XamInputGetKeystrokeEx);
 AR_IMPORT(XamContentGetDeviceData);
 AR_IMPORT(XamContentCreateEnumerator);
 AR_IMPORT(XamContentCreateEx);

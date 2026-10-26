@@ -20,13 +20,16 @@ struct AllocationTarget
 {
     PageAllocator* allocator;
     uint32_t address;
-    uint32_t view; // Added back to physical addresses to form guest addresses.
+    uint32_t viewOffset; // Added to the allocator's addresses to form guest addresses.
 };
 
 static std::optional<AllocationTarget> FindTarget(uint32_t address)
 {
     if (IsPhysicalAddress(address))
-        return AllocationTarget{ &g_physicalAllocator, PhysicalMemoryOffset(address), address & 0xE0000000 };
+    {
+        uint32_t physical = VirtualToPhysical(address);
+        return AllocationTarget{ &g_physicalAllocator, physical, address - physical };
+    }
 
     if (g_virtualAllocator.Contains(address))
         return AllocationTarget{ &g_virtualAllocator, address, 0 };
@@ -128,9 +131,9 @@ namespace imports
         }
 
         info->baseAddress = baseAddress & ~0xFFFu;
-        info->allocationBase = region->base + target->view;
+        info->allocationBase = region->base + target->viewOffset;
         info->allocationProtect = region->protect;
-        info->regionSize = region->base + target->view + region->size - info->baseAddress;
+        info->regionSize = region->base + target->viewOffset + region->size - info->baseAddress;
         info->state = region->committed ? X_MEM_COMMIT : X_MEM_RESERVE;
         info->protect = region->protect;
         info->type = X_MEM_PRIVATE;
