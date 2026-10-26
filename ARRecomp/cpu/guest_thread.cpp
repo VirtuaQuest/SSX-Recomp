@@ -4,6 +4,8 @@
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 
+void PrintThreadStack(HANDLE thread, int maxFrames);
+
 TlsInfo g_tlsInfo;
 uint32_t g_defaultStackSize = 0x40000;
 
@@ -219,6 +221,48 @@ std::shared_ptr<ThreadObject> FindThreadById(uint32_t threadId)
 
     auto it = g_threads.find(threadId);
     return it != g_threads.end() ? it->second.lock() : nullptr;
+}
+
+void RecordImportCall(const char* name, uint32_t caller)
+{
+    if (auto* thread = t_currentThread.get())
+    {
+        thread->lastImport.store(name, std::memory_order_relaxed);
+        thread->lastImportCaller.store(caller, std::memory_order_relaxed);
+    }
+}
+
+void RecordWait(uint32_t object)
+{
+    if (auto* thread = t_currentThread.get())
+        thread->waitingOn.store(object, std::memory_order_relaxed);
+}
+
+void DumpGuestThreads()
+{
+    std::vector<std::shared_ptr<ThreadObject>> threads;
+    {
+        std::lock_guard lock(g_threadsMutex);
+        for (const auto& [id, weak] : g_threads)
+        {
+            if (auto thread = weak.lock())
+                threads.push_back(thread);
+        }
+    }
+
+    std::sort(threads.begin(), threads.end(), [](const auto& a, const auto& b) { return a->threadId < b->threadId; });
+    for (const auto& thread : threads)
+    {
+        const char* last = thread->lastImport.load();
+        uint32_t waiting = thread->waitingOn.load();
+        LOGF_INFO("thread {:3} start 0x{:08X}{}: last import {} from 0x{:08X}{}", thread->threadId, thread->params.startAddress,
+            thread->finished ? " (finished)" : "", last != nullptr ? last : "-", thread->lastImportCaller.load(),
+            waiting != 0 ? fmt::format(", waiting on 0x{:08X}", waiting) : "");
+
+        // Threads that are running guest code: show where.
+        if (!thread->finished && waiting == 0)
+            PrintThreadStack(thread->hostThread, 12);
+    }
 }
 
 std::shared_ptr<ThreadObject> FindThreadByKThread(uint32_t kthread)

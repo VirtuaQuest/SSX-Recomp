@@ -175,6 +175,10 @@ uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, 
 {
     const uint32_t thread = GetCurrentKThread();
 
+    // Record what is being waited on for diagnostics, cleared when the wait ends.
+    RecordWait(objects.empty() ? 0 : g_memory.MapVirtual(objects[0]));
+    struct ClearWait { ~ClearWait() { RecordWait(0); } } clearWait;
+
     std::unique_lock lock(g_dispatcherMutex);
 
     while (true)

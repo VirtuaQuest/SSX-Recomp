@@ -40,6 +40,11 @@ struct ThreadObject : KernelObject
     std::atomic<int32_t> suspendCount{};
     std::shared_ptr<ThreadObject> self; // Keeps the object alive while the thread runs.
 
+    // Diagnostics: the last import called and what the thread is waiting on.
+    std::atomic<const char*> lastImport{};
+    std::atomic<uint32_t> lastImportCaller{};
+    std::atomic<uint32_t> waitingOn{};
+
 #ifdef _WIN32
     HANDLE hostThread{};
 #endif
@@ -75,3 +80,10 @@ uint32_t GetCurrentKThread();
 uint32_t GetCurrentGuestThreadId();
 std::shared_ptr<ThreadObject> FindThreadById(uint32_t threadId);
 std::shared_ptr<ThreadObject> FindThreadByKThread(uint32_t kthread);
+
+// Records an import call by the current thread, for DumpGuestThreads.
+void RecordImportCall(const char* name, uint32_t caller);
+void RecordWait(uint32_t object);
+
+// Prints every guest thread's last import and the object it is waiting on.
+void DumpGuestThreads();

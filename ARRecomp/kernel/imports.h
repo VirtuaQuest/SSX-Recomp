@@ -4,14 +4,16 @@
 #include "heap.h"
 #include "memory.h"
 #include "objects.h"
+#include <cpu/guest_thread.h>
 
 // Kernel and XAM imports are implemented as host functions in the "imports" namespace (to avoid clashing with
 // Windows API names) and bound to the import thunks the recompiled code calls.
 #define AR_IMPORT(name) \
     PPC_FUNC(__imp__##name) \
     { \
+        RecordImportCall(#name, uint32_t(ctx.lr)); \
         if (logger::g_minimumLevel == logger::Level::Trace) \
-            logger::Print(logger::Level::Trace, #name, "r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} lr 0x{:08X}", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, uint32_t(ctx.lr)); \
+            logger::Print(logger::Level::Trace, #name, "thread {} r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} lr 0x{:08X}", GetCurrentGuestThreadId(), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, uint32_t(ctx.lr)); \
         HostToGuestFunction<imports::name>(ctx, base); \
     }
 

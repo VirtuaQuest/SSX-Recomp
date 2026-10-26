@@ -3,14 +3,61 @@
 
 // Based on Unleashed Recompiled's kernel/memory.cpp (GPL-3.0).
 
+#ifdef _WIN32
+// Reserves the 4 GB guest address space as placeholders, commits the range below the physical views as ordinary
+// memory and maps one 512 MB section at each of the three physical views, so they alias like on the console.
+// VirtualAlloc2 and MapViewOfFile3 are looked up at runtime as they are missing from older import libraries.
+static uint8_t* ReserveGuestMemory()
+{
+    using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+    using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+
+    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    auto virtualAlloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelBase, "VirtualAlloc2"));
+    auto mapViewOfFile3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelBase, "MapViewOfFile3"));
+    if (virtualAlloc2 == nullptr || mapViewOfFile3 == nullptr)
+        return nullptr;
+
+    HANDLE process = GetCurrentProcess();
+    uint8_t* reserved = nullptr;
+    for (void* preferred : { (void*)0x100000000ull, (void*)nullptr })
+    {
+        reserved = (uint8_t*)virtualAlloc2(process, preferred, PPC_MEMORY_SIZE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        if (reserved != nullptr)
+            break;
+    }
+
+    if (reserved == nullptr)
+        return nullptr;
+
+    constexpr uint64_t physicalViews[] = { 0xA0000000, 0xC0000000, 0xE0000000 };
+
+    // Split the placeholder into the ordinary range and the three views.
+    VirtualFree(reserved, physicalViews[0], MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    VirtualFree(reserved + physicalViews[0], GUEST_PHYSICAL_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    VirtualFree(reserved + physicalViews[1], GUEST_PHYSICAL_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+
+    if (virtualAlloc2(process, reserved, physicalViews[0], MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr)
+        return nullptr;
+
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, 0, GUEST_PHYSICAL_SIZE, nullptr);
+    if (section == nullptr)
+        return nullptr;
+
+    for (uint64_t view : physicalViews)
+    {
+        if (mapViewOfFile3(section, process, reserved + view, 0, GUEST_PHYSICAL_SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr)
+            return nullptr;
+    }
+
+    return reserved;
+}
+#endif
+
 Memory::Memory()
 {
 #ifdef _WIN32
-    base = (uint8_t*)VirtualAlloc((void*)0x100000000ull, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-    if (base == nullptr)
-        base = (uint8_t*)VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
+    base = ReserveGuestMemory();
     if (base == nullptr)
         return;
 
@@ -32,8 +79,8 @@ void* MmGetHostAddress(uint32_t ptr)
     return g_memory.Translate(ptr);
 }
 
-PageAllocator::PageAllocator(uint32_t begin, uint32_t end, uint32_t pageSize)
-    : m_begin(begin), m_end(end), m_pageSize(pageSize)
+PageAllocator::PageAllocator(uint32_t begin, uint32_t end, uint32_t pageSize, uint32_t hostOffset)
+    : m_begin(begin), m_end(end), m_pageSize(pageSize), m_hostOffset(hostOffset)
 {
 }
 
@@ -112,7 +159,7 @@ uint32_t PageAllocator::Allocate(uint32_t address, uint32_t size, uint32_t align
     m_regions.emplace(address, Region{ address, size, protect, commit });
 
     // Memory handed out by the kernel is always zeroed.
-    memset(g_memory.Translate(address), 0, size);
+    memset(g_memory.Translate(uint64_t(address) + m_hostOffset), 0, size);
     return address;
 }
 
@@ -160,7 +207,7 @@ bool PageAllocator::Decommit(uint32_t address, uint32_t size)
     uint32_t begin = address & ~(m_pageSize - 1);
     uint32_t end = std::min<uint64_t>(AlignUp(uint64_t(address) + size, m_pageSize), uint64_t(region.base) + region.size);
     if (begin < end)
-        memset(g_memory.Translate(begin), 0, end - begin);
+        memset(g_memory.Translate(uint64_t(begin) + m_hostOffset), 0, end - begin);
 
     return true;
 }
@@ -192,17 +239,6 @@ uint64_t PageAllocator::AllocatedBytes() const
 }
 
 PageAllocator g_virtualAllocator(GUEST_VIRTUAL_BEGIN, GUEST_VIRTUAL_END, 0x1000);
-PageAllocator g_physicalAllocator64K(0xA0000000, 0xC0000000, 0x10000);
-PageAllocator g_physicalAllocator16M(0xC0000000, 0xE0000000, 0x1000000);
-PageAllocator g_physicalAllocator4K(0xE0000000, 0xFFFFF000, 0x1000);
 
-PageAllocator* FindAllocator(uint32_t address)
-{
-    for (auto* allocator : { &g_virtualAllocator, &g_physicalAllocator64K, &g_physicalAllocator16M, &g_physicalAllocator4K })
-    {
-        if (allocator->Contains(address))
-            return allocator;
-    }
-
-    return nullptr;
-}
+// Starts at 64 KB so that physical address 0 is never handed out.
+PageAllocator g_physicalAllocator(0x10000, GUEST_PHYSICAL_SIZE, 0x1000, PHYSICAL_VIEW_64K);

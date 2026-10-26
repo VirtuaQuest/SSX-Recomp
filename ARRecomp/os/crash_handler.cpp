@@ -9,6 +9,66 @@
 
 static std::mutex g_crashMutex;
 
+static void LoadSymbols()
+{
+    static std::once_flag once;
+    std::call_once(once, []
+        {
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+            SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+        });
+}
+
+static void PrintStack(HANDLE thread, CONTEXT context, int maxFrames)
+{
+    HANDLE process = GetCurrentProcess();
+    LoadSymbols();
+
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+
+    for (int i = 0; i < maxFrames; i++)
+    {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, thread, &frame, &context, nullptr,
+            SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || frame.AddrPC.Offset == 0)
+        {
+            break;
+        }
+
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+
+        if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol))
+            fmt::print(stderr, "  #{:2} {}+0x{:X}\n", i, symbol->Name, displacement);
+        else
+            fmt::print(stderr, "  #{:2} 0x{:X}\n", i, frame.AddrPC.Offset);
+    }
+
+    fflush(stderr);
+}
+
+// Samples where another thread currently is.
+void PrintThreadStack(HANDLE thread, int maxFrames)
+{
+    if (SuspendThread(thread) == DWORD(-1))
+        return;
+
+    CONTEXT context{};
+    context.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(thread, &context))
+        PrintStack(thread, context, maxFrames);
+
+    ResumeThread(thread);
+}
+
 static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* info)
 {
     DWORD code = info->ExceptionRecord->ExceptionCode;
@@ -37,48 +97,12 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* info)
     {
         fmt::print(stderr, "     guest r1 0x{:08X} r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} lr 0x{:08X}\n",
             ctx->r1.u32, ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, uint32_t(ctx->lr));
+        fmt::print(stderr, "     guest r26 0x{:08X} r27 0x{:08X} r28 0x{:08X} r29 0x{:08X} r30 0x{:08X} r31 0x{:08X}\n",
+            ctx->r26.u32, ctx->r27.u32, ctx->r28.u32, ctx->r29.u32, ctx->r30.u32, ctx->r31.u32);
     }
 
-    HANDLE process = GetCurrentProcess();
-    static bool symbolsLoaded = false;
-    if (!symbolsLoaded)
-    {
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-        SymInitialize(process, nullptr, TRUE);
-        symbolsLoaded = true;
-    }
-
-    CONTEXT context = *info->ContextRecord;
-    STACKFRAME64 frame{};
-    frame.AddrPC.Offset = context.Rip;
-    frame.AddrPC.Mode = AddrModeFlat;
-    frame.AddrFrame.Offset = context.Rbp;
-    frame.AddrFrame.Mode = AddrModeFlat;
-    frame.AddrStack.Offset = context.Rsp;
-    frame.AddrStack.Mode = AddrModeFlat;
-
-    for (int i = 0; i < 48; i++)
-    {
-        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, GetCurrentThread(), &frame, &context, nullptr,
-            SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || frame.AddrPC.Offset == 0)
-        {
-            break;
-        }
-
-        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
-        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
-        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-        symbol->MaxNameLen = 255;
-        DWORD64 displacement = 0;
-
-        if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol))
-            fmt::print(stderr, "  #{:2} {}+0x{:X}\n", i, symbol->Name, displacement);
-        else
-            fmt::print(stderr, "  #{:2} 0x{:X}\n", i, frame.AddrPC.Offset);
-    }
-
-    fflush(stderr);
-    TerminateProcess(process, 0xC0DE0000 | (code & 0xFFFF));
+    PrintStack(GetCurrentThread(), *info->ContextRecord, 48);
+    TerminateProcess(GetCurrentProcess(), 0xC0DE0000 | (code & 0xFFFF));
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

@@ -12,8 +12,7 @@
 //   0xC0000000 - 0xE0000000  physical memory, 16 MB pages
 //   0xE0000000 - 0x100000000 physical memory, 4 KB pages
 //
-// The three physical views address the same 512 MB on real hardware. They are not aliased here; each physical
-// allocation is only visible through the view it was allocated in.
+// The three physical views map the same 512 MB of physical memory, like on the console.
 
 constexpr uint32_t GUEST_RUNTIME_HEAP_BEGIN = 0x00010000;
 constexpr uint32_t GUEST_RUNTIME_HEAP_END = 0x40000000;
@@ -80,7 +79,8 @@ public:
         bool committed;
     };
 
-    PageAllocator(uint32_t begin, uint32_t end, uint32_t pageSize);
+    // hostOffset is added to addresses to reach the memory, for allocators that manage physical addresses.
+    PageAllocator(uint32_t begin, uint32_t end, uint32_t pageSize, uint32_t hostOffset = 0);
 
     // Allocates anywhere in the range, or at a fixed address when address is not 0. Returns 0 on failure.
     uint32_t Allocate(uint32_t address, uint32_t size, uint32_t alignment, uint32_t protect, bool commit, bool topDown = false);
@@ -96,13 +96,38 @@ private:
     uint32_t m_begin;
     uint32_t m_end;
     uint32_t m_pageSize;
+    uint32_t m_hostOffset;
     std::map<uint32_t, Region> m_regions;
     mutable std::mutex m_mutex;
 };
 
 extern PageAllocator g_virtualAllocator;
-extern PageAllocator g_physicalAllocator64K;
-extern PageAllocator g_physicalAllocator16M;
-extern PageAllocator g_physicalAllocator4K;
+extern PageAllocator g_physicalAllocator; // Manages physical addresses (0 - 512 MB).
 
-PageAllocator* FindAllocator(uint32_t address);
+constexpr uint32_t PHYSICAL_VIEW_4K = 0xE0000000;
+constexpr uint32_t PHYSICAL_VIEW_64K = 0xA0000000;
+constexpr uint32_t PHYSICAL_VIEW_16M = 0xC0000000;
+
+inline bool IsPhysicalAddress(uint32_t address)
+{
+    return address >= PHYSICAL_VIEW_64K;
+}
+
+// Offset of a physical view address in the physical memory backing, as used by g_physicalAllocator.
+inline uint32_t PhysicalMemoryOffset(uint32_t address)
+{
+    return address & (GUEST_PHYSICAL_SIZE - 1);
+}
+
+// Physical memory as the hardware sees it. The 4 KB page view at 0xE0000000 is offset by 4 KB on the console:
+// virtual 0xE0000000 + X is physical X + 0x1000, and titles compute GPU addresses with that rule. Host views must
+// be 64 KB aligned, so the offset is applied in these translations instead: allocations in that view are tracked
+// (with a guard page after each, keeping translations unambiguous).
+uint32_t AllocatePhysicalMemory(uint32_t size, uint32_t alignment, uint32_t view, uint32_t protect, bool topDown);
+void FreePhysicalMemory(uint32_t address);
+
+// Virtual address in a physical view to the address the GPU and DMA engines use.
+uint32_t VirtualToPhysical(uint32_t address);
+
+// GPU address to a virtual address the host can access.
+uint32_t PhysicalToVirtual(uint32_t physical);

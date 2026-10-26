@@ -15,6 +15,25 @@ constexpr uint32_t X_MEM_16MB_PAGES = 0x80000000;
 constexpr uint32_t X_PAGE_NOACCESS = 0x01;
 constexpr uint32_t X_PAGE_READWRITE = 0x04;
 
+// The allocator responsible for a guest address, and the address in that allocator's terms.
+struct AllocationTarget
+{
+    PageAllocator* allocator;
+    uint32_t address;
+    uint32_t view; // Added back to physical addresses to form guest addresses.
+};
+
+static std::optional<AllocationTarget> FindTarget(uint32_t address)
+{
+    if (IsPhysicalAddress(address))
+        return AllocationTarget{ &g_physicalAllocator, PhysicalMemoryOffset(address), address & 0xE0000000 };
+
+    if (g_virtualAllocator.Contains(address))
+        return AllocationTarget{ &g_virtualAllocator, address, 0 };
+
+    return std::nullopt;
+}
+
 namespace imports
 {
     uint32_t NtAllocateVirtualMemory(be<uint32_t>* baseAddress, be<uint32_t>* regionSize, uint32_t allocationType,
@@ -30,8 +49,8 @@ namespace imports
         // Committing inside an existing reservation.
         if (address != 0 && (allocationType & X_MEM_COMMIT) && !(allocationType & X_MEM_RESERVE))
         {
-            auto* allocator = FindAllocator(address);
-            if (allocator != nullptr && allocator->Commit(address, size, protect))
+            auto target = FindTarget(address);
+            if (target.has_value() && target->allocator->Commit(target->address, size, protect))
             {
                 uint32_t begin = address & ~(alignment - 1);
                 *baseAddress = begin;
@@ -59,22 +78,21 @@ namespace imports
         if (baseAddress == nullptr)
             return X_STATUS_INVALID_PARAMETER;
 
-        uint32_t address = *baseAddress;
-        auto* allocator = FindAllocator(address);
-        if (allocator == nullptr)
+        auto target = FindTarget(*baseAddress);
+        if (!target.has_value())
             return X_STATUS_MEMORY_NOT_ALLOCATED;
 
         if (freeType & X_MEM_DECOMMIT)
         {
             uint32_t size = regionSize != nullptr ? regionSize->get() : 0;
-            if (!allocator->Decommit(address, size))
+            if (!target->allocator->Decommit(target->address, size))
                 return X_STATUS_MEMORY_NOT_ALLOCATED;
 
             return X_STATUS_SUCCESS;
         }
 
         uint32_t freed = 0;
-        if (!allocator->Free(address, &freed))
+        if (!target->allocator->Free(target->address, &freed))
             return X_STATUS_MEMORY_NOT_ALLOCATED;
 
         if (regionSize != nullptr)
@@ -96,8 +114,8 @@ namespace imports
 
     uint32_t NtQueryVirtualMemory(uint32_t baseAddress, XMemoryBasicInformation* info)
     {
-        auto* allocator = FindAllocator(baseAddress);
-        auto region = allocator != nullptr ? allocator->Query(baseAddress) : std::nullopt;
+        auto target = FindTarget(baseAddress);
+        auto region = target.has_value() ? target->allocator->Query(target->address) : std::nullopt;
 
         memset(info, 0, sizeof(*info));
         if (!region.has_value())
@@ -109,10 +127,10 @@ namespace imports
             return X_STATUS_SUCCESS;
         }
 
-        info->baseAddress = baseAddress & ~(allocator->PageSize() - 1);
-        info->allocationBase = region->base;
+        info->baseAddress = baseAddress & ~0xFFFu;
+        info->allocationBase = region->base + target->view;
         info->allocationProtect = region->protect;
-        info->regionSize = region->base + region->size - info->baseAddress;
+        info->regionSize = region->base + target->view + region->size - info->baseAddress;
         info->state = region->committed ? X_MEM_COMMIT : X_MEM_RESERVE;
         info->protect = region->protect;
         info->type = X_MEM_PRIVATE;
@@ -122,13 +140,22 @@ namespace imports
     uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size, uint32_t protect, uint32_t minAddress,
         uint32_t maxAddress, uint32_t alignment)
     {
-        PageAllocator* allocator = &g_physicalAllocator4K;
+        // The page size picks the view the memory is returned in.
+        uint32_t view = PHYSICAL_VIEW_4K;
+        uint32_t pageSize = 0x1000;
         if (protect & X_MEM_16MB_PAGES)
-            allocator = &g_physicalAllocator16M;
+        {
+            view = PHYSICAL_VIEW_16M;
+            pageSize = 0x1000000;
+        }
         else if (protect & X_MEM_LARGE_PAGES)
-            allocator = &g_physicalAllocator64K;
+        {
+            view = PHYSICAL_VIEW_64K;
+            pageSize = 0x10000;
+        }
 
-        uint32_t address = allocator->Allocate(0, size, std::max(alignment, allocator->PageSize()), protect, true, (flags & 1) != 0);
+        size = (size + pageSize - 1) & ~(pageSize - 1);
+        uint32_t address = AllocatePhysicalMemory(size, std::max(alignment, pageSize), view, protect, (flags & 1) != 0);
         if (address == 0)
             LOGF_ERROR("failed to allocate 0x{:X} bytes of physical memory (protect 0x{:X})", size, protect);
 
@@ -137,23 +164,18 @@ namespace imports
 
     void MmFreePhysicalMemory(uint32_t type, uint32_t baseAddress)
     {
-        if (auto* allocator = FindAllocator(baseAddress))
-            allocator->Free(baseAddress);
+        FreePhysicalMemory(baseAddress);
     }
 
     uint32_t MmGetPhysicalAddress(uint32_t address)
     {
-        // Physical memory views at 0xA0000000, 0xC0000000 and 0xE0000000 map onto the 512 MB of physical memory.
-        if (address >= 0xA0000000)
-            return address & 0x1FFFFFFF;
-
-        return address;
+        return VirtualToPhysical(address);
     }
 
     uint32_t MmQueryAddressProtect(uint32_t address)
     {
-        auto* allocator = FindAllocator(address);
-        auto region = allocator != nullptr ? allocator->Query(address) : std::nullopt;
+        auto target = FindTarget(address);
+        auto region = target.has_value() ? target->allocator->Query(target->address) : std::nullopt;
         if (region.has_value())
             return region->protect;
 
@@ -202,7 +224,7 @@ namespace imports
         if (stats == nullptr || stats->length != sizeof(XMmStatistics))
             return X_STATUS_BUFFER_TOO_SMALL;
 
-        uint64_t physicalUsed = g_physicalAllocator4K.AllocatedBytes() + g_physicalAllocator64K.AllocatedBytes() + g_physicalAllocator16M.AllocatedBytes();
+        uint64_t physicalUsed = g_physicalAllocator.AllocatedBytes();
         uint64_t virtualUsed = g_virtualAllocator.AllocatedBytes();
         uint32_t totalPages = GUEST_PHYSICAL_SIZE / 0x1000;
         uint32_t usedPages = uint32_t((physicalUsed + virtualUsed) / 0x1000);

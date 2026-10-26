@@ -1,5 +1,6 @@
 #include <stdafx.h>
 #include <cpu/guest_thread.h>
+#include <gpu/command_processor.h>
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <kernel/variables.h>
@@ -34,6 +35,7 @@ int main(int argc, char* argv[])
     std::filesystem::path gamePath;
     std::filesystem::path xexPath;
     std::filesystem::path userPath = "user";
+    int dumpThreadsAfter = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -46,6 +48,8 @@ int main(int argc, char* argv[])
             userPath = argv[++i];
         else if (arg == "--trace")
             logger::g_minimumLevel = logger::Level::Trace;
+        else if (arg == "--dump-threads" && i + 1 < argc)
+            dumpThreadsAfter = atoi(argv[++i]);
         else
         {
             PrintUsage();
@@ -93,6 +97,26 @@ int main(int argc, char* argv[])
     auto mainThread = CreateGuestThread(params);
     if (!mainThread)
         return 1;
+
+    if (dumpThreadsAfter > 0)
+    {
+        std::thread([dumpThreadsAfter]
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(dumpThreadsAfter));
+                DumpGuestThreads();
+                gpu::DumpState();
+
+                // The title's Direct3D device: fence counter (+0x2B1C) and the completed fence it points at (+0x2B10).
+                uint32_t device = *g_memory.Translate<be<uint32_t>>(GetKernelVariable("VdGlobalDevice"));
+                if (device != 0)
+                {
+                    uint32_t fenceAddress = *g_memory.Translate<be<uint32_t>>(device + 0x2B10);
+                    LOGF_INFO("D3D device 0x{:08X}: fence counter {}, completed fence at 0x{:08X} = {}", device,
+                        g_memory.Translate<be<uint32_t>>(device + 0x2B1C)->get(), fenceAddress,
+                        fenceAddress != 0 ? g_memory.Translate<be<uint32_t>>(fenceAddress)->get() : 0);
+                }
+            }).detach();
+    }
 
     XDISPATCHER_HEADER* header = mainThread->Header();
     WaitForDispatcherObjects({ &header, 1 }, false, std::nullopt, false);
