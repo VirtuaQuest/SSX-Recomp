@@ -28,7 +28,8 @@ namespace gpu
         PM4_EVENT_WRITE = 0x46,
         PM4_INTERRUPT = 0x54,
         PM4_EVENT_WRITE_SHD = 0x58,
-        PM4_EVENT_WRITE_EXT = 0x59,
+        PM4_EVENT_WRITE_CFL = 0x59,
+        PM4_EVENT_WRITE_EXT = 0x5A,
         PM4_EVENT_WRITE_ZPD = 0x5B,
         PM4_SET_BIN_MASK = 0x50,
         PM4_SET_BIN_SELECT = 0x51,
@@ -548,8 +549,10 @@ namespace gpu
             uint32_t address = read();
             WriteRegister(VGT_EVENT_INITIATOR, initiator & 0x3F);
 
-            // Screen extents (min/max x, y, z) in 16 bit units of 8 pixels: report the full render target.
-            static const uint16_t extents[] = { 0, 1280 / 8, 0, 720 / 8, 0, 1 };
+            // Screen extents of the preceding draws (min/max x, y in units of 8 pixels, then z), which D3D uses to
+            // decide which tiles of a predicated tiling frame each object touches. Not measured: the maximum surface
+            // size is reported, so objects draw in every tile, as Xenia does.
+            static const uint16_t extents[] = { 0, 8192 / 8, 0, 8192 / 8, 0, 1 };
             auto* out = g_memory.Translate<be<uint16_t>>(PhysicalToVirtual(address & ~3u));
             for (size_t i = 0; i < std::size(extents); i++)
                 out[i] = extents[i];

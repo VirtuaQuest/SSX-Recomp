@@ -193,6 +193,10 @@ namespace gpu::d3d12
         D3D12_GPU_VIRTUAL_ADDRESS uploadGpu = 0;
         uint64_t uploadOffset = 0;
 
+        // Vertex buffer ranges already uploaded since the upload space was last reset: draws sharing a buffer
+        // reuse its copy.
+        std::unordered_map<uint64_t, uint64_t> vertexUploads;
+
         ComPtr<ID3D12DescriptorHeap> viewHeap, samplerHeap, rtvHeap, dsvHeap;
         uint32_t viewSize = 0, samplerSize = 0, rtvSize = 0, dsvSize = 0;
         DescriptorAllocator views, rtvs, dsvs;
@@ -311,6 +315,7 @@ namespace gpu::d3d12
         frame.allocator->Reset();
         g.list->Reset(frame.allocator.Get(), nullptr);
         g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
+        g.vertexUploads.clear();
         BindHeaps();
     }
 
@@ -332,6 +337,7 @@ namespace gpu::d3d12
         frame.allocator->Reset();
         g.list->Reset(frame.allocator.Get(), nullptr);
         g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
+        g.vertexUploads.clear();
         BindHeaps();
     }
 
@@ -1557,9 +1563,14 @@ float4 main(float4 position : SV_Position) : SV_Target
             if (size == 0)
                 continue;
             uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
-            auto allocation = Upload(size, 16);
-            memcpy(allocation.cpu, g_memory.Translate(PhysicalToVirtual(address)), size);
-            system.vertexDataOffsets[index] = int32_t(allocation.offset - frameBase) - int32_t(address);
+            auto& uploaded = g.vertexUploads[(uint64_t(address) << 32) | size];
+            if (uploaded == 0)
+            {
+                auto allocation = Upload(size, 16);
+                memcpy(allocation.cpu, g_memory.Translate(PhysicalToVirtual(address)), size);
+                uploaded = allocation.offset + 1;
+            }
+            system.vertexDataOffsets[index] = int32_t(uploaded - 1 - frameBase) - int32_t(address);
         }
 
         // Constants.
@@ -1607,17 +1618,31 @@ float4 main(float4 position : SV_Position) : SV_Target
         system.alphaFunc = ((colorControl >> 3) & 1) ? (colorControl & 7) : 7;
         system.alphaRef = RegisterFloat(registers, RB_ALPHA_REF);
 
-        auto uploadFloatConstants = [&](uint32_t baseRegister)
+        // Only the constants up to the highest one the shader reads are copied (all of them when it indexes them).
+        auto uploadFloatConstants = [&](uint32_t baseRegister, const HostShader* shader)
             {
+                uint32_t count = 0;
+                if (shader)
+                {
+                    const auto& map = shader->shader->constant_register_map();
+                    if (map.float_dynamic_addressing)
+                        count = 256;
+                    for (uint32_t i = 0; i < 4; i++)
+                    {
+                        if (map.float_bitmap[i])
+                            count = std::max<uint32_t>(count, i * 64 + 64 - uint32_t(std::countl_zero(map.float_bitmap[i])));
+                    }
+                }
+
                 uint32_t base = std::min<uint32_t>(baseRegister & 0x1FF, 256);
                 auto allocation = Upload(4096, 256);
                 auto* out = reinterpret_cast<uint32_t*>(allocation.cpu);
-                for (uint32_t i = 0; i < 1024; i++)
+                for (uint32_t i = 0; i < count * 4; i++)
                     out[i] = registers[SHADER_CONSTANT_000_X + base * 4 + i];
                 return allocation.gpu;
             };
-        D3D12_GPU_VIRTUAL_ADDRESS vertexConstants = uploadFloatConstants(registers[0x2307]);
-        D3D12_GPU_VIRTUAL_ADDRESS pixelConstants = uploadFloatConstants(registers[0x2308]);
+        D3D12_GPU_VIRTUAL_ADDRESS vertexConstants = uploadFloatConstants(registers[0x2307], &vertexShader);
+        D3D12_GPU_VIRTUAL_ADDRESS pixelConstants = uploadFloatConstants(registers[0x2308], pixelShader);
         D3D12_GPU_VIRTUAL_ADDRESS systemConstants = UploadConstants(system);
 
         D3D12_INDEX_BUFFER_VIEW indexView{};
@@ -1932,6 +1957,11 @@ float4 main(float4 position : SV_Position) : SV_Target
                         depthSource ? UploadConstants(depthConstants) : UploadConstants(constants));
                     g.list->DrawInstanced(3, 1, 0, 0);
 
+                    if (TraceThisFrame() && source->format == DXGI_FORMAT_R8G8B8A8_UNORM && getenv("AR_DUMP_SOURCES"))
+                    {
+                        static int sourceIndex;
+                        SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
+                    }
                     if (TraceThisFrame() && destFormat == DXGI_FORMAT_R8G8B8A8_UNORM)
                     {
                         static int resolveIndex;
