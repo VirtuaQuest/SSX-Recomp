@@ -30,7 +30,13 @@ namespace gpu
         PM4_EVENT_WRITE_SHD = 0x58,
         PM4_EVENT_WRITE_EXT = 0x59,
         PM4_EVENT_WRITE_ZPD = 0x5B,
+        PM4_SET_BIN_MASK = 0x50,
+        PM4_SET_BIN_SELECT = 0x51,
         PM4_SET_CONSTANT2 = 0x55,
+        PM4_SET_BIN_MASK_LO = 0x60,
+        PM4_SET_BIN_MASK_HI = 0x61,
+        PM4_SET_BIN_SELECT_LO = 0x62,
+        PM4_SET_BIN_SELECT_HI = 0x63,
         PM4_SET_SHADER_CONSTANTS = 0x56,
         PM4_XE_SWAP = 0x64, // Written by VdSwap.
     };
@@ -43,6 +49,28 @@ namespace gpu
     static std::atomic<uint32_t> g_swapCounter;
     static std::atomic<uint64_t> g_frames;
     static uint32_t g_readPointer;
+
+    // When VdSwap was called for each swap the GPU hasn't reached yet, to measure how far behind it runs.
+    static std::mutex g_swapTimesMutex;
+    static std::deque<std::chrono::steady_clock::time_point> g_swapTimes;
+
+    void NoteSwapSubmitted()
+    {
+        std::lock_guard lock(g_swapTimesMutex);
+        g_swapTimes.push_back(std::chrono::steady_clock::now());
+
+        static uint64_t calls;
+        static auto lastReport = std::chrono::steady_clock::now();
+        calls++;
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastReport > std::chrono::seconds(5))
+        {
+            LOGF_INFO("VdSwap: {} calls in {:.1f} s, GPU swaps {}", calls,
+                std::chrono::duration<double>(now - lastReport).count(), g_frames.load());
+            calls = 0;
+            lastReport = now;
+        }
+    }
 
     uint32_t SwapCounter()
     {
@@ -126,6 +154,19 @@ namespace gpu
             std::this_thread::sleep_until(next);
 
             g_swapCounter++;
+
+            if (getenv("AR_LOG_GPU_WAITS"))
+            {
+                static int logged;
+                uint32_t value = *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(0x0CCD7004));
+                if (logged++ < 40)
+                    LOGF_INFO("vblank {}: flag 0x{:08X}", g_swapCounter.load(), value);
+            }
+
+            // The scanline counter advances by a frame's worth of lines, so code timing frames with it sees time pass.
+            auto& counter = Registers()[0x194C]; // D1MODE_V_COUNTER
+            counter = counter + 720;
+
             QueueInterrupt(0, 2); // Vertical blank interrupts go to the third hardware thread.
         }
     }
@@ -182,6 +223,7 @@ namespace gpu
         }
 
         uint32_t Position() const { return m_position; }
+        uint32_t Size() const { return m_size; }
         bool Wraps() const { return m_wraps; }
 
     private:
@@ -215,6 +257,14 @@ namespace gpu
     }
 
     static void ExecuteBuffer(PacketReader& reader, uint32_t endPosition);
+
+    static void PublishReadPointer(uint32_t position)
+    {
+        g_readPointer = position;
+        Registers()[CP_RB_RPTR] = position;
+        if (uint32_t writeBack = g_readPointerWriteBack)
+            *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(writeBack)) = position;
+    }
 
     // SET_CONSTANT and LOAD_ALU_CONSTANT address one of the constant blocks, or the context registers.
     static uint32_t ConstantRegister(uint32_t offsetType)
@@ -259,11 +309,24 @@ namespace gpu
 
     static int g_indirectDepth;
 
-    static void ExecutePacket3(PacketReader& reader, uint32_t opcode, uint32_t count)
+    // Predicated tiling: a frame is rendered in screen tiles ("bins") by running the same commands once per tile.
+    // Type 3 packets with the predicate bit only run when the selected bins overlap the mask, so per frame work
+    // (fences, swaps) inside them runs once.
+    static uint64_t g_binMask = 0xFFFFFFFF;
+    static uint64_t g_binSelect = 0xFFFFFFFF;
+
+    static void ExecutePacket3(PacketReader& reader, uint32_t opcode, uint32_t count, bool predicated)
     {
         uint32_t start = reader.Position();
         uint32_t consumed = 0;
         auto read = [&]() { consumed++; return reader.Read(); };
+
+        // Predicated swaps are skipped too: a frame is presented once, not per tile.
+        if (predicated && ((g_binSelect & g_binMask) == 0 || opcode == PM4_XE_SWAP))
+        {
+            reader.Skip(count);
+            return;
+        }
 
         switch (opcode)
         {
@@ -273,6 +336,9 @@ namespace gpu
             uint32_t address = read() & ~3u;
             uint32_t length = read() & 0xFFFFF;
             LOGF_TRACE("indirect buffer 0x{:08X}, {} words", address, length);
+            if (getenv("AR_LOG_IBS") && g_frames >= 20 && g_frames < 24)
+                LOGF_INFO("frame {} depth {}: indirect buffer 0x{:08X}, {} words (ring position {})", g_frames.load(), g_indirectDepth,
+                    address, length, reader.Position());
 
             // Indirect buffers do not nest deeply on the console; deep nesting means misparsed packets.
             if (g_indirectDepth >= 4)
@@ -287,6 +353,32 @@ namespace gpu
             g_indirectDepth--;
             break;
         }
+
+        case PM4_SET_BIN_MASK:
+            g_binMask = uint64_t(read()) << 32;
+            g_binMask |= read();
+            break;
+
+        case PM4_SET_BIN_SELECT:
+            g_binSelect = uint64_t(read()) << 32;
+            g_binSelect |= read();
+            break;
+
+        case PM4_SET_BIN_MASK_LO:
+            g_binMask = (g_binMask & 0xFFFFFFFF00000000ull) | read();
+            break;
+
+        case PM4_SET_BIN_MASK_HI:
+            g_binMask = (g_binMask & 0xFFFFFFFFull) | (uint64_t(read()) << 32);
+            break;
+
+        case PM4_SET_BIN_SELECT_LO:
+            g_binSelect = (g_binSelect & 0xFFFFFFFF00000000ull) | read();
+            break;
+
+        case PM4_SET_BIN_SELECT_HI:
+            g_binSelect = (g_binSelect & 0xFFFFFFFFull) | (uint64_t(read()) << 32);
+            break;
 
         case PM4_DRAW_INDX:
         case PM4_DRAW_INDX_2:
@@ -345,6 +437,12 @@ namespace gpu
         case PM4_MEM_WRITE:
         {
             uint32_t address = read();
+            if (getenv("AR_LOG_GPU_WAITS") && (address & ~3u) == 0x0CCD7004)
+            {
+                static int logged;
+                if (logged++ < 20)
+                    LOGF_INFO("GPU writes 0x{:08X} words to 0x{:08X}, first 0x{:X}", count - 1, address, reader.Position());
+            }
             for (uint32_t i = 1; i < count; i++)
                 WriteMemory(address + (i - 1) * 4, read());
             break;
@@ -363,13 +461,22 @@ namespace gpu
             bool warned = false;
             while (!Compare(waitInfo, ReadPollValue(waitInfo, pollAddress) & mask, reference))
             {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::this_thread::yield();
                 if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(5))
                 {
                     LOGF_WARNING("GPU is waiting on {} 0x{:08X} (function {}, reference 0x{:X}, mask 0x{:X})",
                         (waitInfo & 0x10) ? "memory" : "register", pollAddress, waitInfo & 7, reference, mask);
                     warned = true;
                 }
+            }
+
+            if (getenv("AR_LOG_GPU_WAITS"))
+            {
+                double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                static int logged;
+                if (waited > 1.0 && logged++ < 60)
+                    LOGF_INFO("GPU waited {:.1f} ms on {} 0x{:08X} (function {}, reference 0x{:X}, mask 0x{:X}), value now 0x{:X}", waited,
+                        (waitInfo & 0x10) ? "memory" : "register", pollAddress, waitInfo & 7, reference, mask, ReadPollValue(waitInfo, pollAddress));
             }
             break;
         }
@@ -417,6 +524,20 @@ namespace gpu
             uint32_t value = read();
             WriteRegister(VGT_EVENT_INITIATOR, initiator & 0x3F);
             WriteMemory(address, (initiator >> 31) ? g_swapCounter.load() : value);
+
+            if (getenv("AR_LOG_IBS") && g_frames >= 20 && g_frames < 24)
+                LOGF_INFO("frame {}: fence write {} to 0x{:08X}", g_frames.load(), value, address);
+            if (getenv("AR_LOG_FENCES"))
+            {
+                static std::map<uint32_t, uint32_t> last;
+                static int logged;
+                uint32_t& previous = last[address];
+                if (value < previous && logged++ < 30)
+                    LOGF_INFO("fence at 0x{:08X} went back from {} to {} (frame {})", address, previous, value, g_frames.load());
+                if (address == 0x0CCD4000 && logged++ < 30)
+                    LOGF_INFO("fence 0x{:08X} = {} (frame {})", address, value, g_frames.load());
+                previous = value;
+            }
             LOGF_TRACE("event write 0x{:08X} to 0x{:08X} (initiator 0x{:08X})", value, address, initiator);
             break;
         }
@@ -469,7 +590,10 @@ namespace gpu
         {
             uint64_t frame = ++g_frames;
             if (frame == 1 || frame % 600 == 0)
-                LOGF_INFO("frame {}", frame);
+            {
+                std::lock_guard lock(g_swapTimesMutex);
+                LOGF_INFO("frame {} ({} swaps submitted but not reached)", frame, g_swapTimes.size());
+            }
 
             // Written by VdSwap: 'SWAP', the front buffer's physical address and size, then its fetch constant.
             SwapInfo swap{};
@@ -479,17 +603,41 @@ namespace gpu
             swap.height = read();
             for (auto& word : swap.fetchConstant)
                 word = read();
+            {
+                std::lock_guard lock(g_swapTimesMutex);
+                if (!g_swapTimes.empty())
+                {
+                    auto submitted = g_swapTimes.front();
+                    g_swapTimes.pop_front();
+                    if (getenv("AR_LOG_SWAP_LATENCY") != nullptr && (frame % 30) == 0)
+                        LOGF_INFO("frame {}: swap latency {:.1f} ms, {} swaps queued", frame,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submitted).count(), g_swapTimes.size());
+                }
+            }
             Swap(Registers(), swap);
             break;
         }
 
         default:
+        {
+            static std::set<uint32_t> logged;
+            static std::mutex mutex;
+            std::lock_guard lock(mutex);
+            if (logged.insert(opcode).second)
+                LOGF_WARNING("unhandled PM4 packet 0x{:02X} ({} words)", opcode, count);
             break;
+        }
         }
 
         // Packets carry their length, so anything not consumed by the handler (or not handled) is skipped.
         if (consumed < count)
             reader.Skip(count - consumed);
+        else if (consumed > count)
+        {
+            static std::set<uint32_t> logged;
+            if (logged.insert(opcode).second)
+                LOGF_ERROR("PM4 packet 0x{:02X} handler read {} words of a {} word packet", opcode, consumed, count);
+        }
     }
 
     static void ExecutePacket(PacketReader& reader)
@@ -518,7 +666,7 @@ namespace gpu
             break;
 
         case 3:
-            ExecutePacket3(reader, (header >> 8) & 0x7F, ((header >> 16) & 0x3FFF) + 1);
+            ExecutePacket3(reader, (header >> 8) & 0x7F, ((header >> 16) & 0x3FFF) + 1, header & 1);
             break;
         }
     }
@@ -533,12 +681,31 @@ namespace gpu
             return;
         }
 
+        // The ring's read pointer advances packet by packet, like the hardware's fetcher: D3D waits on it for ring
+        // space, and holding it back while a packet blocks (a swap waits up to two vertical blanks) stalls
+        // the title's render thread, and with it everything waiting on GPU fences.
         while (reader.Position() != endPosition)
+        {
+            uint32_t before = reader.Position();
+            uint32_t remaining = (endPosition + reader.Size() - before) % reader.Size();
             ExecutePacket(reader);
+
+            // A packet extending past the write pointer would make the loop run around the whole ring, replaying
+            // stale commands. Stop at the write pointer instead.
+            uint32_t advanced = (reader.Position() + reader.Size() - before) % reader.Size();
+            if (advanced > remaining)
+            {
+                LOGF_ERROR("PM4 packet at {} extends past the write pointer {} (advanced {} words)", before, endPosition, advanced);
+                PublishReadPointer(endPosition);
+                return;
+            }
+            PublishReadPointer(reader.Position());
+        }
     }
 
     static void RunCommandProcessor()
     {
+        auto lastWork = std::chrono::steady_clock::now();
         while (true)
         {
             uint32_t base = g_ringBase;
@@ -547,17 +714,27 @@ namespace gpu
 
             if (base == 0 || size == 0 || writePointer == g_readPointer || writePointer >= size)
             {
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                // The CPU often waits on the GPU right after submitting (fences, occlusion queries), and Windows
+                // sleeps last a millisecond or more, so new work is polled for without sleeping for a while.
+                if (std::chrono::steady_clock::now() - lastWork < std::chrono::milliseconds(50))
+                    std::this_thread::yield();
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
                 continue;
+            }
+
+            lastWork = std::chrono::steady_clock::now();
+            if (getenv("AR_LOG_FENCES") && writePointer < g_readPointer)
+            {
+                static int logged;
+                if (logged++ < 30)
+                    LOGF_INFO("ring wraps: read pointer {}, write pointer {} ({} words of {})", g_readPointer, writePointer,
+                        writePointer + size - g_readPointer, size);
             }
 
             PacketReader reader(base, size, g_readPointer, true);
             ExecuteBuffer(reader, writePointer);
-            g_readPointer = writePointer;
-
-            Registers()[CP_RB_RPTR] = g_readPointer;
-            if (uint32_t writeBack = g_readPointerWriteBack)
-                *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(writeBack)) = g_readPointer;
+            PublishReadPointer(writePointer);
         }
     }
 

@@ -255,8 +255,13 @@ void DumpGuestThreads()
     {
         const char* last = thread->lastImport.load();
         uint32_t waiting = thread->waitingOn.load();
-        LOGF_INFO("thread {:3} start 0x{:08X}{}: last import {} from 0x{:08X}{}", thread->threadId, thread->params.startAddress,
-            thread->finished ? " (finished)" : "", last != nullptr ? last : "-", thread->lastImportCaller.load(),
+        FILETIME creation, exit, kernel, user;
+        double cpuSeconds = 0.0;
+        if (!thread->finished && GetThreadTimes(thread->hostThread, &creation, &exit, &kernel, &user))
+            cpuSeconds = double((uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime) + (uint64_t(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime)) / 1e7;
+
+        LOGF_INFO("thread {:3} start 0x{:08X}{}: {:.1f} s CPU, last import {} from 0x{:08X}{}", thread->threadId, thread->params.startAddress,
+            thread->finished ? " (finished)" : "", cpuSeconds, last != nullptr ? last : "-", thread->lastImportCaller.load(),
             waiting != 0 ? fmt::format(", waiting on 0x{:08X}", waiting) : "");
 
         // Threads that are running guest code: show where.

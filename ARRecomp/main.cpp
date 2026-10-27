@@ -102,6 +102,14 @@ int main(int argc, char* argv[])
     if (!LoadExecutable(xexPath))
         return 1;
 
+    // For reverse engineering: the loaded image, as the recompiled code sees it (AR_DUMP_IMAGE=<path>).
+    if (const char* dumpPath = getenv("AR_DUMP_IMAGE"))
+    {
+        std::ofstream file(dumpPath, std::ios::binary);
+        file.write(g_memory.Translate<const char>(g_module.imageBase), g_module.imageSize);
+        LOGF_INFO("image dumped to {}", dumpPath);
+    }
+
     StartTimeStampBundleUpdates();
 
     ThreadStartParams params{};

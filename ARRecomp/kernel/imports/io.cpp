@@ -197,6 +197,20 @@ namespace imports
         file->position = offset + read;
         SetIoStatus(ioStatus, status, uint32_t(read));
         SignalCompletion(event, apcRoutine);
+
+        if (getenv("AR_LOG_READS"))
+            LOGF_INFO("read {} at 0x{:X}: 0x{:X} of 0x{:X} bytes to 0x{:08X}, event 0x{:X}, apc 0x{:X}, status 0x{:X}", file->path, offset, read,
+                length, g_memory.MapVirtual(buffer), event, apcRoutine, status);
+
+        // Read statistics every 10 seconds, to tell loading progress apart from stalls.
+        static std::atomic<uint64_t> reads, bytes;
+        static std::atomic<int64_t> lastReport = std::chrono::steady_clock::now().time_since_epoch().count();
+        reads++;
+        bytes += read;
+        int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+        int64_t last = lastReport;
+        if (now - last > 10'000'000'000 && lastReport.compare_exchange_strong(last, now))
+            LOGF_INFO("file reads: {} ({} KB) in the last 10 seconds", reads.exchange(0), bytes.exchange(0) / 1024);
         return status;
     }
 

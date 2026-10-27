@@ -60,14 +60,15 @@ namespace imports
         return X_STATUS_SUCCESS;
     }
 
-    // Guest priorities range from -15 to 15 around 0; map them onto the host priority classes.
+    // Guest priorities range from -15 to 15 around 0; map them onto the host priority classes. Low priorities stay
+    // close to normal: on the console a low priority thread still runs on its hardware thread whenever others wait,
+    // while on the host, threads that poll (the GPU, D3D waiting on queries) keep cores busy, and idle priority
+    // threads would barely run. Sofdec's movie decoder lowers itself to -16 and then decodes far below real time.
     static int HostPriority(int32_t priority)
     {
         if (priority >= 15) return THREAD_PRIORITY_TIME_CRITICAL;
         if (priority >= 2) return THREAD_PRIORITY_HIGHEST;
         if (priority >= 1) return THREAD_PRIORITY_ABOVE_NORMAL;
-        if (priority <= -15) return THREAD_PRIORITY_IDLE;
-        if (priority <= -2) return THREAD_PRIORITY_LOWEST;
         if (priority <= -1) return THREAD_PRIORITY_BELOW_NORMAL;
         return THREAD_PRIORITY_NORMAL;
     }
@@ -131,6 +132,19 @@ namespace imports
 
     uint32_t KeDelayExecutionThread(uint32_t processorMode, uint32_t alertable, be<int64_t>* interval)
     {
+        if (getenv("AR_LOG_DELAYS") && interval != nullptr)
+        {
+            static std::mutex mutex;
+            static std::map<std::pair<uint32_t, int64_t>, uint32_t> counts;
+            std::lock_guard lock(mutex);
+            if (counts[{ GetCurrentGuestThreadId(), interval->get() }]++ == 0)
+                LOGF_INFO("thread {} delays {} (100 ns units), alertable {}", GetCurrentGuestThreadId(), interval->get(), alertable);
+        }
+
+        // Experiment: Unleashed Recompiled ends alertable delays immediately with STATUS_USER_APC.
+        if (alertable && getenv("AR_UR_ALERTABLE"))
+            return 0x000000C0; // STATUS_USER_APC
+
         auto deadline = GuestTimeoutToDeadline(interval);
         if (!deadline.has_value() || *deadline <= std::chrono::steady_clock::now())
             std::this_thread::yield();
@@ -651,6 +665,13 @@ namespace imports
 
     // ---- Time ----
 
+    static const uint64_t g_hostCounterFrequency = []
+        {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            return uint64_t(frequency.QuadPart);
+        }();
+
     uint64_t KeQueryPerformanceFrequency()
     {
         return 50000000; // The Xbox 360 time base runs at 50 MHz.
@@ -810,6 +831,15 @@ AR_IMPORT(KfReleaseSpinLock);
 AR_IMPORT(KeAcquireSpinLockAtRaisedIrql);
 AR_IMPORT(KeReleaseSpinLockFromRaisedIrql);
 AR_IMPORT(KeQueryPerformanceFrequency);
+
+uint64_t ArQueryTimeBase()
+{
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    uint64_t ticks = uint64_t(counter.QuadPart);
+    uint64_t frequency = imports::g_hostCounterFrequency;
+    return ticks / frequency * 50000000 + ticks % frequency * 50000000 / frequency;
+}
 AR_IMPORT(KeQuerySystemTime);
 AR_IMPORT(KeInitializeDpc);
 AR_IMPORT(KeInsertQueueDpc);

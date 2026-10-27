@@ -21,6 +21,9 @@ namespace gpu
     // Number of vertical blanks so far; also written by EVENT_WRITE_SHD packets that request the counter.
     uint32_t SwapCounter();
 
+    // Called by VdSwap, to measure the GPU's latency behind the CPU.
+    void NoteSwapSubmitted();
+
     // Prints the command processor state, for diagnosing hangs.
     void DumpState();
 }

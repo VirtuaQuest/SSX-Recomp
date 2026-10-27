@@ -12,3 +12,8 @@ inline uint64_t PPCHostOffset(uint32_t address)
 }
 
 #define PPC_MEMORY_ADDRESS(x) (base + PPCHostOffset(uint32_t(x)))
+
+// mftb: the Xbox 360 time base ticks at 50 MHz (KeQueryPerformanceFrequency reports that rate), while the host TSC
+// runs at several GHz. Implemented by the runtime.
+uint64_t ArQueryTimeBase();
+#define PPC_QUERY_TIMEBASE() ArQueryTimeBase()

@@ -219,20 +219,69 @@ namespace imports
 
     // ---- Messaging with system applications ----
 
+    // The music player (XMP, app 0xFA). The game is always in control of playback: no user music is playing, so
+    // titles keep their own music on. Messages take a buffer of arguments, mostly pointers to results.
+    constexpr uint32_t XMP_APP = 0xFA;
+
+    static uint32_t DispatchXmpMessage(uint32_t message, uint32_t buffer)
+    {
+        auto* args = g_memory.Translate<be<uint32_t>>(buffer);
+        auto write = [](uint32_t address, uint32_t value)
+            {
+                if (address != 0)
+                    *g_memory.Translate<be<uint32_t>>(address) = value;
+            };
+
+        switch (message)
+        {
+        case 0x00070009: // XMPGetStatus
+            write(args[1], 0); // Idle.
+            return X_ERROR_SUCCESS;
+        case 0x0007000B: // XMPGetVolume
+            write(args[1], 0x3F800000); // 1.0
+            return X_ERROR_SUCCESS;
+        case 0x0007001B: // XMPGetPlaybackController
+            write(args[1], 0); // The game.
+            write(args[2], 0); // Not locked.
+            return X_ERROR_SUCCESS;
+        case 0x00070029: // XMPGetPlaybackBehavior
+            write(args[1], 0);
+            write(args[2], 0);
+            write(args[3], 0);
+            return X_ERROR_SUCCESS;
+        case 0x0007000C: // XMPSetVolume
+        case 0x0007001A: // XMPSetPlaybackController
+        case 0x0007003D: // XMPCaptureOutput
+            return X_ERROR_SUCCESS;
+        default:
+            LOGF_WARNING("unhandled music player message 0x{:08X}", message);
+            return X_ERROR_SUCCESS;
+        }
+    }
+
     uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, uint32_t parameter1, uint32_t parameter2)
     {
+        if (app == XMP_APP)
+            return DispatchXmpMessage(message, parameter1);
+
         LOGF_WARNING("unhandled message 0x{:08X} to app 0x{:08X}", message, app);
         return X_ERROR_NOT_FOUND;
     }
 
     uint32_t XMsgStartIORequest(uint32_t app, uint32_t message, uint32_t overlapped, uint32_t buffer, uint32_t bufferLength)
     {
+        if (app == XMP_APP)
+            return FinishRequest(overlapped, DispatchXmpMessage(message, buffer));
+
         LOGF_WARNING("unhandled I/O request 0x{:08X} to app 0x{:08X}", message, app);
         return FinishRequest(overlapped, X_ERROR_NOT_FOUND);
     }
 
     uint32_t XMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped, uint32_t buffer, uint32_t bufferLength, uint32_t unknown)
     {
+        if (app == XMP_APP)
+            return FinishRequest(overlapped, DispatchXmpMessage(message, buffer));
+
         LOGF_WARNING("unhandled I/O request 0x{:08X} to app 0x{:08X}", message, app);
         return FinishRequest(overlapped, X_ERROR_NOT_FOUND);
     }

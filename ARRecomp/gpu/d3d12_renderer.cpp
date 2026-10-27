@@ -56,6 +56,7 @@ namespace gpu::d3d12
         ROOT_TEXTURES_3D,
         ROOT_TEXTURES_CUBE,
         ROOT_SAMPLERS,
+        ROOT_TEXTURES_UINT, // Integer views (depth buffers' stencil), for depth resolves.
         ROOT_PARAMETER_COUNT,
     };
 
@@ -67,6 +68,7 @@ namespace gpu::d3d12
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t srv = UINT32_MAX;
+        uint32_t stencilSrv = UINT32_MAX; // Depth buffers.
         uint32_t rtv = UINT32_MAX;
         uint32_t dsv = UINT32_MAX;
     };
@@ -196,7 +198,8 @@ namespace gpu::d3d12
         ComPtr<ID3D12RootSignature> rootSignature;
         std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
         std::vector<uint8_t> rectangleGeometryShader;
-        std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader;
+        std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader;
+        std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthBlitPipelines;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> blitPipelines;
         ComPtr<ID3D12PipelineState> presentPipeline;
 
@@ -205,6 +208,20 @@ namespace gpu::d3d12
         std::unordered_map<uint64_t, CachedTexture> textures;
         std::set<uint32_t> warnedFormats;
     } g;
+
+    // Time spent on the command processor thread, logged every 300 frames.
+    struct Profile
+    {
+        double draw, textures, vertices, present, presentWait;
+        uint32_t draws;
+    } static g_profile;
+
+    struct ScopedTimer
+    {
+        double& target;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~ScopedTimer() { target += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+    };
 
     static D3D12_CPU_DESCRIPTOR_HANDLE CpuView(uint32_t index)
     {
@@ -243,6 +260,8 @@ namespace gpu::d3d12
             frame.releasedResources.push_back(std::move(texture.resource));
         if (texture.srv != UINT32_MAX)
             frame.releasedSrvs.push_back(texture.srv);
+        if (texture.stencilSrv != UINT32_MAX)
+            frame.releasedSrvs.push_back(texture.stencilSrv);
         g.rtvs.Free(texture.rtv);
         g.dsvs.Free(texture.dsv);
         texture = {};
@@ -269,12 +288,16 @@ namespace gpu::d3d12
         g.list->SetGraphicsRootDescriptorTable(ROOT_TEXTURES_3D, views);
         g.list->SetGraphicsRootDescriptorTable(ROOT_TEXTURES_CUBE, views);
         g.list->SetGraphicsRootDescriptorTable(ROOT_SAMPLERS, g.samplerHeap->GetGPUDescriptorHandleForHeapStart());
+        g.list->SetGraphicsRootDescriptorTable(ROOT_TEXTURES_UINT, views);
     }
 
     static void BeginFrame()
     {
         auto& frame = g.frames[g.frameIndex];
-        WaitForFence(frame.fenceValue);
+        {
+            ScopedTimer timer{ g_profile.presentWait };
+            WaitForFence(frame.fenceValue);
+        }
         frame.releasedResources.clear();
         for (uint32_t srv : frame.releasedSrvs)
             g.views.Free(srv);
@@ -406,6 +429,41 @@ float4 main(float4 position : SV_Position) : SV_Target
 }
 )";
 
+    // Raw copy of a depth buffer, as the 32 bit words EDRAM holds: 24 bit depth (unorm, or float with a 4 bit
+    // exponent and 20 bit mantissa) above 8 bit stencil, written as 8 bit color components from the low byte up.
+    static constexpr const char* DEPTH_BLIT_PS = R"(
+cbuffer DepthBlitConstants : register(b0)
+{
+    int2 sourceOffset;
+    uint depthIndex;
+    uint stencilIndex;
+    uint floatDepth;
+};
+
+Texture2D<float4> textures[] : register(t0, space0);
+Texture2D<uint4> uintTextures[] : register(t0, space4);
+
+uint ToFloat24(float value)
+{
+    value = clamp(value, 0.0f, 1.99999988f);
+    uint bits = asuint(value);
+    int exponent = int(bits >> 23) - 127 + 15;
+    if (exponent <= 0)
+        return uint(value * exp2(34.0f)) & 0xFFFFFu; // Denormal: mantissa scaled by 2^(14 + 20).
+    return (uint(exponent) << 20) | ((bits >> 3) & 0xFFFFFu);
+}
+
+float4 main(float4 position : SV_Position) : SV_Target
+{
+    int3 coords = int3(int2(position.xy) + sourceOffset, 0);
+    float depth = textures[NonUniformResourceIndex(depthIndex)].Load(coords).r;
+    uint stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
+    uint depth24 = floatDepth ? ToFloat24(depth) : uint(round(saturate(depth) * 16777215.0f));
+    uint raw = (depth24 << 8) | (stencil & 0xFFu);
+    return float4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, raw >> 24) / 255.0f;
+}
+)";
+
     static constexpr const char* PRESENT_PS = R"(
 cbuffer PresentConstants : register(b0)
 {
@@ -427,7 +485,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static bool CreateRootSignature()
     {
-        D3D12_DESCRIPTOR_RANGE ranges[4]{};
+        D3D12_DESCRIPTOR_RANGE ranges[5]{};
         for (uint32_t i = 0; i < 3; i++)
         {
             ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -436,6 +494,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
         ranges[3].NumDescriptors = UINT_MAX;
+        ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[4].NumDescriptors = UINT_MAX;
+        ranges[4].RegisterSpace = 4;
 
         D3D12_ROOT_PARAMETER parameters[ROOT_PARAMETER_COUNT]{};
         parameters[ROOT_SYSTEM_CONSTANTS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -449,7 +510,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         parameters[ROOT_VERTEX_DATA].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         parameters[ROOT_VERTEX_DATA].Descriptor.RegisterSpace = 3;
         parameters[ROOT_VERTEX_DATA].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-        for (uint32_t i = 0; i < 4; i++)
+        for (uint32_t i = 0; i < 5; i++)
         {
             auto& parameter = parameters[ROOT_TEXTURES_2D + i];
             parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -593,6 +654,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.blitVertexShader = CompileInternal(BLIT_VS, L"vs_6_0", "blit_vs");
         g.blitPixelShader = CompileInternal(BLIT_PS, L"ps_6_0", "blit_ps");
         g.presentPixelShader = CompileInternal(PRESENT_PS, L"ps_6_0", "present_ps");
+        g.depthBlitPixelShader = CompileInternal(DEPTH_BLIT_PS, L"ps_6_0", "depth_blit_ps");
         if (g.blitVertexShader.empty() || g.blitPixelShader.empty() || g.presentPixelShader.empty())
             return false;
 
@@ -699,6 +761,16 @@ float4 main(float4 position : SV_Position) : SV_Target
             srv.Texture2D.MipLevels = 1;
         }
         g.device->CreateShaderResourceView(texture.resource.Get(), &srv, CpuView(texture.srv));
+
+        // Stencil is the second plane of depth formats.
+        if (format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC stencil = srv;
+            stencil.Format = format == DXGI_FORMAT_D24_UNORM_S8_UINT ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            stencil.Texture2D.PlaneSlice = 1;
+            texture.stencilSrv = g.views.Allocate();
+            g.device->CreateShaderResourceView(texture.resource.Get(), &stencil, CpuView(texture.stencilSrv));
+        }
 
         if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
         {
@@ -1103,16 +1175,16 @@ float4 main(float4 position : SV_Position) : SV_Target
         return pipeline.Get();
     }
 
-    static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present)
+    static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present, bool depth = false)
     {
-        auto& pipeline = present ? g.presentPipeline : g.blitPipelines[format];
+        auto& pipeline = present ? g.presentPipeline : depth ? g.depthBlitPipelines[format] : g.blitPipelines[format];
         if (pipeline)
             return pipeline.Get();
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = g.rootSignature.Get();
         desc.VS = Bytecode(g.blitVertexShader);
-        desc.PS = Bytecode(present ? g.presentPixelShader : g.blitPixelShader);
+        desc.PS = Bytecode(present ? g.presentPixelShader : depth ? g.depthBlitPixelShader : g.blitPixelShader);
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask = UINT_MAX;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1207,6 +1279,9 @@ float4 main(float4 position : SV_Position) : SV_Target
     {
         if (!Initialize())
             return;
+
+        ScopedTimer timer{ g_profile.draw };
+        g_profile.draws++;
 
         auto mode = EdramMode(registers[RB_MODECONTROL] & 7);
         if (mode == EdramMode::Copy)
@@ -1337,9 +1412,12 @@ float4 main(float4 position : SV_Position) : SV_Target
                     slot[3] = signs;
                 }
             };
-        bindTextures(vertexShader);
-        if (pixelShader)
-            bindTextures(*pixelShader);
+        {
+            ScopedTimer textureTimer{ g_profile.textures };
+            bindTextures(vertexShader);
+            if (pixelShader)
+                bindTextures(*pixelShader);
+        }
 
         // Index data.
         std::vector<uint32_t> indices;
@@ -1396,6 +1474,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (g.uploadOffset + uploadSize > frameBase + UPLOAD_SIZE / FRAME_COUNT)
             FlushAndWait();
 
+        ScopedTimer vertexTimer{ g_profile.vertices };
         for (auto [index, size] : vertexRanges)
         {
             if (size == 0)
@@ -1644,6 +1723,9 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         D3D12_RECT rect{ x0, y0, x1, y1 };
         uint32_t destBase = registers[RB_COPY_DEST_BASE] & 0x1FFFFFFF;
+        if (getenv("AR_LOG_PRESENT") && g.frameNumber >= 300 && g.frameNumber < 303 && destBase == 0x0CEF0000)
+            LOGF_INFO("frame {}: resolve to front buffer {},{}-{},{} from {} (base {}, pitch {}), command {}, clear {:X}", g.frameNumber,
+                x0, y0, x1, y1, sourceSelect, ColorInfo{ registers[RB_COLOR_INFO] }.Base(), pitch, control.Command(), (control.value >> 8) & 3);
         if (TraceThisFrame())
             LOGF_INFO("resolve {},{}-{},{} from {} (pitch {}) to {:08X} format {} command {} clear {:X} vertices {} {} {} {} {} {}",
                 x0, y0, x1, y1, sourceSelect, pitch, destBase, CopyDestInfo{ registers[RB_COPY_DEST_INFO] }.Format(), control.Command(),
@@ -1654,11 +1736,13 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (destBase != 0 && control.Command() != 3)
         {
             DXGI_FORMAT destFormat = GetHostTextureFormat(destInfo.Format());
-            if (depthSource)
+            if (depthSource && (destInfo.Format() == 22 || destInfo.Format() == 23)) // 24_8, 24_8_FLOAT: raw words.
+                destFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+            if (depthSource && destFormat != DXGI_FORMAT_R8G8B8A8_UNORM)
             {
-                static bool warned;
-                if (!std::exchange(warned, true))
-                    LOGF_WARNING("depth resolves are not implemented");
+                if (g.warnedFormats.insert(0x200 | destInfo.Format()).second)
+                    LOGF_WARNING("depth resolves to format {} are not supported", destInfo.Format());
             }
             else if (destFormat == DXGI_FORMAT_UNKNOWN || (destFormat >= DXGI_FORMAT_BC1_TYPELESS && destFormat <= DXGI_FORMAT_BC5_SNORM))
             {
@@ -1697,14 +1781,24 @@ float4 main(float4 position : SV_Position) : SV_Target
                     for (float& value : constants.scale)
                         value = scale;
 
+                    struct DepthBlitConstants
+                    {
+                        int32_t sourceOffset[2];
+                        uint32_t depthIndex;
+                        uint32_t stencilIndex;
+                        uint32_t floatDepth;
+                    } depthConstants{ { 0, 0 }, source->srv, source->stencilSrv,
+                        DepthInfo{ registers[RB_DEPTH_INFO] }.Format() == 1 ? 1u : 0u };
+
                     Transition(*source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     Transition(resolved.texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
                     auto rtv = CpuRtv(resolved.texture.rtv);
                     g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                     SetViewportAndScissor(destWidth, destHeight, rect);
-                    g.list->SetPipelineState(GetBlitPipeline(destFormat, false));
+                    g.list->SetPipelineState(GetBlitPipeline(destFormat, false, depthSource));
                     g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+                    g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS,
+                        depthSource ? UploadConstants(depthConstants) : UploadConstants(constants));
                     g.list->DrawInstanced(3, 1, 0, 0);
 
                     if (TraceThisFrame() && destFormat == DXGI_FORMAT_R8G8B8A8_UNORM)
@@ -1812,10 +1906,27 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (!Initialize())
             return;
 
+        static auto lastReport = std::chrono::steady_clock::now();
+        if (g.frameNumber % 300 == 0 && g.frameNumber != 0 && getenv("AR_PROFILE"))
+        {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double, std::milli>(now - lastReport).count();
+            lastReport = now;
+            LOGF_INFO("profile: {:.1f} fps; per frame {:.2f} ms draws ({:.0f} draws, textures {:.2f}, vertices {:.2f}), present {:.2f} (waiting {:.2f})",
+                300000.0 / elapsed, g_profile.draw / 300, g_profile.draws / 300.0, g_profile.textures / 300, g_profile.vertices / 300,
+                g_profile.present / 300, g_profile.presentWait / 300);
+            g_profile = {};
+        }
+
+        ScopedTimer presentTimer{ g_profile.present };
+
         TextureFetch fetch;
         memcpy(fetch.words, swap.fetchConstant, sizeof(fetch.words));
         uint32_t frontBuffer = fetch.words[1] != 0 ? fetch.BaseAddress() : swap.frontBuffer;
         auto resolved = g.resolvedTextures.find(frontBuffer);
+        if (getenv("AR_LOG_PRESENT") && (g.frameNumber % 150 == 0 || (g.frameNumber >= 300 && g.frameNumber < 303)))
+            LOGF_INFO("present {}: front buffer 0x{:08X} (packet 0x{:08X}, fetch {:08X} {:08X}), {}", g.frameNumber, frontBuffer,
+                swap.frontBuffer, fetch.words[0], fetch.words[1], resolved != g.resolvedTextures.end() ? "found" : "not resolved");
 
         ID3D12Resource* backBuffer = g.backBuffers[g.frameIndex].Get();
         D3D12_RESOURCE_BARRIER barrier{};

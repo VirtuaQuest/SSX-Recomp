@@ -1,5 +1,6 @@
 #include <stdafx.h>
 #include "renderer.h"
+#include <kernel/memory.h>
 #include "d3d12_renderer.h"
 #include "hlsl_translator.h"
 #include "shader_compiler.h"
@@ -219,6 +220,23 @@ namespace gpu
 
         g_survey = {};
         g_surveyFrame++;
+
+        // Debugging the intro movie: log when its frame buffer changes (AR_WATCH_MOVIE).
+        if (getenv("AR_WATCH_MOVIE") && g_surveyFrame % 10 == 0)
+        {
+            static uint64_t lastHash;
+            static uint32_t changes;
+            const uint8_t* frame = g_memory.Translate<uint8_t>(PhysicalToVirtual(0x11E61000));
+            uint64_t hash = 0xCBF29CE484222325ull;
+            for (size_t i = 0; i < 1280 * 720 * 4; i += 64)
+                hash = (hash ^ frame[i]) * 0x100000001B3ull;
+            if (hash != lastHash)
+            {
+                lastHash = hash;
+                if (++changes % 10 == 1)
+                    LOGF_INFO("movie frame buffer changed ({} changes) at frame {}", changes, g_surveyFrame);
+            }
+        }
 
         if (!g_renderingDisabled)
             d3d12::Present(registers, swap);

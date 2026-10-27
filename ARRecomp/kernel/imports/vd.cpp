@@ -147,6 +147,8 @@ namespace imports
         for (uint32_t i = 5; i < 64; i++)
             buffer[i] = 0;
 
+        gpu::NoteSwapSubmitted();
+
         // The front buffer's texture fetch constant tells the renderer its format and layout.
         if (fetchConstant != 0)
         {
