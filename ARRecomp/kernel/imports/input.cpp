@@ -132,6 +132,40 @@ static uint16_t AutoPressButtons()
     if (elapsed < period * 1000 || elapsed % (period * 1000) >= 150)
         return 0;
 
+    // AR_AUTO_SEQUENCE: comma separated buttons (A, B, X, Y, START, BACK, UP, DOWN, LEFT, RIGHT, LB, RB) pressed in
+    // order instead; after the last one, A repeats.
+    static const std::vector<uint16_t> sequence = []
+        {
+            std::vector<uint16_t> buttons;
+            static const std::pair<const char*, uint16_t> names[] = { { "A", XINPUT_GAMEPAD_A }, { "B", XINPUT_GAMEPAD_B },
+                { "X", XINPUT_GAMEPAD_X }, { "Y", XINPUT_GAMEPAD_Y }, { "START", XINPUT_GAMEPAD_START }, { "BACK", XINPUT_GAMEPAD_BACK },
+                { "UP", XINPUT_GAMEPAD_DPAD_UP }, { "DOWN", XINPUT_GAMEPAD_DPAD_DOWN }, { "LEFT", XINPUT_GAMEPAD_DPAD_LEFT },
+                { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER } };
+            if (const char* text = getenv("AR_AUTO_SEQUENCE"))
+            {
+                std::string list = text;
+                size_t start = 0;
+                while (start <= list.size())
+                {
+                    size_t end = list.find(',', start);
+                    std::string name = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    for (auto& [buttonName, button] : names)
+                    {
+                        if (name == buttonName)
+                            buttons.push_back(button);
+                    }
+                    if (end == std::string::npos)
+                        break;
+                    start = end + 1;
+                }
+            }
+            return buttons;
+        }();
+
+    size_t step = size_t(elapsed / (period * 1000)) - 1;
+    if (!sequence.empty())
+        return step < sequence.size() ? sequence[step] : XINPUT_GAMEPAD_A;
+
     return (elapsed / (period * 1000)) % 2 ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_START;
 }
 
