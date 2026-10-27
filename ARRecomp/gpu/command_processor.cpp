@@ -3,23 +3,23 @@
 #include <cpu/guest_thread.h>
 #include <kernel/function.h>
 #include <kernel/memory.h>
+#include "registers.h"
+#include "renderer.h"
 
 namespace gpu
 {
-    // Register indices (word offsets from REGISTER_BASE).
-    constexpr uint32_t REG_CP_RB_RPTR = 0x01C4;
-    constexpr uint32_t REG_CP_RB_WPTR = 0x01C5;
-    constexpr uint32_t REG_SCRATCH_UMSK = 0x01DC;
-    constexpr uint32_t REG_SCRATCH_ADDR = 0x01DD;
-    constexpr uint32_t REG_SCRATCH_REG0 = 0x0578;
-    constexpr uint32_t REG_COHER_STATUS_HOST = 0x0A31;
-    constexpr uint32_t REG_VGT_EVENT_INITIATOR = 0x21F9;
-    constexpr uint32_t REGISTER_COUNT = 0x6000;
+    using namespace reg;
 
     // PM4 type 3 opcodes.
     enum : uint32_t
     {
         PM4_REG_RMW = 0x21,
+        PM4_DRAW_INDX = 0x22,
+        PM4_IM_LOAD = 0x27,
+        PM4_IM_LOAD_IMMEDIATE = 0x2B,
+        PM4_SET_CONSTANT = 0x2D,
+        PM4_LOAD_ALU_CONSTANT = 0x2F,
+        PM4_DRAW_INDX_2 = 0x36,
         PM4_INDIRECT_BUFFER_PFD = 0x37,
         PM4_WAIT_REG_MEM = 0x3C,
         PM4_MEM_WRITE = 0x3D,
@@ -30,6 +30,8 @@ namespace gpu
         PM4_EVENT_WRITE_SHD = 0x58,
         PM4_EVENT_WRITE_EXT = 0x59,
         PM4_EVENT_WRITE_ZPD = 0x5B,
+        PM4_SET_CONSTANT2 = 0x55,
+        PM4_SET_SHADER_CONSTANTS = 0x56,
         PM4_XE_SWAP = 0x64, // Written by VdSwap.
     };
 
@@ -138,17 +140,17 @@ namespace gpu
         auto* registers = Registers();
         registers[index] = value;
 
-        if (index == REG_SCRATCH_ADDR || index == REG_SCRATCH_UMSK || (index >= REG_SCRATCH_REG0 && index < REG_SCRATCH_REG0 + 8))
+        if (index == SCRATCH_ADDR || index == SCRATCH_UMSK || (index >= SCRATCH_REG0 && index < SCRATCH_REG0 + 8))
             LOGF_TRACE("register 0x{:04X} = 0x{:08X}", index, value);
 
-        if (index >= REG_SCRATCH_REG0 && index < REG_SCRATCH_REG0 + 8)
+        if (index >= SCRATCH_REG0 && index < SCRATCH_REG0 + 8)
         {
             // Scratch registers selected by the mask are mirrored to memory, which the CPU polls for fences.
-            uint32_t scratch = index - REG_SCRATCH_REG0;
-            if ((registers[REG_SCRATCH_UMSK] >> scratch) & 1)
-                *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(registers[REG_SCRATCH_ADDR] + scratch * 4)) = value;
+            uint32_t scratch = index - SCRATCH_REG0;
+            if ((registers[SCRATCH_UMSK] >> scratch) & 1)
+                *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(registers[SCRATCH_ADDR] + scratch * 4)) = value;
         }
-        else if (index == REG_COHER_STATUS_HOST && (value & 0x80000000))
+        else if (index == COHER_STATUS_HOST && (value & 0x80000000))
         {
             // Cache coherency requests complete immediately.
             registers[index] = value & ~0x80000000u;
@@ -214,6 +216,47 @@ namespace gpu
 
     static void ExecuteBuffer(PacketReader& reader, uint32_t endPosition);
 
+    // SET_CONSTANT and LOAD_ALU_CONSTANT address one of the constant blocks, or the context registers.
+    static uint32_t ConstantRegister(uint32_t offsetType)
+    {
+        static constexpr uint32_t bases[] = { SHADER_CONSTANT_000_X, SHADER_CONSTANT_FETCH_00_0,
+            SHADER_CONSTANT_BOOL_000_031, SHADER_CONSTANT_LOOP_00, 0x2000 };
+
+        uint32_t type = (offsetType >> 16) & 0xFF;
+        return type < std::size(bases) ? bases[type] + (offsetType & 0x7FF) : REGISTER_COUNT;
+    }
+
+    static void ExecuteDraw(PacketReader& reader, uint32_t& consumed, uint32_t count, bool hasVizQuery)
+    {
+        auto read = [&]() { consumed++; return reader.Read(); };
+        if (hasVizQuery)
+            read();
+
+        DrawCall draw{};
+        draw.initiator.value = read();
+        WriteRegister(VGT_DRAW_INITIATOR, draw.initiator.value);
+
+        if (draw.initiator.Source() == SourceSelect::DMA)
+        {
+            draw.indexBase = read() & 0x1FFFFFFF;
+            uint32_t dmaSize = read();
+            draw.indexEndian = dmaSize >> 30;
+            draw.indexWords = dmaSize & 0xFFFFFF;
+            WriteRegister(VGT_DMA_BASE, draw.indexBase);
+            WriteRegister(VGT_DMA_SIZE, dmaSize);
+        }
+        else if (draw.initiator.Source() == SourceSelect::Immediate)
+        {
+            // Indices follow in the packet, packed as 16 or 32 bit values.
+            uint32_t words = count - consumed;
+            draw.immediateIndices.resize(words);
+            for (uint32_t i = 0; i < words; i++)
+                draw.immediateIndices[i] = read();
+        }
+
+        IssueDraw(Registers(), draw);
+    }
+
     static int g_indirectDepth;
 
     static void ExecutePacket3(PacketReader& reader, uint32_t opcode, uint32_t count)
@@ -242,6 +285,60 @@ namespace gpu
             PacketReader indirect(PhysicalToVirtual(address), length, 0, false);
             ExecuteBuffer(indirect, length);
             g_indirectDepth--;
+            break;
+        }
+
+        case PM4_DRAW_INDX:
+        case PM4_DRAW_INDX_2:
+            ExecuteDraw(reader, consumed, count, opcode == PM4_DRAW_INDX);
+            break;
+
+        case PM4_SET_CONSTANT:
+        {
+            uint32_t base = ConstantRegister(read());
+            for (uint32_t i = 1; i < count; i++)
+                WriteRegister(base + i - 1, read());
+            break;
+        }
+
+        case PM4_SET_CONSTANT2:
+        case PM4_SET_SHADER_CONSTANTS:
+        {
+            uint32_t base = read() & 0xFFFF;
+            for (uint32_t i = 1; i < count; i++)
+                WriteRegister(base + i - 1, read());
+            break;
+        }
+
+        case PM4_LOAD_ALU_CONSTANT:
+        {
+            uint32_t address = read() & 0x3FFFFFFF;
+            uint32_t base = ConstantRegister(read());
+            uint32_t sizeWords = read() & 0xFFF;
+            auto* source = g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(address));
+            for (uint32_t i = 0; i < sizeWords; i++)
+                WriteRegister(base + i, source[i]);
+            break;
+        }
+
+        case PM4_IM_LOAD:
+        {
+            uint32_t addressType = read();
+            uint32_t startSize = read();
+            auto* code = g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(addressType & ~3u));
+            LoadShader(addressType & 3, code, startSize & 0xFFFF);
+            break;
+        }
+
+        case PM4_IM_LOAD_IMMEDIATE:
+        {
+            uint32_t type = read();
+            uint32_t startSize = read();
+            uint32_t sizeWords = std::min(startSize & 0xFFFF, count - consumed);
+            std::vector<be<uint32_t>> code(sizeWords);
+            for (uint32_t i = 0; i < sizeWords; i++)
+                code[i] = read();
+            LoadShader(type & 3, code.data(), sizeWords);
             break;
         }
 
@@ -310,7 +407,7 @@ namespace gpu
         }
 
         case PM4_EVENT_WRITE:
-            WriteRegister(REG_VGT_EVENT_INITIATOR, read() & 0x3F);
+            WriteRegister(VGT_EVENT_INITIATOR, read() & 0x3F);
             break;
 
         case PM4_EVENT_WRITE_SHD:
@@ -318,7 +415,7 @@ namespace gpu
             uint32_t initiator = read();
             uint32_t address = read();
             uint32_t value = read();
-            WriteRegister(REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+            WriteRegister(VGT_EVENT_INITIATOR, initiator & 0x3F);
             WriteMemory(address, (initiator >> 31) ? g_swapCounter.load() : value);
             LOGF_TRACE("event write 0x{:08X} to 0x{:08X} (initiator 0x{:08X})", value, address, initiator);
             break;
@@ -328,7 +425,7 @@ namespace gpu
         {
             uint32_t initiator = read();
             uint32_t address = read();
-            WriteRegister(REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+            WriteRegister(VGT_EVENT_INITIATOR, initiator & 0x3F);
 
             // Screen extents (min/max x, y, z) in 16 bit units of 8 pixels: report the full render target.
             static const uint16_t extents[] = { 0, 1280 / 8, 0, 720 / 8, 0, 1 };
@@ -362,6 +459,16 @@ namespace gpu
             uint64_t frame = ++g_frames;
             if (frame == 1 || frame % 600 == 0)
                 LOGF_INFO("frame {}", frame);
+
+            // Written by VdSwap: 'SWAP', the front buffer's physical address and size, then its fetch constant.
+            SwapInfo swap{};
+            read();
+            swap.frontBuffer = read();
+            swap.width = read();
+            swap.height = read();
+            for (auto& word : swap.fetchConstant)
+                word = read();
+            Swap(Registers(), swap);
             break;
         }
 
@@ -425,7 +532,7 @@ namespace gpu
         {
             uint32_t base = g_ringBase;
             uint32_t size = g_ringSizeWords;
-            uint32_t writePointer = Registers()[REG_CP_RB_WPTR];
+            uint32_t writePointer = Registers()[CP_RB_WPTR];
 
             if (base == 0 || size == 0 || writePointer == g_readPointer || writePointer >= size)
             {
@@ -437,7 +544,7 @@ namespace gpu
             ExecuteBuffer(reader, writePointer);
             g_readPointer = writePointer;
 
-            Registers()[REG_CP_RB_RPTR] = g_readPointer;
+            Registers()[CP_RB_RPTR] = g_readPointer;
             if (uint32_t writeBack = g_readPointerWriteBack)
                 *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(writeBack)) = g_readPointer;
         }
@@ -476,7 +583,7 @@ namespace gpu
     void InitializeRingBuffer(uint32_t physicalAddress, uint32_t sizeLog2)
     {
         g_readPointer = 0;
-        Registers()[REG_CP_RB_WPTR] = 0;
+        Registers()[CP_RB_WPTR] = 0;
         g_ringSizeWords = (1u << (sizeLog2 + 3)) / 4;
         g_ringBase = PhysicalToVirtual(physicalAddress);
         LOGF_INFO("ring buffer at 0x{:08X}, {} words", physicalAddress, g_ringSizeWords.load());
@@ -501,6 +608,6 @@ namespace gpu
     void DumpState()
     {
         LOGF_INFO("GPU: ring 0x{:08X} ({} words), read pointer {}, write pointer {}, frames {}, vblanks {}",
-            g_ringBase.load(), g_ringSizeWords.load(), g_readPointer, Registers()[REG_CP_RB_WPTR].get(), g_frames.load(), g_swapCounter.load());
+            g_ringBase.load(), g_ringSizeWords.load(), g_readPointer, Registers()[CP_RB_WPTR].get(), g_frames.load(), g_swapCounter.load());
     }
 }

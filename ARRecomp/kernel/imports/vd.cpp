@@ -146,6 +146,14 @@ namespace imports
         buffer[4] = 720;
         for (uint32_t i = 5; i < 64; i++)
             buffer[i] = 0;
+
+        // The front buffer's texture fetch constant tells the renderer its format and layout.
+        if (fetchConstant != 0)
+        {
+            auto* words = g_memory.Translate<be<uint32_t>>(fetchConstant);
+            for (uint32_t i = 0; i < 6; i++)
+                buffer[5 + i] = words[i];
+        }
     }
 }
 

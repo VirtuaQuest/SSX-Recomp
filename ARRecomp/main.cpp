@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include <cpu/guest_thread.h>
 #include <gpu/command_processor.h>
+#include <gpu/renderer.h>
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <kernel/variables.h>
@@ -36,6 +37,7 @@ int main(int argc, char* argv[])
     std::filesystem::path xexPath;
     std::filesystem::path userPath = "user";
     int dumpThreadsAfter = 0;
+    bool gpuSurvey = false;
 
     for (int i = 1; i < argc; i++)
     {
@@ -48,6 +50,8 @@ int main(int argc, char* argv[])
             userPath = argv[++i];
         else if (arg == "--trace")
             logger::g_minimumLevel = logger::Level::Trace;
+        else if (arg == "--gpu-survey")
+            gpuSurvey = true;
         else if (arg == "--dump-threads" && i + 1 < argc)
             dumpThreadsAfter = atoi(argv[++i]);
         else
@@ -62,6 +66,9 @@ int main(int argc, char* argv[])
         PrintUsage();
         return 1;
     }
+
+    if (gpuSurvey)
+        gpu::EnableSurvey(userPath / "shaders");
 
     if (g_memory.base == nullptr)
     {

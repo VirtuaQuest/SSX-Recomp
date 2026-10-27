@@ -19,5 +19,7 @@ target_include_directories(o1heap PUBLIC "thirdparty/o1heap")
 # o1heap counts leading zeros of size_t with __builtin_clzl by default, which is 32 bit on Windows.
 target_compile_definitions(o1heap PRIVATE O1HEAP_CLZ=__builtin_clzll)
 
+add_subdirectory(thirdparty/xenia)
 add_subdirectory(ARRecompLib)
 add_subdirectory(ARRecomp)
+add_subdirectory(tools/shader_tool)
