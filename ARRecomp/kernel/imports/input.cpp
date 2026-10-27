@@ -37,7 +37,7 @@ static void StartConnectionMonitor()
     static std::once_flag once;
     std::call_once(once, []
         {
-            g_connectedMask = QueryConnectedMask();
+            g_connectedMask = QueryConnectedMask() | (getenv("AR_AUTO_PRESS") ? 1u : 0u);
             LOGF_INFO("controllers connected: mask 0x{:X}", g_connectedMask.load());
 
             std::thread([]
@@ -45,7 +45,7 @@ static void StartConnectionMonitor()
                     while (true)
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                        uint32_t mask = QueryConnectedMask();
+                        uint32_t mask = QueryConnectedMask() | (getenv("AR_AUTO_PRESS") ? 1u : 0u);
                         uint32_t previous = g_connectedMask.exchange(mask);
                         if (mask != previous)
                         {
@@ -119,11 +119,39 @@ static bool IsKeyDown(const XINPUT_GAMEPAD& pad, const KeyMapping& key)
 static std::mutex g_keystrokeMutex;
 static KeystrokeState g_keystrokes[XUSER_MAX_COUNT];
 
+// Debugging without a controller (AR_AUTO_PRESS=<seconds>): controller 0 taps A every that many seconds.
+static bool AutoPressA()
+{
+    static const int period = getenv("AR_AUTO_PRESS") ? atoi(getenv("AR_AUTO_PRESS")) : 0;
+    static const auto start = std::chrono::steady_clock::now();
+    if (period <= 0)
+        return false;
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    return elapsed > period * 1000 && elapsed % (period * 1000) < 150;
+}
+
+static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
+{
+    bool connected = XInputGetState(user, &state) == ERROR_SUCCESS;
+    if (!connected)
+        memset(&state, 0, sizeof(state));
+
+    if (user == 0 && getenv("AR_AUTO_PRESS"))
+    {
+        if (AutoPressA())
+            state.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
+        state.dwPacketNumber = DWORD(std::chrono::steady_clock::now().time_since_epoch().count() / 10000000);
+        return true;
+    }
+
+    return connected;
+}
+
 static void UpdateKeystrokes(uint32_t user)
 {
     XINPUT_STATE state;
-    if (XInputGetState(user, &state) != ERROR_SUCCESS)
-        memset(&state, 0, sizeof(state));
+    GetControllerState(user, state);
 
     auto& keys = g_keystrokes[user];
     auto now = std::chrono::steady_clock::now();
@@ -181,7 +209,13 @@ namespace imports
 
         XINPUT_CAPABILITIES host;
         if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(userIndex & 0xFF, XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
-            return X_ERROR_DEVICE_NOT_CONNECTED;
+        {
+            if ((userIndex & 0xFF) != 0 || !getenv("AR_AUTO_PRESS"))
+                return X_ERROR_DEVICE_NOT_CONNECTED;
+            host = {};
+            host.Type = XINPUT_DEVTYPE_GAMEPAD;
+            host.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+        }
 
         memset(capabilities, 0, sizeof(*capabilities));
         capabilities->Type = host.Type;
@@ -198,7 +232,7 @@ namespace imports
         StartConnectionMonitor();
 
         XINPUT_STATE host;
-        if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetState(userIndex & 0xFF, &host) != ERROR_SUCCESS)
+        if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || !GetControllerState(userIndex & 0xFF, host))
             return X_ERROR_DEVICE_NOT_CONNECTED;
 
         state->dwPacketNumber = ByteSwap(uint32_t(host.dwPacketNumber));

@@ -43,8 +43,9 @@ namespace gpu::d3d12
         float colorExpBias[4];
         uint32_t textures[32][4];
         int32_t vertexDataOffsets[96];
+        float textureTransforms[32][4]; // UV scale and offset, for textures inside larger resolved textures.
     };
-    static_assert(sizeof(SystemConstants) == 1904);
+    static_assert(sizeof(SystemConstants) == 2416);
 
     enum RootParameter : uint32_t
     {
@@ -130,10 +131,14 @@ namespace gpu::d3d12
         }
     };
 
+    // A texture written by resolves. Its guest memory spans rowBytes * height bytes from its address (tiled
+    // layouts keep whole rows of 32 contiguous, and resolves start at multiples of 8 rows), and resolves and
+    // fetches can address it at any row.
     struct ResolvedTexture
     {
         Texture texture;
         uint32_t format;
+        uint32_t rowBytes;
     };
 
     struct CachedTexture
@@ -416,13 +421,19 @@ cbuffer BlitConstants : register(b0)
     uint sourceIndex;
     uint swapRedBlue;
     float4 scale;
+    int2 sampleScale; // Samples per pixel of the source, averaged.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
 
 float4 main(float4 position : SV_Position) : SV_Target
 {
-    float4 color = textures[sourceIndex].Load(int3(int2(position.xy) + sourceOffset, 0));
+    int2 coords = (int2(position.xy) + sourceOffset) * sampleScale;
+    float4 color = 0.0f;
+    for (int y = 0; y < sampleScale.y; y++)
+        for (int x = 0; x < sampleScale.x; x++)
+            color += textures[NonUniformResourceIndex(sourceIndex)].Load(int3(coords + int2(x, y), 0));
+    color /= float(sampleScale.x * sampleScale.y);
     if (swapRedBlue)
         color = color.bgra;
     return color * scale;
@@ -438,6 +449,7 @@ cbuffer DepthBlitConstants : register(b0)
     uint depthIndex;
     uint stencilIndex;
     uint floatDepth;
+    int2 sampleScale;
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
@@ -455,7 +467,7 @@ uint ToFloat24(float value)
 
 float4 main(float4 position : SV_Position) : SV_Target
 {
-    int3 coords = int3(int2(position.xy) + sourceOffset, 0);
+    int3 coords = int3((int2(position.xy) + sourceOffset) * sampleScale, 0);
     float depth = textures[NonUniformResourceIndex(depthIndex)].Load(coords).r;
     uint stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
     uint depth24 = floatDepth ? ToFloat24(depth) : uint(round(saturate(depth) * 16777215.0f));
@@ -835,19 +847,62 @@ float4 main(float4 position : SV_Position) : SV_Target
         Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    // Returns the descriptor index for the texture a fetch constant describes.
-    static uint32_t GetTexture(const TextureFetch& fetch, uint32_t dimension)
+    static uint32_t BytesPerPixel(DXGI_FORMAT format)
     {
+        switch (format)
+        {
+        case DXGI_FORMAT_R8_UNORM: return 1;
+        case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_FLOAT: return 2;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R32G32_FLOAT: return 8;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+        default: return 4;
+        }
+    }
+
+    // Finds the resolved texture holding an address at the start of a row: the one starting there, else one it is
+    // inside. rowBytes 0 accepts any row pitch.
+    static ResolvedTexture* FindResolved(uint32_t address, uint32_t rowBytes, uint32_t& row)
+    {
+        row = 0;
+        auto exact = g.resolvedTextures.find(address);
+        if (exact != g.resolvedTextures.end() && (rowBytes == 0 || exact->second.rowBytes == rowBytes))
+            return &exact->second;
+
+        for (auto& [base, resolved] : g.resolvedTextures)
+        {
+            uint64_t end = uint64_t(base) + uint64_t(resolved.rowBytes) * resolved.texture.height;
+            if (address > base && address < end && (rowBytes == 0 || resolved.rowBytes == rowBytes) &&
+                (address - base) % resolved.rowBytes == 0)
+            {
+                row = (address - base) / resolved.rowBytes;
+                return &resolved;
+            }
+        }
+
+        return nullptr;
+    }
+
+    // Returns the descriptor index for the texture a fetch constant describes. transform receives the UV scale and
+    // offset that map the fetch's coordinates onto the host texture.
+    static uint32_t GetTexture(const TextureFetch& fetch, uint32_t dimension, float* transform)
+    {
+        transform[0] = transform[1] = 1.0f;
+        transform[2] = transform[3] = 0.0f;
         uint32_t nullSrv = dimension == 3 ? NULL_SRV_CUBE : dimension == 2 ? NULL_SRV_3D : NULL_SRV_2D;
         if ((fetch.words[0] & 3) != 2) // Not a texture fetch constant.
             return nullSrv;
 
         // Resolved render targets are used directly.
-        auto resolved = g.resolvedTextures.find(fetch.BaseAddress());
-        if (resolved != g.resolvedTextures.end() && dimension < 2)
+        uint32_t row;
+        ResolvedTexture* resolved = dimension < 2 ? FindResolved(fetch.BaseAddress(), 0, row) : nullptr;
+        if (resolved)
         {
-            Transition(resolved->second.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            return resolved->second.texture.srv;
+            auto& texture = resolved->texture;
+            transform[0] = float(fetch.Width()) / float(texture.width);
+            transform[1] = float(fetch.Height()) / float(texture.height);
+            transform[3] = float(row) / float(texture.height);
+            Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            return texture.srv;
         }
 
         if (GetHostTextureFormat(fetch.Format()) == DXGI_FORMAT_UNKNOWN)
@@ -1056,6 +1111,25 @@ float4 main(float4 position : SV_Position) : SV_Target
         right = std::min<int32_t>(right, SignExtend15(screenBr & 0x7FFF));
         bottom = std::min<int32_t>(bottom, SignExtend15((screenBr >> 16) & 0x7FFF));
         return { std::max(left, 0), std::max(top, 0), std::max(right, 0), std::max(bottom, 0) };
+    }
+
+    // MSAA surfaces are emulated with a sample per pixel: a 2x surface is twice as tall and a 4x one twice as wide
+    // and tall, matching how EDRAM lays samples out, so a surface viewed with different sample counts (games clear
+    // with 4x and render with 1x) shares one host render target.
+    struct SampleScale
+    {
+        uint32_t x, y;
+    };
+
+    static SampleScale GetSampleScale(const be<uint32_t>* registers)
+    {
+        uint32_t msaa = SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples();
+        return { msaa >= 2 ? 2u : 1u, msaa >= 1 ? 2u : 1u };
+    }
+
+    static D3D12_RECT ScaleRect(D3D12_RECT rect, SampleScale scale)
+    {
+        return { LONG(rect.left * scale.x), LONG(rect.top * scale.y), LONG(rect.right * scale.x), LONG(rect.bottom * scale.y) };
     }
 
     // ---- Pipelines ----
@@ -1303,13 +1377,16 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
 
         uint32_t count = draw.initiator.NumIndices();
-        uint32_t pitch = SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch();
+        SampleScale sampleScale = GetSampleScale(registers);
+        uint32_t pitch = SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch() * sampleScale.x;
         if (count == 0 || pitch == 0)
             return;
 
         PipelineKey key;
         memset(&key, 0, sizeof(key));
         SystemConstants system{};
+        for (auto& transform : system.textureTransforms)
+            transform[0] = transform[1] = 1.0f;
 
         // Render targets. Only the targets the pixel shader writes are bound.
         Texture* colorTargets[4]{};
@@ -1406,7 +1483,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     }
 
                     auto& slot = system.textures[index];
-                    slot[0] = GetTexture(fetch, hostDimension);
+                    slot[0] = GetTexture(fetch, hostDimension, system.textureTransforms[index]);
                     slot[1] = GetSampler(fetch);
                     slot[2] = fetch.Swizzle();
                     slot[3] = signs;
@@ -1514,7 +1591,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             offsetY += 0.5f;
         }
 
-        float width = float(pitch), height = float(RENDER_TARGET_HEIGHT);
+        float width = float(pitch) / float(sampleScale.x), height = float(RENDER_TARGET_HEIGHT) / float(sampleScale.y);
         system.ndcScale[0] = scaleX * 2.0f / width;
         system.ndcScale[1] = -scaleY * 2.0f / height;
         system.ndcScale[2] = scaleZ;
@@ -1635,7 +1712,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             dsv = CpuDsv(depthTarget->dsv);
         }
         g.list->OMSetRenderTargets(key.renderTargetCount, rtvs, FALSE, depthTarget ? &dsv : nullptr);
-        SetViewportAndScissor(pitch, RENDER_TARGET_HEIGHT, GetScissor(registers));
+        SetViewportAndScissor(pitch, RENDER_TARGET_HEIGHT, ScaleRect(GetScissor(registers), sampleScale));
 
         g.list->SetPipelineState(pipeline);
         g.list->IASetPrimitiveTopology(topology);
@@ -1665,6 +1742,7 @@ float4 main(float4 position : SV_Position) : SV_Target
     static void Resolve(const be<uint32_t>* registers)
     {
         CopyControl control{ registers[RB_COPY_CONTROL] };
+        SampleScale sampleScale = GetSampleScale(registers);
         uint32_t pitch = SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch();
         if (pitch == 0)
             return;
@@ -1701,7 +1779,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         x0 = std::clamp<int32_t>(x0, scissor.left, scissor.right) & ~7;
         y0 = std::clamp<int32_t>(y0, scissor.top, scissor.bottom) & ~7;
         x1 = std::min<int32_t>((std::clamp<int32_t>(x1, scissor.left, scissor.right) + 7) & ~7, int32_t(pitch));
-        y1 = std::min<int32_t>((std::clamp<int32_t>(y1, scissor.top, scissor.bottom) + 7) & ~7, int32_t(RENDER_TARGET_HEIGHT));
+        y1 = std::min<int32_t>((std::clamp<int32_t>(y1, scissor.top, scissor.bottom) + 7) & ~7, int32_t(RENDER_TARGET_HEIGHT / sampleScale.y));
         if (x0 >= x1 || y0 >= y1)
             return;
 
@@ -1711,12 +1789,12 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (depthSource)
         {
             DepthInfo info{ registers[RB_DEPTH_INFO] };
-            source = GetRenderTarget(info.Base(), pitch, info.Format(), true);
+            source = GetRenderTarget(info.Base(), pitch * sampleScale.x, info.Format(), true);
         }
         else
         {
             ColorInfo info{ registers[sourceSelect == 0 ? RB_COLOR_INFO : RB_COLOR1_INFO + sourceSelect - 1] };
-            source = GetRenderTarget(info.Base(), pitch, info.Format(), false);
+            source = GetRenderTarget(info.Base(), pitch * sampleScale.x, info.Format(), false);
         }
         if (!source)
             return;
@@ -1726,6 +1804,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (getenv("AR_LOG_PRESENT") && g.frameNumber >= 300 && g.frameNumber < 303 && destBase == 0x0CEF0000)
             LOGF_INFO("frame {}: resolve to front buffer {},{}-{},{} from {} (base {}, pitch {}), command {}, clear {:X}", g.frameNumber,
                 x0, y0, x1, y1, sourceSelect, ColorInfo{ registers[RB_COLOR_INFO] }.Base(), pitch, control.Command(), (control.value >> 8) & 3);
+        if (TraceThisFrame())
+            LOGF_INFO("resolve window offset {:08X} mode {:X} scissor {:08X} {:08X} dest pitch {:08X} info {:08X}",
+                uint32_t(registers[PA_SC_WINDOW_OFFSET]), uint32_t(registers[PA_SU_SC_MODE_CNTL]), uint32_t(registers[PA_SC_WINDOW_SCISSOR_TL]),
+                uint32_t(registers[PA_SC_WINDOW_SCISSOR_BR]), uint32_t(registers[RB_COPY_DEST_PITCH]), uint32_t(registers[RB_COPY_DEST_INFO]));
         if (TraceThisFrame())
             LOGF_INFO("resolve {},{}-{},{} from {} (pitch {}) to {:08X} format {} command {} clear {:X} vertices {} {} {} {} {} {}",
                 x0, y0, x1, y1, sourceSelect, pitch, destBase, CopyDestInfo{ registers[RB_COPY_DEST_INFO] }.Format(), control.Command(),
@@ -1753,30 +1835,77 @@ float4 main(float4 position : SV_Position) : SV_Target
             {
                 uint32_t destWidth = std::max<uint32_t>(destPitch.Pitch(), uint32_t(x1));
                 uint32_t destHeight = std::max<uint32_t>(destPitch.Height(), uint32_t(y1));
-                auto& resolved = g.resolvedTextures[destBase];
-                if (!resolved.texture.resource || resolved.texture.width != destWidth || resolved.texture.height != destHeight ||
-                    resolved.texture.format != destFormat)
+                uint32_t rowBytes = destWidth * BytesPerPixel(destFormat);
+
+                // Resolves can write into part of a texture resolved before (games render in strips and point each
+                // strip's resolve at its rows), so they go to the resolved texture holding the address when it fits.
+                uint32_t row = 0;
+                ResolvedTexture* target = FindResolved(destBase, rowBytes, row);
+                if (target && (target->texture.format != destFormat || target->texture.width != destWidth ||
+                    row + uint32_t(y1) > target->texture.height || (row == 0 && target->texture.height != destHeight)))
                 {
-                    ReleaseTexture(resolved.texture);
-                    resolved.texture = CreateTexture(destWidth, destHeight, 1, false, destFormat,
+                    target = nullptr;
+                }
+
+                if (!target)
+                {
+                    ResolvedTexture created;
+                    created.texture = CreateTexture(destWidth, destHeight, 1, false, destFormat,
                         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                    resolved.format = destInfo.Format();
-                    if (resolved.texture.resource)
+                    created.format = destInfo.Format();
+                    created.rowBytes = rowBytes;
+                    row = 0;
+                    if (created.texture.resource)
                     {
                         const float black[4] = {};
-                        g.list->ClearRenderTargetView(CpuRtv(resolved.texture.rtv), black, 0, nullptr);
+                        g.list->ClearRenderTargetView(CpuRtv(created.texture.rtv), black, 0, nullptr);
+
+                        // Resolved textures inside the new one's memory become part of it.
+                        uint64_t end = uint64_t(destBase) + uint64_t(rowBytes) * destHeight;
+                        for (auto it = g.resolvedTextures.begin(); it != g.resolvedTextures.end();)
+                        {
+                            auto& inner = it->second;
+                            bool inside = it->first >= destBase && it->first < end && inner.rowBytes == rowBytes &&
+                                (it->first - destBase) % rowBytes == 0;
+                            uint32_t innerRow = inside ? (it->first - destBase) / rowBytes : 0;
+                            if (inside && inner.texture.format == destFormat && inner.texture.width == destWidth &&
+                                innerRow + inner.texture.height <= destHeight)
+                            {
+                                Transition(inner.texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                                Transition(created.texture, D3D12_RESOURCE_STATE_COPY_DEST);
+                                D3D12_TEXTURE_COPY_LOCATION source{ inner.texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                                D3D12_TEXTURE_COPY_LOCATION dest{ created.texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                                g.list->CopyTextureRegion(&dest, 0, innerRow, 0, &source, nullptr);
+                            }
+
+                            if (inside || it->first == destBase)
+                            {
+                                ReleaseTexture(inner.texture);
+                                it = g.resolvedTextures.erase(it);
+                            }
+                            else
+                            {
+                                ++it;
+                            }
+                        }
+
+                        target = &g.resolvedTextures.insert_or_assign(destBase, std::move(created)).first->second;
                     }
                 }
 
-                if (resolved.texture.resource)
+                if (target)
                 {
+                    auto& resolved = *target;
                     struct BlitConstants
                     {
                         int32_t sourceOffset[2];
                         uint32_t sourceIndex;
                         uint32_t swapRedBlue;
                         float scale[4];
-                    } constants{ { 0, 0 }, source->srv, destInfo.Swap() ? 1u : 0u };
+                        int32_t sampleScale[2];
+                    } constants{ { 0, -int32_t(row) }, source->srv, destInfo.Swap() ? 1u : 0u };
+                    constants.sampleScale[0] = int32_t(sampleScale.x);
+                    constants.sampleScale[1] = int32_t(sampleScale.y);
                     float scale = std::ldexp(1.0f, destInfo.ExpBias());
                     for (float& value : constants.scale)
                         value = scale;
@@ -1787,14 +1916,16 @@ float4 main(float4 position : SV_Position) : SV_Target
                         uint32_t depthIndex;
                         uint32_t stencilIndex;
                         uint32_t floatDepth;
-                    } depthConstants{ { 0, 0 }, source->srv, source->stencilSrv,
-                        DepthInfo{ registers[RB_DEPTH_INFO] }.Format() == 1 ? 1u : 0u };
+                        int32_t sampleScale[2];
+                    } depthConstants{ { 0, -int32_t(row) }, source->srv, source->stencilSrv,
+                        DepthInfo{ registers[RB_DEPTH_INFO] }.Format() == 1 ? 1u : 0u, { int32_t(sampleScale.x), int32_t(sampleScale.y) } };
 
                     Transition(*source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     Transition(resolved.texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
                     auto rtv = CpuRtv(resolved.texture.rtv);
                     g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-                    SetViewportAndScissor(destWidth, destHeight, rect);
+                    D3D12_RECT destRect{ rect.left, rect.top + LONG(row), rect.right, rect.bottom + LONG(row) };
+                    SetViewportAndScissor(resolved.texture.width, resolved.texture.height, destRect);
                     g.list->SetPipelineState(GetBlitPipeline(destFormat, false, depthSource));
                     g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS,
@@ -1817,18 +1948,20 @@ float4 main(float4 position : SV_Position) : SV_Target
             float color[4] = { float(clear & 0xFF) / 255.0f, float((clear >> 8) & 0xFF) / 255.0f,
                 float((clear >> 16) & 0xFF) / 255.0f, float(clear >> 24) / 255.0f };
             Transition(*source, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            g.list->ClearRenderTargetView(CpuRtv(source->rtv), color, 1, &rect);
+            D3D12_RECT sourceRect = ScaleRect(rect, sampleScale);
+            g.list->ClearRenderTargetView(CpuRtv(source->rtv), color, 1, &sourceRect);
         }
 
         if (control.DepthClear())
         {
             DepthInfo info{ registers[RB_DEPTH_INFO] };
-            if (Texture* depth = GetRenderTarget(info.Base(), pitch, info.Format(), true))
+            if (Texture* depth = GetRenderTarget(info.Base(), pitch * sampleScale.x, info.Format(), true))
             {
                 uint32_t clear = registers[RB_DEPTH_CLEAR];
+                D3D12_RECT depthRect = ScaleRect(rect, sampleScale);
                 Transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 g.list->ClearDepthStencilView(CpuDsv(depth->dsv), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                    float(clear >> 8) / 16777215.0f, UINT8(clear & 0xFF), 1, &rect);
+                    float(clear >> 8) / 16777215.0f, UINT8(clear & 0xFF), 1, &depthRect);
             }
         }
     }
@@ -1923,7 +2056,14 @@ float4 main(float4 position : SV_Position) : SV_Target
         TextureFetch fetch;
         memcpy(fetch.words, swap.fetchConstant, sizeof(fetch.words));
         uint32_t frontBuffer = fetch.words[1] != 0 ? fetch.BaseAddress() : swap.frontBuffer;
-        auto resolved = g.resolvedTextures.find(frontBuffer);
+        uint32_t frontBufferRow;
+        ResolvedTexture* frontBufferTexture = FindResolved(frontBuffer, 0, frontBufferRow);
+        auto resolved = g.resolvedTextures.end();
+        for (auto it = g.resolvedTextures.begin(); it != g.resolvedTextures.end(); ++it)
+        {
+            if (&it->second == frontBufferTexture)
+                resolved = it;
+        }
         if (getenv("AR_LOG_PRESENT") && (g.frameNumber % 150 == 0 || (g.frameNumber >= 300 && g.frameNumber < 303)))
             LOGF_INFO("present {}: front buffer 0x{:08X} (packet 0x{:08X}, fetch {:08X} {:08X}), {}", g.frameNumber, frontBuffer,
                 swap.frontBuffer, fetch.words[0], fetch.words[1], resolved != g.resolvedTextures.end() ? "found" : "not resolved");

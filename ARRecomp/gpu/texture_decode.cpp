@@ -209,6 +209,19 @@ namespace gpu
         out.data.assign(size_t(out.rowPitch) * out.rowCount * slices, 0);
 
         const uint8_t* base = g_memory.Translate<uint8_t>(PhysicalToVirtual(fetch.BaseAddress()));
+
+        // Packed mips: textures with a side of 16 texels or less sit 16 texels into their 32x32 tile, below it
+        // when wider than tall, else beside it (Xenia's texture_util GetPackedMipOffset, for the base level).
+        uint32_t offsetX = 0, offsetY = 0;
+        if (fetch.Tiled() && ((fetch.words[5] >> 11) & 1))
+        {
+            uint32_t log2Width = std::bit_width(fetch.Width() - 1), log2Height = std::bit_width(fetch.Height() - 1);
+            if (std::min(log2Width, log2Height) <= 4)
+            {
+                bool wide = log2Width > std::max<uint32_t>(log2Height, 1);
+                (wide ? offsetY : offsetX) = 16 / info.blockSize;
+            }
+        }
         uint32_t bppLog2 = std::countr_zero(info.bytesPerBlock);
         uint8_t block[16];
 
@@ -223,7 +236,7 @@ namespace gpu
                 for (uint32_t x = 0; x < layout.widthBlocks; x++)
                 {
                     size_t offset = fetch.Tiled()
-                        ? size_t(xe::gpu::texture_address::Tiled2D(int32_t(x), int32_t(y), layout.pitchBlocks, bppLog2))
+                        ? size_t(xe::gpu::texture_address::Tiled2D(int32_t(x + offsetX), int32_t(y + offsetY), layout.pitchBlocks, bppLog2))
                         : size_t(y) * layout.rowPitchBytes + size_t(x) * info.bytesPerBlock;
 
                     memcpy(block, slice + offset, info.bytesPerBlock);

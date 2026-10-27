@@ -27,6 +27,7 @@ cbuffer XeSystemConstants : register(b0)
     float4 xe_color_exp_bias;
     uint4 xe_textures[32];          // Descriptor index, sampler index, swizzle, sign/gamma flags.
     int4 xe_vertex_data_offsets[24]; // Byte offset from a guest address to the draw's vertex data.
+    float4 xe_texture_transforms[32]; // UV scale (xy) and offset (zw) onto the host texture.
 };
 
 cbuffer XeFloatConstants : register(b1)
@@ -653,6 +654,11 @@ float4 xe_cube(float4 a, float4 b)
                     coords = fmt::format("({} / xe_size.xy)", coords);
                 if (attributes.offset_x != 0.0f || attributes.offset_y != 0.0f)
                     coords = fmt::format("({} + float2({}f, {}f) / xe_size.xy)", coords, attributes.offset_x, attributes.offset_y);
+                // Unnormalized coordinates are already in host texels; normalized ones span the fetch's size.
+                if (attributes.unnormalized_coordinates)
+                    coords = fmt::format("({} + xe_texture_transforms[{}].zw)", coords, fetchConstant);
+                else
+                    coords = fmt::format("({} * xe_texture_transforms[{}].xy + xe_texture_transforms[{}].zw)", coords, fetchConstant, fetchConstant);
                 value = sample("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)]", coords);
                 break;
             }
