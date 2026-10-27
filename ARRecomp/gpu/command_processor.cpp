@@ -437,9 +437,20 @@ namespace gpu
 
         case PM4_EVENT_WRITE_ZPD:
         {
-            static std::atomic<bool> warned;
-            if (!warned.exchange(true))
-                LOGF_WARNING("occlusion queries are not implemented");
+            // Occlusion query begin and end both write a report of cumulative sample counts to RB_SAMPLE_COUNT_ADDR;
+            // D3D subtracts them and polls until the end report replaces its pending marker. Queries aren't
+            // measured: the counter advances by a fixed amount, so every query completes and reports visible.
+            WriteRegister(VGT_EVENT_INITIATOR, read() & 0x3F);
+            static uint64_t samples;
+            samples += 4096;
+            uint32_t address = Registers()[RB_SAMPLE_COUNT_ADDR];
+            if (address != 0)
+            {
+                auto* report = g_memory.Translate<uint32_t>(PhysicalToVirtual(address & ~3u));
+                uint32_t a = uint32_t(samples) - (uint32_t(samples) >> 1), b = uint32_t(samples) >> 1;
+                const uint32_t values[8] = { a, b, 0, 0, a, b, 0, 0 }; // Total, ZFail, ZPass, StencilFail (little endian).
+                memcpy(report, values, sizeof(values));
+            }
             break;
         }
 

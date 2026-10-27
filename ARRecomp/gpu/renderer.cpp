@@ -1,5 +1,10 @@
 #include <stdafx.h>
 #include "renderer.h"
+#include "d3d12_renderer.h"
+#include "hlsl_translator.h"
+#include "shader_compiler.h"
+#include "xenia/base/string_buffer.h"
+#include "xenia/gpu/shader.h"
 
 namespace gpu
 {
@@ -10,7 +15,42 @@ namespace gpu
         uint32_t type;
         uint64_t hash;
         std::vector<uint32_t> words; // Host byte order.
+
+        // Translated on first use.
+        std::unique_ptr<xe::gpu::Shader> shader;
+        std::vector<uint8_t> code;
+        bool translated = false;
     };
+
+    static bool g_renderingDisabled;
+
+    void DisableRendering()
+    {
+        g_renderingDisabled = true;
+    }
+
+    // Analyzes, translates and compiles a shader the first time a draw uses it.
+    static bool PrepareShader(ShaderMicrocode& microcode)
+    {
+        if (microcode.translated)
+            return !microcode.code.empty();
+
+        microcode.translated = true;
+        static xe::StringBuffer buffer;
+        microcode.shader = std::make_unique<xe::gpu::Shader>(microcode.type == 0 ? xe::gpu::xenos::ShaderType::kVertex :
+            xe::gpu::xenos::ShaderType::kPixel, microcode.hash, microcode.words.data(), microcode.words.size(), std::endian::little);
+        microcode.shader->AnalyzeUcode(buffer);
+
+        std::string hlsl = TranslateShaderToHlsl(*microcode.shader);
+        for (const auto& error : microcode.shader->GetOrCreateTranslation(0)->errors())
+            LOGF_WARNING("shader {:016X}: {}", microcode.hash, error.message);
+        if (hlsl.empty())
+            return false;
+
+        auto name = fmt::format("{}_{:016X}", microcode.type == 0 ? "vs" : "ps", microcode.hash);
+        microcode.code = CompileHlsl(hlsl, microcode.type == 0 ? L"vs_6_0" : L"ps_6_0", name.c_str());
+        return !microcode.code.empty();
+    }
 
     static std::unordered_map<uint64_t, std::unique_ptr<ShaderMicrocode>> g_shaders;
     static ShaderMicrocode* g_activeShaders[2];
@@ -151,6 +191,25 @@ namespace gpu
     {
         if (SurveyThisFrame())
             SurveyDraw(registers, draw);
+
+        if (g_renderingDisabled)
+            return;
+
+        // Resolves don't run shaders.
+        auto mode = Bits<EdramMode>(registers[RB_MODECONTROL], 0, 3);
+        auto* vertex = g_activeShaders[0];
+        auto* pixel = g_activeShaders[1];
+        d3d12::HostShader vertexShader{}, pixelShader{};
+        if (mode != EdramMode::Copy)
+        {
+            if (!vertex || !PrepareShader(*vertex))
+                return;
+            vertexShader = { vertex->shader.get(), &vertex->code, vertex->hash };
+            if (pixel && PrepareShader(*pixel))
+                pixelShader = { pixel->shader.get(), &pixel->code, pixel->hash };
+        }
+
+        d3d12::Draw(registers, draw, vertexShader, pixelShader.code ? &pixelShader : nullptr);
     }
 
     void Swap(const be<uint32_t>* registers, const SwapInfo& swap)
@@ -160,5 +219,8 @@ namespace gpu
 
         g_survey = {};
         g_surveyFrame++;
+
+        if (!g_renderingDisabled)
+            d3d12::Present(registers, swap);
     }
 }

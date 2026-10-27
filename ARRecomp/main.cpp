@@ -2,6 +2,8 @@
 #include <cpu/guest_thread.h>
 #include <gpu/command_processor.h>
 #include <gpu/renderer.h>
+#include <gpu/d3d12_renderer.h>
+#include <gpu/shader_compiler.h>
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <kernel/variables.h>
@@ -52,6 +54,10 @@ int main(int argc, char* argv[])
             logger::g_minimumLevel = logger::Level::Trace;
         else if (arg == "--gpu-survey")
             gpuSurvey = true;
+        else if (arg == "--screenshots")
+            gpu::d3d12::EnableScreenshots("screenshots");
+        else if (arg == "--headless")
+            gpu::DisableRendering();
         else if (arg == "--dump-threads" && i + 1 < argc)
             dumpThreadsAfter = atoi(argv[++i]);
         else
@@ -69,6 +75,7 @@ int main(int argc, char* argv[])
 
     if (gpuSurvey)
         gpu::EnableSurvey(userPath / "shaders");
+    gpu::SetShaderCacheFolder(userPath / "shader_cache");
 
     if (g_memory.base == nullptr)
     {

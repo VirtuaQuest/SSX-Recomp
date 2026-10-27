@@ -28,6 +28,9 @@ namespace gpu
     void IssueDraw(const be<uint32_t>* registers, const DrawCall& draw);
     void Swap(const be<uint32_t>* registers, const SwapInfo& swap);
 
+    // Runs without a window, skipping all host rendering (the command processor still runs).
+    void DisableRendering();
+
     // Logs a summary of the GPU work of every 300th frame and saves the shaders to the folder (empty: off).
     void EnableSurvey(const std::filesystem::path& shaderFolder);
 }

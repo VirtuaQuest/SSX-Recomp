@@ -77,6 +77,8 @@ namespace gpu::reg
     constexpr uint32_t RB_COPY_REF = 0x2321;
     constexpr uint32_t RB_COPY_MASK = 0x2322;
     constexpr uint32_t RB_COPY_SURFACE_SLICE = 0x2323;
+    constexpr uint32_t RB_SAMPLE_COUNT_CTL = 0x2324;
+    constexpr uint32_t RB_SAMPLE_COUNT_ADDR = 0x2325;
 
     // Shader constants: 512 float4 (256 each for the vertex and pixel shaders), then the fetch constants
     // (32 texture fetch constants of 6 words, which alias 96 vertex fetch constants of 2 words), the boolean
