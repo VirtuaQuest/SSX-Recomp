@@ -119,16 +119,20 @@ static bool IsKeyDown(const XINPUT_GAMEPAD& pad, const KeyMapping& key)
 static std::mutex g_keystrokeMutex;
 static KeystrokeState g_keystrokes[XUSER_MAX_COUNT];
 
-// Debugging without a controller (AR_AUTO_PRESS=<seconds>): controller 0 taps A every that many seconds.
-static bool AutoPressA()
+// Debugging without a controller (AR_AUTO_PRESS=<seconds>): controller 0 taps a button every that many seconds,
+// alternating A and Start.
+static uint16_t AutoPressButtons()
 {
     static const int period = getenv("AR_AUTO_PRESS") ? atoi(getenv("AR_AUTO_PRESS")) : 0;
     static const auto start = std::chrono::steady_clock::now();
     if (period <= 0)
-        return false;
+        return 0;
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    return elapsed > period * 1000 && elapsed % (period * 1000) < 150;
+    if (elapsed < period * 1000 || elapsed % (period * 1000) >= 150)
+        return 0;
+
+    return (elapsed / (period * 1000)) % 2 ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_START;
 }
 
 static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
@@ -139,9 +143,16 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
 
     if (user == 0 && getenv("AR_AUTO_PRESS"))
     {
-        if (AutoPressA())
-            state.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
-        state.dwPacketNumber = DWORD(std::chrono::steady_clock::now().time_since_epoch().count() / 10000000);
+        // The packet number changes with the state, which is how titles notice input.
+        static std::atomic<uint32_t> packet;
+        static std::atomic<uint16_t> lastButtons;
+        state.Gamepad.wButtons |= AutoPressButtons();
+        if (lastButtons.exchange(state.Gamepad.wButtons) != state.Gamepad.wButtons)
+        {
+            packet++;
+            LOGF_INFO("auto press: buttons 0x{:04X}", state.Gamepad.wButtons);
+        }
+        state.dwPacketNumber = packet;
         return true;
     }
 
@@ -272,6 +283,8 @@ namespace imports
         if (userIndex != nullptr)
             *userIndex = event.user;
 
+        if (getenv("AR_AUTO_PRESS"))
+            LOGF_INFO("keystroke 0x{:04X} flags {} to user {} (requested 0x{:X})", event.virtualKey, event.flags, event.user, user);
         return X_ERROR_SUCCESS;
     }
 }

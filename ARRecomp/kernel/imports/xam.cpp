@@ -41,6 +41,33 @@ static uint32_t FinishRequest(uint32_t overlapped, uint32_t result, uint32_t len
     return X_ERROR_IO_PENDING;
 }
 
+// Shows a system dialog the way the console does: the system UI notification goes out, the request completes
+// shortly after on another thread (titles poll the overlapped), and the UI closes after that. run fills in the
+// dialog's result. Based on Xenia's headless dialogs (xam_ui.cc).
+static uint32_t ShowSystemDialog(uint32_t overlapped, std::function<uint32_t()> run)
+{
+    PostNotification(XN_SYS_UI, 1);
+
+    if (overlapped == 0)
+    {
+        uint32_t result = run();
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            PostNotification(XN_SYS_UI, 0);
+        }).detach();
+        return result;
+    }
+
+    GuestPtr<be<uint32_t>>(overlapped)[0] = X_ERROR_IO_PENDING;
+    std::thread([overlapped, run] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        CompleteOverlapped(overlapped, run(), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        PostNotification(XN_SYS_UI, 0);
+    }).detach();
+    return X_ERROR_IO_PENDING;
+}
+
 // ---- Enumerators ----
 
 struct EnumeratorObject : KernelObject
@@ -259,10 +286,26 @@ namespace imports
         }
     }
 
+    // XGI (app 0xFB): user context and properties (game mode, presence), sessions, achievements and leaderboards.
+    // Without Xbox Live these have nothing to do; accepting them lets titles continue.
+    constexpr uint32_t XGI_APP = 0xFB;
+
+    static uint32_t DispatchXgiMessage(uint32_t message)
+    {
+        static std::mutex mutex;
+        static std::set<uint32_t> logged;
+        std::lock_guard lock(mutex);
+        if (logged.insert(message).second)
+            LOGF_INFO("XGI message 0x{:08X} accepted", message);
+        return X_ERROR_SUCCESS;
+    }
+
     uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, uint32_t parameter1, uint32_t parameter2)
     {
         if (app == XMP_APP)
             return DispatchXmpMessage(message, parameter1);
+        if (app == XGI_APP)
+            return DispatchXgiMessage(message);
 
         LOGF_WARNING("unhandled message 0x{:08X} to app 0x{:08X}", message, app);
         return X_ERROR_NOT_FOUND;
@@ -272,6 +315,8 @@ namespace imports
     {
         if (app == XMP_APP)
             return FinishRequest(overlapped, DispatchXmpMessage(message, buffer));
+        if (app == XGI_APP)
+            return FinishRequest(overlapped, DispatchXgiMessage(message));
 
         LOGF_WARNING("unhandled I/O request 0x{:08X} to app 0x{:08X}", message, app);
         return FinishRequest(overlapped, X_ERROR_NOT_FOUND);
@@ -281,6 +326,8 @@ namespace imports
     {
         if (app == XMP_APP)
             return FinishRequest(overlapped, DispatchXmpMessage(message, buffer));
+        if (app == XGI_APP)
+            return FinishRequest(overlapped, DispatchXgiMessage(message));
 
         LOGF_WARNING("unhandled I/O request 0x{:08X} to app 0x{:08X}", message, app);
         return FinishRequest(overlapped, X_ERROR_NOT_FOUND);
@@ -565,9 +612,7 @@ namespace imports
 
     uint32_t XamShowSigninUI(uint32_t unknown, uint32_t mask)
     {
-        PostNotification(XN_SYS_UI, 1);
-        PostNotification(XN_SYS_UI, 0);
-        return X_ERROR_SUCCESS;
+        return ShowSystemDialog(0, [] { return X_ERROR_SUCCESS; });
     }
 
     uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType, uint32_t contentFlags, uint64_t totalRequested,
@@ -577,20 +622,32 @@ namespace imports
         return FinishRequest(overlapped, X_ERROR_SUCCESS);
     }
 
+    // Message boxes have no UI here: the first button is chosen, which is the affirmative one ("Yes", "OK",
+    // "Continue") in system and title dialogs. The focused button is often "No".
+    static uint32_t ShowMessageBox(be<uint16_t>* title, be<uint16_t>* text, uint32_t buttonCount, uint32_t buttons,
+        uint32_t activeButton, be<uint32_t>* result, uint32_t overlapped)
+    {
+        std::string labels;
+        for (uint32_t i = 0; i < buttonCount; i++)
+        {
+            uint32_t label = *GuestPtr<be<uint32_t>>(buttons + i * 4);
+            labels += fmt::format("{}\"{}\"", i ? ", " : "", label ? ReadWideString(GuestPtr<be<uint16_t>>(label)) : "");
+        }
+
+        LOGF_WARNING("message box \"{}\": {} [{}] (focused {}, answered 0)", ReadWideString(title), ReadWideString(text), labels, activeButton);
+        return ShowSystemDialog(overlapped, [result] { *result = 0; return X_ERROR_SUCCESS; });
+    }
+
     uint32_t XamShowMessageBoxUI(uint32_t userIndex, be<uint16_t>* title, be<uint16_t>* text, uint32_t buttonCount,
         uint32_t buttons, uint32_t activeButton, uint32_t flags, be<uint32_t>* result, uint32_t overlapped)
     {
-        LOGF_WARNING("message box \"{}\": {}", ReadWideString(title), ReadWideString(text));
-        *result = activeButton;
-        return FinishRequest(overlapped, X_ERROR_SUCCESS);
+        return ShowMessageBox(title, text, buttonCount, buttons, activeButton, result, overlapped);
     }
 
     uint32_t XamShowMessageBoxUIEx(uint32_t userIndex, be<uint16_t>* title, be<uint16_t>* text, uint32_t buttonCount,
         uint32_t buttons, uint32_t activeButton, uint32_t flags, uint32_t unknown, be<uint32_t>* result, uint32_t overlapped)
     {
-        LOGF_WARNING("message box \"{}\": {}", ReadWideString(title), ReadWideString(text));
-        *result = activeButton;
-        return FinishRequest(overlapped, X_ERROR_SUCCESS);
+        return ShowMessageBox(title, text, buttonCount, buttons, activeButton, result, overlapped);
     }
 
     uint32_t XamShowDirtyDiscErrorUI(uint32_t userIndex)
