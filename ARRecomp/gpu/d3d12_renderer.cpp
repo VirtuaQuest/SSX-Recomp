@@ -1222,7 +1222,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             // 8888 color targets also take the raw words of depth buffers over them (games clear color by clearing
             // depth at the same EDRAM address).
             bool depthIntoColor = !key.depth && otherKey.depth && (key.format == 0 || key.format == 1);
-            bool colorIntoDepth = key.depth && !otherKey.depth && (otherKey.format == 0 || otherKey.format == 1);
+            static const bool noColorIntoDepth = getenv("AR_NO_COLOR_TO_DEPTH") != nullptr;
+            bool colorIntoDepth = !noColorIntoDepth && key.depth && !otherKey.depth && (otherKey.format == 0 || otherKey.format == 1);
             if (otherKey == key || otherKey.pitch != key.pitch ||
                 (!depthIntoColor && !colorIntoDepth && (otherKey.depth != key.depth || otherKey.format != key.format)))
                 continue;
@@ -1873,10 +1874,11 @@ float4 main(float4 position : SV_Position) : SV_Target
                     // Raw depth words can't be filtered.
                     // Filters set in the fetch instruction override the fetch constant's.
                     TextureFetch samplerFetch = fetch;
+                    static const bool noFilterOverride = getenv("AR_NO_FILTER_OVERRIDE") != nullptr;
                     const auto& attributes = binding.fetch_instr.attributes;
                     auto overrideField = [&](uint32_t value, uint32_t useFetchConst, uint32_t shift, uint32_t mask)
                         {
-                            if (value != useFetchConst)
+                            if (value != useFetchConst && !noFilterOverride)
                                 samplerFetch.words[3] = (samplerFetch.words[3] & ~(mask << shift)) | (value << shift);
                         };
                     overrideField(uint32_t(attributes.mag_filter), 3, 19, 3);
