@@ -2009,6 +2009,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         static const int highlightPrimitive = getenv("AR_HIGHLIGHT_PRIM") ? atoi(getenv("AR_HIGHLIGHT_PRIM")) : -1;
         if (int(draw.initiator.PrimType()) == highlightPrimitive)
             system.flags |= 16;
+        // AR_HIGHLIGHT_PS=<hash prefix>: draws with that pixel shader output solid magenta.
+        static const char* highlightShader = getenv("AR_HIGHLIGHT_PS");
+        if (highlightShader && pixelShader && fmt::format("{:016X}", pixelShader->hash).rfind(highlightShader, 0) == 0)
+            system.flags |= 16;
         if (draw.initiator.PrimType() == PrimitiveType::PointList)
         {
             // PA_SU_POINT_SIZE and PA_SU_POINT_MINMAX hold radii in 12.4 fixed point.
@@ -2138,6 +2142,29 @@ float4 main(float4 position : SV_Position) : SV_Target
                 colorMask, depthControl, pitch, scissor.left, scissor.top, scissor.right, scissor.bottom,
                 system.ndcScale[0], system.ndcScale[1], system.ndcScale[2], system.ndcOffset[0], system.ndcOffset[1], system.ndcOffset[2],
                 vte, key.blend[0], textures);
+            // AR_TRACE_PS=<hash prefix>: the float constants that draw's shaders read.
+            if (const char* tracePs = getenv("AR_TRACE_PS"); tracePs && pixelShader &&
+                fmt::format("{:016X}", pixelShader->hash).rfind(tracePs, 0) == 0)
+            {
+                LOGF_INFO("  loop constants 31 {:08X} 0 {:08X}, bool {:08X} {:08X}", uint32_t(registers[SHADER_CONSTANT_LOOP_00 + 31]),
+                    uint32_t(registers[SHADER_CONSTANT_LOOP_00]), uint32_t(registers[SHADER_CONSTANT_BOOL_000_031]),
+                    uint32_t(registers[SHADER_CONSTANT_BOOL_000_031 + 4]));
+                for (int stage = 0; stage < 2; stage++)
+                {
+                    const HostShader* shader = stage == 0 ? &vertexShader : pixelShader;
+                    uint32_t base = std::min<uint32_t>(registers[stage == 0 ? 0x2307 : 0x2308] & 0x1FF, 256);
+                    const auto& map = shader->shader->constant_register_map();
+                    for (uint32_t i = 0; i < 256; i++)
+                    {
+                        if (!((map.float_bitmap[i / 64] >> (i % 64)) & 1))
+                            continue;
+                        float c[4];
+                        for (uint32_t k = 0; k < 4; k++)
+                            c[k] = RegisterFloat(registers, SHADER_CONSTANT_000_X + (base + i) * 4 + k);
+                        LOGF_INFO("  {} c{} = {} {} {} {}", stage == 0 ? "vs" : "ps", i, c[0], c[1], c[2], c[3]);
+                    }
+                }
+            }
             LOGF_INFO("  line {:08X} point {:08X} {:08X}", uint32_t(registers[0x2282]), uint32_t(registers[PA_SU_POINT_SIZE]),
                 uint32_t(registers[PA_SU_POINT_MINMAX]));
             LOGF_INFO("  surface {:08X} color {:08X} depth {:08X} window {:08X} vport {} {} {} {}", uint32_t(registers[RB_SURFACE_INFO]),
