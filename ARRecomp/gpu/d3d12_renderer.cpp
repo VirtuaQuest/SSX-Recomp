@@ -74,6 +74,9 @@ namespace gpu::d3d12
         uint32_t stencilSrv = UINT32_MAX; // Depth buffers.
         uint32_t rtv = UINT32_MAX;
         uint32_t dsv = UINT32_MAX;
+        // Render targets: the sample layout their texels are in. 0 is EDRAM order (as single sampled surfaces see
+        // it); 1 and 2 are as rasterized with 2x and 4x MSAA (a sample per texel, samples of a pixel adjacent).
+        uint32_t layout = 0;
     };
 
     struct DescriptorAllocator
@@ -213,6 +216,9 @@ namespace gpu::d3d12
         std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader, depthCopyPixelShader,
             colorToDepthPixelShader;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> colorToDepthPipelines;
+        std::vector<uint8_t> layoutPixelShader, layoutDepthPixelShader;
+        std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> layoutPipelines;
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Texture> layoutScratch;
         bool stencilRefSupported = false;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthCopyPipelines;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthBlitPipelines;
@@ -592,6 +598,75 @@ float main(float4 position : SV_Position
 }
 )";
 
+    // Reorders a render target's texels between sample layouts (see Texture::layout). EDRAM interleaves the samples
+    // of 2x2 pixel blocks (Xenia's render target cache, canonical sample coordinates):
+    //   2x: u = (x & ~2) | (sample << 1), v = ((y >> 1) << 2) | (x & 2) | (y & 1)
+    //   4x: u = ((x >> 1) << 2) | (sampleX << 1) | (x & 1), likewise v with y and sampleY.
+    static constexpr const char* LAYOUT_PS = R"(
+cbuffer LayoutConstants : register(b0)
+{
+    uint sourceIndex;
+    uint stencilIndex;
+    uint fromLayout;
+    uint toLayout;
+};
+
+Texture2D<float4> textures[] : register(t0, space0);
+Texture2D<uint4> uintTextures[] : register(t0, space4);
+
+uint2 ToCanonical(uint layout, uint2 h)
+{
+    if (layout == 1u)
+    {
+        uint x = h.x, y = h.y >> 1u, sample = h.y & 1u;
+        return uint2((x & ~2u) | (sample << 1u), ((y >> 1u) << 2u) | (x & 2u) | (y & 1u));
+    }
+    if (layout == 2u)
+    {
+        uint2 p = h >> 1u, sample = h & 1u;
+        return ((p >> 1u) << 2u) | (sample << 1u) | (p & 1u);
+    }
+    return h;
+}
+
+uint2 FromCanonical(uint layout, uint2 c)
+{
+    if (layout == 1u)
+    {
+        uint x = (c.x & ~3u) | (c.y & 2u) | (c.x & 1u), sample = (c.x >> 1u) & 1u;
+        uint y = ((c.y >> 2u) << 1u) | (c.y & 1u);
+        return uint2(x, y * 2u + sample);
+    }
+    if (layout == 2u)
+    {
+        uint2 sample = (c >> 1u) & 1u, p = ((c >> 2u) << 1u) | (c & 1u);
+        return p * 2u + sample;
+    }
+    return c;
+}
+
+#ifdef DEPTH
+float main(float4 position : SV_Position
+#ifdef STENCIL_REF
+    , out uint stencil : SV_StencilRef
+#endif
+    ) : SV_Depth
+{
+    int3 coords = int3(FromCanonical(fromLayout, ToCanonical(toLayout, uint2(position.xy))), 0);
+#ifdef STENCIL_REF
+    stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
+#endif
+    return textures[NonUniformResourceIndex(sourceIndex)].Load(coords).r;
+}
+#else
+float4 main(float4 position : SV_Position) : SV_Target
+{
+    int3 coords = int3(FromCanonical(fromLayout, ToCanonical(toLayout, uint2(position.xy))), 0);
+    return textures[NonUniformResourceIndex(sourceIndex)].Load(coords);
+}
+#endif
+)";
+
     static constexpr const char* PRESENT_PS = R"(
 cbuffer PresentConstants : register(b0)
 {
@@ -787,6 +862,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.blitPixelShader = CompileInternal(BLIT_PS, L"ps_6_0", "blit_ps");
         g.presentPixelShader = CompileInternal(PRESENT_PS, L"ps_6_0", "present_ps");
         g.depthBlitPixelShader = CompileInternal(DEPTH_BLIT_PS, L"ps_6_0", "depth_blit_ps");
+        g.layoutPixelShader = CompileInternal(LAYOUT_PS, L"ps_6_0", "layout_ps");
+        g.layoutDepthPixelShader = CompileInternal((std::string("#define DEPTH\n") +
+            (g.stencilRefSupported ? "#define STENCIL_REF\n" : "") + LAYOUT_PS).c_str(), L"ps_6_0", "layout_depth_ps");
         g.colorToDepthPixelShader = CompileInternal(
             (std::string(g.stencilRefSupported ? "#define STENCIL_REF\n" : "") + COLOR_TO_DEPTH_PS).c_str(), L"ps_6_0", "color_to_depth_ps");
         g.depthCopyPixelShader = CompileInternal(
@@ -1212,6 +1290,100 @@ float4 main(float4 position : SV_Position) : SV_Target
         return !depth && (format == 5 || format == 7 || format == 15) ? 40 : 80;
     }
 
+    static D3D12_SHADER_BYTECODE Bytecode(const std::vector<uint8_t>& code);
+
+    static ID3D12PipelineState* GetLayoutPipeline(DXGI_FORMAT format, bool depth)
+    {
+        auto& pipeline = g.layoutPipelines[uint32_t(format) | (depth ? 0x10000u : 0u)];
+        if (pipeline)
+            return pipeline.Get();
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = g.rootSignature.Get();
+        desc.VS = Bytecode(g.blitVertexShader);
+        desc.PS = Bytecode(depth ? g.layoutDepthPixelShader : g.layoutPixelShader);
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.SampleDesc.Count = 1;
+        if (depth)
+        {
+            desc.DepthStencilState.DepthEnable = TRUE;
+            desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            if (g.stencilRefSupported)
+            {
+                desc.DepthStencilState.StencilEnable = TRUE;
+                desc.DepthStencilState.StencilReadMask = 0xFF;
+                desc.DepthStencilState.StencilWriteMask = 0xFF;
+                desc.DepthStencilState.FrontFace = { D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_REPLACE,
+                    D3D12_COMPARISON_FUNC_ALWAYS };
+                desc.DepthStencilState.BackFace = desc.DepthStencilState.FrontFace;
+            }
+            desc.DSVFormat = format;
+        }
+        else
+        {
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            desc.NumRenderTargets = 1;
+            desc.RTVFormats[0] = format;
+        }
+        if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline))))
+            LOGF_ERROR("failed to create the layout pipeline for format {}", uint32_t(format));
+        return pipeline.Get();
+    }
+
+    // Reorders a render target's texels into another sample layout, through a scratch copy.
+    static void ConvertLayout(Texture& texture, uint32_t layout)
+    {
+        static const bool disabled = getenv("AR_NO_LAYOUT") != nullptr;
+        if (disabled || texture.layout == layout || !texture.resource)
+            return;
+
+        bool depth = texture.dsv != UINT32_MAX;
+        auto& scratch = g.layoutScratch[{ uint32_t(texture.format), texture.width, texture.height }];
+        if (!scratch.resource)
+        {
+            scratch = CreateTexture(texture.width, texture.height, 1, false, texture.format,
+                depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            if (!scratch.resource)
+                return;
+        }
+
+        Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(scratch, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyResource(scratch.resource.Get(), texture.resource.Get());
+        Transition(scratch, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+        if (depth)
+        {
+            Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            auto dsv = CpuDsv(texture.dsv);
+            g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        }
+        else
+        {
+            Transition(texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto rtv = CpuRtv(texture.rtv);
+            g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        }
+        SetViewportAndScissor(texture.width, texture.height, { 0, 0, LONG(texture.width), LONG(texture.height) });
+        g.list->SetPipelineState(GetLayoutPipeline(texture.format, depth));
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        struct
+        {
+            uint32_t sourceIndex;
+            uint32_t stencilIndex;
+            uint32_t fromLayout;
+            uint32_t toLayout;
+        } constants{ scratch.srv, scratch.stencilSrv, texture.layout, layout };
+        g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+        g.list->DrawInstanced(3, 1, 0, 0);
+        texture.layout = layout;
+    }
+
     static D3D12_RECT UnionRect(const D3D12_RECT& a, const D3D12_RECT& b)
     {
         return { std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right), std::max(a.bottom, b.bottom) };
@@ -1270,6 +1442,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         for (auto& [otherStamp, entry] : newer)
         {
             auto& [otherKey, other] = entry;
+            ConvertLayout(texture, 0);
+            ConvertLayout(*other, 0);
             // The other target's row 0 is at this one's row `rows` (in samples).
             int32_t rows = (int32_t(otherKey->base) - int32_t(key.base)) / int32_t(pitchTiles) * 16;
             uint32_t sourceTop = uint32_t(std::max(0, -rows)), destTop = uint32_t(std::max(0, rows));
@@ -1807,6 +1981,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             colorTargets[i] = GetRenderTarget(info.Base(), pitch, info.Format(), false);
             if (!colorTargets[i])
                 return;
+            ConvertLayout(*colorTargets[i], SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples());
 
             key.renderTargetCount = uint8_t(i + 1);
             key.renderTargetFormats[i] = colorTargets[i]->format;
@@ -1823,6 +1998,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             depthTarget = GetRenderTarget(info.Base(), pitch, info.Format(), true);
             if (!depthTarget)
                 return;
+            ConvertLayout(*depthTarget, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples());
             key.depthFormat = depthTarget->format;
         }
         else
@@ -2378,6 +2554,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         if (!source)
             return;
+        ConvertLayout(*source, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples());
 
         D3D12_RECT rect{ x0, y0, x1, y1 };
         uint32_t destBase = registers[RB_COPY_DEST_BASE] & 0x1FFFFFFF;
