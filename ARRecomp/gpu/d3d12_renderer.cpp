@@ -218,6 +218,8 @@ namespace gpu::d3d12
         std::unordered_map<RenderTargetKey, Texture, RenderTargetKeyHash> renderTargets;
         // When each render target was last used: overlapping ones copy from those used after them.
         std::unordered_map<RenderTargetKey, uint64_t, RenderTargetKeyHash> renderTargetStamps;
+        // Regions recently written in each render target (in samples), with the stamp they were written under.
+        std::unordered_map<RenderTargetKey, std::vector<std::pair<uint64_t, D3D12_RECT>>, RenderTargetKeyHash> renderTargetWrites;
         uint64_t renderTargetClock = 0;
         std::unordered_map<uint32_t, ResolvedTexture> resolvedTextures;
         std::unordered_map<uint64_t, CachedTexture> textures;
@@ -521,6 +523,7 @@ cbuffer PresentConstants : register(b0)
     float2 viewportSize;
     uint sourceIndex;
     uint samplerIndex;
+    uint swapRedBlue; // The front buffer's fetch constant reads it as BGRA.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
@@ -529,7 +532,8 @@ SamplerState samplers[] : register(s0, space0);
 float4 main(float4 position : SV_Position) : SV_Target
 {
     float2 uv = (position.xy - viewportOrigin) / viewportSize;
-    return float4(textures[sourceIndex].SampleLevel(samplers[samplerIndex], uv, 0.0f).rgb, 1.0f);
+    float3 color = textures[sourceIndex].SampleLevel(samplers[samplerIndex], uv, 0.0f).rgb;
+    return float4(swapRedBlue ? color.bgr : color, 1.0f);
 }
 )";
 
@@ -748,7 +752,8 @@ float4 main(float4 position : SV_Position) : SV_Target
     }
 
     static bool TraceThisFrame();
-    static void SaveScreenshot(struct Texture& texture, uint32_t width, uint32_t height, const std::filesystem::path& path);
+    static void SaveScreenshot(struct Texture& texture, uint32_t width, uint32_t height, const std::filesystem::path& path,
+        bool swapRedBlue = false);
 
     // ---- Textures ----
 
@@ -1097,12 +1102,35 @@ float4 main(float4 position : SV_Position) : SV_Target
     }
 
     static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format);
+    static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present, bool depth);
     static void SetViewportAndScissor(uint32_t width, uint32_t height, D3D12_RECT scissor);
 
     // EDRAM tiles are 80x16 samples of 32 bits (40x16 of 64 bits).
     static uint32_t EdramTileWidth(uint32_t format, bool depth)
     {
         return !depth && (format == 5 || format == 7 || format == 15) ? 40 : 80;
+    }
+
+    static D3D12_RECT UnionRect(const D3D12_RECT& a, const D3D12_RECT& b)
+    {
+        return { std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right), std::max(a.bottom, b.bottom) };
+    }
+
+    // Notes a region written in a render target, under its current stamp.
+    static void RecordWrite(const RenderTargetKey& key, D3D12_RECT rect)
+    {
+        if (rect.left >= rect.right || rect.top >= rect.bottom)
+            return;
+
+        auto& writes = g.renderTargetWrites[key];
+        uint64_t stamp = g.renderTargetStamps[key];
+        if (!writes.empty() && writes.back().first == stamp)
+            writes.back().second = UnionRect(writes.back().second, rect);
+        else
+            writes.push_back({ stamp, rect });
+
+        if (writes.size() > 32)
+            writes.erase(writes.begin());
     }
 
     // Render targets whose EDRAM overlaps (same pitch and format, bases whole tile rows apart; games point
@@ -1116,7 +1144,11 @@ float4 main(float4 position : SV_Position) : SV_Target
         std::vector<std::pair<uint64_t, std::pair<const RenderTargetKey*, Texture*>>> newer;
         for (auto& [otherKey, other] : g.renderTargets)
         {
-            if (otherKey == key || otherKey.depth != key.depth || otherKey.format != key.format || otherKey.pitch != key.pitch)
+            // 8888 color targets also take the raw words of depth buffers over them (games clear color by clearing
+            // depth at the same EDRAM address).
+            bool depthIntoColor = !key.depth && otherKey.depth && (key.format == 0 || key.format == 1);
+            if (otherKey == key || otherKey.pitch != key.pitch ||
+                (!depthIntoColor && (otherKey.depth != key.depth || otherKey.format != key.format)))
                 continue;
             int32_t delta = int32_t(otherKey.base) - int32_t(key.base);
             uint64_t otherStamp = g.renderTargetStamps[otherKey];
@@ -1136,7 +1168,45 @@ float4 main(float4 position : SV_Position) : SV_Target
             uint32_t sourceTop = uint32_t(std::max(0, -rows)), destTop = uint32_t(std::max(0, rows));
             uint32_t height = RENDER_TARGET_HEIGHT - uint32_t(std::abs(rows));
 
-            if (key.depth)
+            if (!key.depth && otherKey->depth)
+            {
+                // Only what the depth buffer wrote since this target was last used: elsewhere its texture doesn't
+                // hold what EDRAM does (this target's own contents).
+                D3D12_RECT written{};
+                bool any = false;
+                for (auto& [writeStamp, rect] : g.renderTargetWrites[*otherKey])
+                {
+                    if (writeStamp > stamp)
+                    {
+                        written = any ? UnionRect(written, rect) : rect;
+                        any = true;
+                    }
+                }
+                if (!any)
+                    continue;
+
+                written.top = std::max<LONG>(written.top + rows, LONG(destTop));
+                written.bottom = std::min<LONG>(written.bottom + rows, LONG(destTop + height));
+                Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                Transition(texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                auto rtv = CpuRtv(texture.rtv);
+                g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                SetViewportAndScissor(texture.width, texture.height, written);
+                g.list->SetPipelineState(GetBlitPipeline(texture.format, false, true));
+                g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                struct
+                {
+                    int32_t sourceOffset[2];
+                    uint32_t depthIndex;
+                    uint32_t stencilIndex;
+                    uint32_t floatDepth;
+                    int32_t sampleScale[2];
+                } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, other->stencilSrv,
+                    otherKey->format == 1 ? 1u : 0u, { 1, 1 } };
+                g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+                g.list->DrawInstanced(3, 1, 0, 0);
+            }
+            else if (key.depth)
             {
                 Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1382,7 +1452,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         return pipeline.Get();
     }
 
-    static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present, bool depth = false)
+    static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present, bool depth)
     {
         auto& pipeline = present ? g.presentPipeline : depth ? g.depthBlitPipelines[format] : g.blitPipelines[format];
         if (pipeline)
@@ -1917,6 +1987,66 @@ float4 main(float4 position : SV_Position) : SV_Target
                 RegisterFloat(registers, PA_CL_VPORT_YSCALE), RegisterFloat(registers, PA_CL_VPORT_YOFFSET));
         }
 
+        // Regions written, for render targets sharing EDRAM. Clears drawn as a rectangle in screen coordinates
+        // cover their rectangle, not the scissor (which is often the whole 8192x8192 space).
+        {
+            D3D12_RECT written = ScaleRect(GetScissor(registers), sampleScale);
+            written.right = std::min<LONG>(written.right, LONG(pitch));
+            written.bottom = std::min<LONG>(written.bottom, LONG(RENDER_TARGET_HEIGHT));
+            const auto& bindings = vertexShader.shader->vertex_bindings();
+            if (draw.initiator.PrimType() == PrimitiveType::RectangleList && draw.initiator.NumIndices() == 3 &&
+                draw.initiator.Source() == SourceSelect::AutoIndex && (vte & 0x3F) == 0 && !bindings.empty())
+            {
+                uint32_t fetchIndex = bindings[0].fetch_constant;
+                uint32_t fetch0 = registers[SHADER_CONSTANT_FETCH_00_0 + fetchIndex * 2];
+                uint32_t fetch1 = registers[SHADER_CONSTANT_FETCH_00_0 + fetchIndex * 2 + 1];
+                const uint8_t* data = g_memory.Translate<uint8_t>(PhysicalToVirtual(fetch0 & 0x1FFFFFFC));
+                float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+                for (uint32_t v = 0; v < 3; v++)
+                {
+                    float position[2];
+                    for (uint32_t c = 0; c < 2; c++)
+                    {
+                        uint32_t raw;
+                        memcpy(&raw, data + v * bindings[0].stride_words * 4 + c * 4, 4);
+                        raw = GpuSwap(raw, fetch1 & 3);
+                        memcpy(&position[c], &raw, 4);
+                    }
+                    minX = std::min(minX, position[0]);
+                    maxX = std::max(maxX, position[0]);
+                    minY = std::min(minY, position[1]);
+                    maxY = std::max(maxY, position[1]);
+                }
+                int32_t windowX = 0, windowY = 0;
+                if ((modeControl >> 16) & 1)
+                    GetWindowOffset(registers, windowX, windowY);
+                if (minX > -16384.0f && maxX < 16384.0f && minY > -16384.0f && maxY < 16384.0f)
+                {
+                    D3D12_RECT bounds{ LONG(std::floor(minX)) + windowX, LONG(std::floor(minY)) + windowY,
+                        LONG(std::ceil(maxX)) + windowX, LONG(std::ceil(maxY)) + windowY };
+                    bounds = ScaleRect(bounds, sampleScale);
+                    written = { std::max(written.left, bounds.left), std::max(written.top, bounds.top),
+                        std::min(written.right, bounds.right), std::min(written.bottom, bounds.bottom) };
+                }
+                if (TraceThisFrame())
+                    LOGF_INFO("  clear rectangle {},{}-{},{}", minX, minY, maxX, maxY);
+            }
+
+            for (uint32_t i = 0; i < key.renderTargetCount; i++)
+            {
+                if (colorTargets[i])
+                {
+                    ColorInfo info{ registers[i == 0 ? RB_COLOR_INFO : RB_COLOR1_INFO + i - 1] };
+                    RecordWrite({ info.Base(), pitch, info.Format(), false }, written);
+                }
+            }
+            if (depthTarget && (depthControl & 5))
+            {
+                DepthInfo info{ registers[RB_DEPTH_INFO] };
+                RecordWrite({ info.Base(), pitch, info.Format(), true }, written);
+            }
+        }
+
         // Record.
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4]{};
         for (uint32_t i = 0; i < key.renderTargetCount; i++)
@@ -2189,6 +2319,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             Transition(*source, D3D12_RESOURCE_STATE_RENDER_TARGET);
             D3D12_RECT sourceRect = ScaleRect(rect, sampleScale);
             g.list->ClearRenderTargetView(CpuRtv(source->rtv), color, 1, &sourceRect);
+            ColorInfo info{ registers[sourceSelect == 0 ? RB_COLOR_INFO : RB_COLOR1_INFO + sourceSelect - 1] };
+            RecordWrite({ info.Base(), pitch * sampleScale.x, info.Format(), false }, sourceRect);
         }
 
         if (control.DepthClear())
@@ -2201,6 +2333,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 Transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 g.list->ClearDepthStencilView(CpuDsv(depth->dsv), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                     float(clear >> 8) / 16777215.0f, UINT8(clear & 0xFF), 1, &depthRect);
+                RecordWrite({ info.Base(), pitch * sampleScale.x, info.Format(), true }, depthRect);
             }
         }
     }
@@ -2222,7 +2355,7 @@ float4 main(float4 position : SV_Position) : SV_Target
     }
 
     // Reads a texture back (waiting for the GPU) and saves it as a 32 bit BMP, for debugging.
-    void SaveScreenshot(Texture& texture, uint32_t width, uint32_t height, const std::filesystem::path& path)
+    void SaveScreenshot(Texture& texture, uint32_t width, uint32_t height, const std::filesystem::path& path, bool swapRedBlue)
     {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
         UINT64 totalSize;
@@ -2261,9 +2394,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             for (uint32_t x = 0; x < width; x++)
             {
                 uint8_t* out = &pixels[(size_t(y) * width + x) * 4];
-                out[0] = row[x * 4 + 2];
+                out[0] = row[x * 4 + (swapRedBlue ? 0 : 2)];
                 out[1] = row[x * 4 + 1];
-                out[2] = row[x * 4 + 0];
+                out[2] = row[x * 4 + (swapRedBlue ? 2 : 0)];
                 out[3] = 255;
             }
         }
@@ -2309,8 +2442,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 resolved = it;
         }
         if (getenv("AR_LOG_PRESENT") && (g.frameNumber % 150 == 0 || (g.frameNumber >= 300 && g.frameNumber < 303)))
-            LOGF_INFO("present {}: front buffer 0x{:08X} (packet 0x{:08X}, fetch {:08X} {:08X}), {}", g.frameNumber, frontBuffer,
-                swap.frontBuffer, fetch.words[0], fetch.words[1], resolved != g.resolvedTextures.end() ? "found" : "not resolved");
+            LOGF_INFO("present {}: front buffer 0x{:08X} (packet 0x{:08X}, fetch {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}), {}", g.frameNumber, frontBuffer,
+                swap.frontBuffer, fetch.words[0], fetch.words[1], fetch.words[2], fetch.words[3], fetch.words[4], fetch.words[5], resolved != g.resolvedTextures.end() ? "found" : "not resolved");
 
         ID3D12Resource* backBuffer = g.backBuffers[g.frameIndex].Get();
         D3D12_RESOURCE_BARRIER barrier{};
@@ -2330,7 +2463,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
         {
             SaveScreenshot(resolved->second.texture, swap.width ? swap.width : 1280, swap.height ? swap.height : 720,
-                g_screenshotFolder / fmt::format("frame_{:06}.bmp", g.frameNumber));
+                g_screenshotFolder / fmt::format("frame_{:06}.bmp", g.frameNumber), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2);
         }
 
         if (resolved != g.resolvedTextures.end())
@@ -2348,9 +2481,10 @@ float4 main(float4 position : SV_Position) : SV_Target
                 float size[2];
                 uint32_t sourceIndex;
                 uint32_t samplerIndex;
+                uint32_t swapRedBlue;
             } constants{ { viewX, viewY },
                 { viewWidth * float(resolved->second.texture.width) / sourceWidth, viewHeight * float(resolved->second.texture.height) / sourceHeight },
-                resolved->second.texture.srv, GetLinearClampSampler() };
+                resolved->second.texture.srv, GetLinearClampSampler(), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2 ? 1u : 0u };
 
             Transition(resolved->second.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -2358,7 +2492,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             D3D12_RECT scissor{ LONG(viewX), LONG(viewY), LONG(viewX + viewWidth), LONG(viewY + viewHeight) };
             g.list->RSSetViewports(1, &viewport);
             g.list->RSSetScissorRects(1, &scissor);
-            g.list->SetPipelineState(GetBlitPipeline(DXGI_FORMAT_R8G8B8A8_UNORM, true));
+            g.list->SetPipelineState(GetBlitPipeline(DXGI_FORMAT_R8G8B8A8_UNORM, true, false));
             g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
             g.list->DrawInstanced(3, 1, 0, 0);
