@@ -28,6 +28,8 @@ cbuffer XeSystemConstants : register(b0)
     uint4 xe_textures[32];          // Descriptor index, sampler index, swizzle, sign/gamma flags.
     int4 xe_vertex_data_offsets[24]; // Byte offset from a guest address to the draw's vertex data.
     float4 xe_texture_transforms[32]; // UV scale (xy) and offset (zw) onto the host texture.
+    float4 xe_point; // Point sprites: constant diameter (xy), per-vertex diameter range (zw), in pixels.
+    float4 xe_point_ndc; // NDC radius of a point one pixel in diameter (xy).
 };
 
 cbuffer XeFloatConstants : register(b1)
@@ -44,6 +46,7 @@ SamplerState xe_samplers[] : register(s0, space0);
 static const uint XE_FLAG_XY_NOT_DIVIDED = 1u;
 static const uint XE_FLAG_Z_NOT_DIVIDED = 2u;
 static const uint XE_FLAG_W_NOT_RECIPROCAL = 4u;
+static const uint XE_FLAG_POINT = 8u; // Drawing point sprites.
 
 // Shader model 3 multiplication: zero times anything (including infinity and NaN) is zero.
 float4 xe_mul(float4 a, float4 b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
@@ -619,7 +622,7 @@ float4 xe_cube(float4 a, float4 b)
         }
 
         if (attributes.exp_adjust != 0)
-            value = fmt::format("({} * {}f)", value, std::ldexp(1.0f, attributes.exp_adjust));
+            value = fmt::format("({} * {:.6f}f)", value, std::ldexp(1.0f, attributes.exp_adjust));
 
         StoreResult(instr.result, value);
         EndPredicate(instr.is_predicated);
@@ -649,9 +652,9 @@ float4 xe_cube(float4 a, float4 b)
             bool pixel = is_pixel_shader();
             std::string lod;
             if (attributes.use_register_lod)
-                lod = fmt::format("xe_lod + {}f", attributes.lod_bias);
+                lod = fmt::format("xe_lod + {:.6f}f", attributes.lod_bias);
             else if (!pixel || !attributes.use_computed_lod)
-                lod = fmt::format("{}f", attributes.lod_bias);
+                lod = fmt::format("{:.6f}f", attributes.lod_bias);
 
             auto sample = [&](const std::string& texture, const std::string& coords)
                 {
@@ -659,7 +662,7 @@ float4 xe_cube(float4 a, float4 b)
                     if (!lod.empty())
                         return fmt::format("{}.SampleLevel({}, {}, {})", texture, sampler, coords, lod);
                     if (attributes.lod_bias != 0.0f)
-                        return fmt::format("{}.SampleBias({}, {}, {}f)", texture, sampler, coords, attributes.lod_bias);
+                        return fmt::format("{}.SampleBias({}, {}, {:.6f}f)", texture, sampler, coords, attributes.lod_bias);
                     return fmt::format("{}.Sample({}, {})", texture, sampler, coords);
                 };
 
@@ -674,7 +677,7 @@ float4 xe_cube(float4 a, float4 b)
                 if (attributes.unnormalized_coordinates)
                     coords = fmt::format("({} / xe_size.xy)", coords);
                 if (attributes.offset_x != 0.0f || attributes.offset_y != 0.0f)
-                    coords = fmt::format("({} + float2({}f, {}f) / xe_size.xy)", coords, attributes.offset_x, attributes.offset_y);
+                    coords = fmt::format("({} + float2({:.6f}f, {:.6f}f) / xe_size.xy)", coords, attributes.offset_x, attributes.offset_y);
                 // Unnormalized coordinates are already in host texels; normalized ones span the fetch's size.
                 if (attributes.unnormalized_coordinates)
                     coords = fmt::format("({} + xe_texture_transforms[{}].zw)", coords, fetchConstant);
@@ -724,7 +727,7 @@ float4 xe_cube(float4 a, float4 b)
                 coords = fmt::format("({} / xe_size.xy + xe_texture_transforms[{}].zw)", coords, fetchConstant);
             else
                 coords = fmt::format("({} * xe_texture_transforms[{}].xy + xe_texture_transforms[{}].zw)", coords, fetchConstant, fetchConstant);
-            StoreResult(instr.result, fmt::format("float4(frac({} * xe_size.xy + float2({}f, {}f) - 0.5f), 0.0f, 0.0f)",
+            StoreResult(instr.result, fmt::format("float4(frac({} * xe_size.xy + float2({:.6f}f, {:.6f}f) - 0.5f), 0.0f, 0.0f)",
                 coords, attributes.offset_x, attributes.offset_y));
             break;
         }
@@ -1007,6 +1010,7 @@ struct XeInput
 {
     float4 position : SV_Position;
     float4 interpolators[16] : TEXCOORD0;
+    float4 extra : TEXCOORD16; // Vertex shader point diameter (x), point sprite coordinates (zw).
     bool frontFace : SV_IsFrontFace;
 };
 
@@ -1025,9 +1029,12 @@ XeOutput main(XeInput input)
         xe_r[i] = i < 16 ? input.interpolators[i] : float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (xe_param_gen_register >= 0 && xe_param_gen_register < XE_REGISTER_COUNT)
     {
-        // Pixel position (negative x for back faces) and point sprite coordinates.
+        // Pixel position (negative x for back faces; for points, negative y) and point sprite coordinates.
         float2 pixel = input.position.xy - 0.5f;
-        xe_r[xe_param_gen_register] = float4(input.frontFace ? pixel.x : -pixel.x - 1.0f, pixel.y, 0.0f, 0.0f);
+        if (xe_flags & XE_FLAG_POINT)
+            xe_r[xe_param_gen_register] = float4(abs(pixel.x), -abs(pixel.y), saturate(input.extra.zw));
+        else
+            xe_r[xe_param_gen_register] = float4(input.frontFace ? pixel.x : -pixel.x - 1.0f, pixel.y, 0.0f, 0.0f);
     }
     float4 xe_color[4] = { float4(0.0f, 0.0f, 0.0f, 0.0f), float4(0.0f, 0.0f, 0.0f, 0.0f),
         float4(0.0f, 0.0f, 0.0f, 0.0f), float4(0.0f, 0.0f, 0.0f, 0.0f) };
@@ -1041,6 +1048,7 @@ struct XeOutput
 {
     float4 position : SV_Position;
     float4 interpolators[16] : TEXCOORD0;
+    float4 extra : TEXCOORD16; // Point diameter (x, negative when the shader doesn't write it).
 };
 
 XeOutput main(uint vertexId : SV_VertexID)
@@ -1053,7 +1061,7 @@ XeOutput main(uint vertexId : SV_VertexID)
     [unroll] for (int j = 0; j < 16; j++)
         xe_o[j] = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 xe_position = float4(0.0f, 0.0f, 0.0f, 1.0f);
-    float4 xe_point_size = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xe_point_size = float4(-1.0f, 0.0f, 0.0f, 0.0f);
     int xe_index = 0;
     uint4 xe_words = uint4(0u, 0u, 0u, 0u);
 )";
@@ -1143,6 +1151,7 @@ XeOutput main(uint vertexId : SV_VertexID)
         position.z *= position.w;
     output.position = float4(position.xyz * xe_ndc_scale.xyz + position.w * xe_ndc_offset.xyz, position.w);
     output.interpolators = xe_o;
+    output.extra = float4(xe_point_size.x, 0.0f, 0.0f, 0.0f);
 )";
         }
 

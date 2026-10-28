@@ -44,8 +44,10 @@ namespace gpu::d3d12
         uint32_t textures[32][4];
         int32_t vertexDataOffsets[96];
         float textureTransforms[32][4]; // UV scale and offset, for textures inside larger resolved textures.
+        float point[4]; // Constant diameter x, y, per-vertex diameter minimum, maximum.
+        float pointNdc[4]; // NDC radius per pixel of diameter x, y.
     };
-    static_assert(sizeof(SystemConstants) == 2416);
+    static_assert(sizeof(SystemConstants) == 2448);
 
     enum RootParameter : uint32_t
     {
@@ -207,7 +209,7 @@ namespace gpu::d3d12
 
         ComPtr<ID3D12RootSignature> rootSignature;
         std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
-        std::vector<uint8_t> rectangleGeometryShader;
+        std::vector<uint8_t> rectangleGeometryShader, pointGeometryShader;
         std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader, depthCopyPixelShader;
         bool stencilRefSupported = false;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthCopyPipelines;
@@ -390,6 +392,7 @@ struct Vertex
 {
     float4 position : SV_Position;
     float4 interpolators[16] : TEXCOORD0;
+    float4 extra : TEXCOORD16;
 };
 
 // Rectangle lists give three corners of each rectangle; the fourth is opposite the corner where the two shorter
@@ -411,11 +414,44 @@ void main(triangle Vertex input[3], inout TriangleStream<Vertex> stream)
     fourth.position = input[a].position + input[b].position - input[corner].position;
     [unroll] for (uint i = 0u; i < 16u; i++)
         fourth.interpolators[i] = input[a].interpolators[i] + input[b].interpolators[i] - input[corner].interpolators[i];
+    fourth.extra = input[corner].extra;
 
     stream.Append(input[corner]);
     stream.Append(input[a]);
     stream.Append(input[b]);
     stream.Append(fourth);
+}
+)";
+
+    // Point sprites: a square around each point, its diameter from the vertex shader (clamped) or the constant size,
+    // with point sprite coordinates from (0, 0) at the top left.
+    static constexpr const char* POINT_GS = R"(
+cbuffer XeSystemConstants : register(b0)
+{
+    float4 xe_point : packoffset(c151);
+    float4 xe_point_ndc : packoffset(c152);
+};
+
+struct Vertex
+{
+    float4 position : SV_Position;
+    float4 interpolators[16] : TEXCOORD0;
+    float4 extra : TEXCOORD16;
+};
+
+[maxvertexcount(4)]
+void main(point Vertex input[1], inout TriangleStream<Vertex> stream)
+{
+    float2 diameter = input[0].extra.x >= 0.0f ? clamp(input[0].extra.x, xe_point.z, xe_point.w).xx : xe_point.xy;
+    float2 radius = diameter * xe_point_ndc.xy * input[0].position.w;
+    [unroll] for (uint i = 0u; i < 4u; i++)
+    {
+        float2 corner = float2(i & 1u, i >> 1u);
+        Vertex output = input[0];
+        output.position.xy += (corner * 2.0f - 1.0f) * float2(radius.x, -radius.y);
+        output.extra.zw = corner;
+        stream.Append(output);
+    }
 }
 )";
 
@@ -706,6 +742,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             return false;
 
         g.rectangleGeometryShader = CompileInternal(RECTANGLE_GS, L"gs_6_0", "rectangle_gs");
+        g.pointGeometryShader = CompileInternal(POINT_GS, L"gs_6_0", "point_gs");
         g.blitVertexShader = CompileInternal(BLIT_VS, L"vs_6_0", "blit_vs");
         g.blitPixelShader = CompileInternal(BLIT_PS, L"ps_6_0", "blit_ps");
         g.presentPixelShader = CompileInternal(PRESENT_PS, L"ps_6_0", "present_ps");
@@ -1394,7 +1431,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (pixelShader)
             desc.PS = Bytecode(*pixelShader->code);
         if (key.geometryShader)
-            desc.GS = Bytecode(g.rectangleGeometryShader);
+            desc.GS = Bytecode(key.geometryShader == 2 ? g.pointGeometryShader : g.rectangleGeometryShader);
 
         for (uint32_t i = 0; i < 4; i++)
         {
@@ -1713,7 +1750,11 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_PRIMITIVE_TOPOLOGY_TYPE topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         switch (draw.initiator.PrimType())
         {
-        case PrimitiveType::PointList: topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST; topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT; break;
+        case PrimitiveType::PointList:
+            topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+            topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+            key.geometryShader = g.pointGeometryShader.empty() ? 0 : 2;
+            break;
         case PrimitiveType::LineList: topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST; topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; break;
         case PrimitiveType::LineStrip: topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP; topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; break;
         case PrimitiveType::LineLoop: topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP; topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; conversion = Conversion::LineLoop; break;
@@ -1894,6 +1935,18 @@ float4 main(float4 position : SV_Position) : SV_Target
         system.ndcOffset[1] = 1.0f - offsetY * 2.0f / height;
         system.ndcOffset[2] = offsetZ;
         system.flags = ((vte >> 8) & 1) | (((vte >> 9) & 1) << 1) | (((vte >> 10) & 1) << 2);
+        if (draw.initiator.PrimType() == PrimitiveType::PointList)
+        {
+            // PA_SU_POINT_SIZE and PA_SU_POINT_MINMAX hold radii in 12.4 fixed point.
+            uint32_t pointSize = registers[PA_SU_POINT_SIZE], pointMinMax = registers[PA_SU_POINT_MINMAX];
+            system.flags |= 8;
+            system.point[0] = float(pointSize >> 16) / 8.0f;
+            system.point[1] = float(pointSize & 0xFFFF) / 8.0f;
+            system.point[2] = float(pointMinMax & 0xFFFF) / 8.0f;
+            system.point[3] = float(pointMinMax >> 16) / 8.0f;
+            system.pointNdc[0] = 1.0f / width;
+            system.pointNdc[1] = 1.0f / height;
+        }
         system.vertexIndexOffset = int32_t(uint32_t(registers[VGT_INDX_OFFSET]));
 
         uint32_t programControl = registers[SQ_PROGRAM_CNTL];
