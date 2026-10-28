@@ -9,6 +9,7 @@ struct FileObject : KernelObject
     std::string path;
     uint64_t position{};
     bool directory{};
+    bool synchronous{}; // Opened with FILE_SYNCHRONOUS_IO_ALERT / NONALERT.
 
     // Directory enumeration state for NtQueryDirectoryFile.
     std::vector<vfs::DirectoryEntry> entries;
@@ -61,6 +62,14 @@ static void SetIoStatus(XIO_STATUS_BLOCK* ioStatus, uint32_t status, uint32_t in
         ioStatus->Status = status;
         ioStatus->Information = information;
     }
+}
+
+// Transfers complete immediately, but on handles opened for asynchronous I/O they return STATUS_PENDING like
+// the console's (the I/O status block and event hold the result): titles check for ERROR_IO_PENDING after an
+// overlapped ReadFile and treat other results as failures.
+static uint32_t AsyncResult(const FileObject& file, uint32_t status)
+{
+    return !file.synchronous && status == X_STATUS_SUCCESS ? X_STATUS_PENDING : status;
 }
 
 static void SignalCompletion(uint32_t event, uint32_t apcRoutine)
@@ -149,6 +158,7 @@ namespace imports
 
         auto object = std::make_shared<FileObject>();
         object->directory = file->Info().directory;
+        object->synchronous = (options & 0x30) != 0;
         object->file = std::move(file);
         object->path = path;
         *handle = CreateHandle(object);
@@ -211,7 +221,7 @@ namespace imports
         int64_t last = lastReport;
         if (now - last > 10'000'000'000 && lastReport.compare_exchange_strong(last, now))
             LOGF_INFO("file reads: {} ({} KB) in the last 10 seconds", reads.exchange(0), bytes.exchange(0) / 1024);
-        return status;
+        return AsyncResult(*file, status);
     }
 
     // FILE_SEGMENT_ELEMENT array: one guest page address (in a 64 bit slot) per 4 KB of the transfer.
@@ -237,7 +247,7 @@ namespace imports
         uint32_t status = total == 0 && length != 0 ? X_STATUS_END_OF_FILE : X_STATUS_SUCCESS;
         SetIoStatus(ioStatus, status, uint32_t(total));
         SignalCompletion(event, apcRoutine);
-        return status;
+        return AsyncResult(*file, status);
     }
 
     uint32_t NtWriteFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus,
@@ -254,7 +264,7 @@ namespace imports
         uint32_t status = written == length ? X_STATUS_SUCCESS : X_STATUS_ACCESS_DENIED;
         SetIoStatus(ioStatus, status, uint32_t(written));
         SignalCompletion(event, apcRoutine);
-        return status;
+        return AsyncResult(*file, status);
     }
 
     uint32_t NtWriteFileGather(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus,
@@ -279,7 +289,7 @@ namespace imports
         uint32_t status = total == length ? X_STATUS_SUCCESS : X_STATUS_ACCESS_DENIED;
         SetIoStatus(ioStatus, status, uint32_t(total));
         SignalCompletion(event, apcRoutine);
-        return status;
+        return AsyncResult(*file, status);
     }
 
     uint32_t NtFlushBuffersFile(uint32_t handle, XIO_STATUS_BLOCK* ioStatus)

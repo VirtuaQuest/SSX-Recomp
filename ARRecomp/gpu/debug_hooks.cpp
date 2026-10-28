@@ -70,3 +70,17 @@ PPC_FUNC(sub_82570808)
         LOGF_INFO("decompress {}: 0x{:08X} ({} bytes) to 0x{:08X} ({} bytes) returned {}", call, source, sourceSize, dest, destSize, ctx.r3.u32);
     }
 }
+
+void PrintCurrentStack(int maxFrames);
+
+// Diagnostics for save data errors (AR_LOG_SAVE_ERRORS): the save task's result code and where it comes from.
+PPC_FUNC_IMPL(__imp__sub_826E3D88);
+PPC_FUNC(sub_826E3D88)
+{
+    if (getenv("AR_LOG_SAVE_ERRORS"))
+    {
+        LOGF_INFO("save task 0x{:08X} result {} (r5 0x{:08X} r6 0x{:08X})", ctx.r3.u32, ctx.r4.s32, ctx.r5.u32, ctx.r6.u32);
+        PrintCurrentStack(8);
+    }
+    __imp__sub_826E3D88(ctx, base);
+}

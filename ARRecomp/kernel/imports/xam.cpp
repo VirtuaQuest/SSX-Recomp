@@ -140,6 +140,8 @@ static std::filesystem::path ContentPath(uint32_t contentType, std::string_view 
 static uint64_t g_userXuid = 0xE000000000000001ull;
 static const char* g_userName = "Player";
 
+void PrintCurrentStack(int maxFrames);
+
 namespace imports
 {
     // ---- Loader ----
@@ -635,6 +637,8 @@ namespace imports
         }
 
         LOGF_WARNING("message box \"{}\": {} [{}] (focused {}, answered 0)", ReadWideString(title), ReadWideString(text), labels, activeButton);
+        if (getenv("AR_MESSAGE_BOX_STACK"))
+            PrintCurrentStack(16);
         return ShowSystemDialog(overlapped, [result] { *result = 0; return X_ERROR_SUCCESS; });
     }
 

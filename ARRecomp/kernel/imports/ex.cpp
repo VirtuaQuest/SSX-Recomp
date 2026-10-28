@@ -194,6 +194,15 @@ namespace imports
         sha.finalize(digest);
         if (output != nullptr)
             memcpy(output, digest, std::min<uint32_t>(outputSize, sizeof(digest)));
+
+        if (getenv("AR_LOG_SHA"))
+        {
+            std::string hex;
+            for (auto byte : digest)
+                hex += fmt::format("{:02X}", byte);
+            LOGF_INFO("sha of 0x{:08X}+{}, 0x{:08X}+{}, 0x{:08X}+{}: {}", g_memory.MapVirtual(input1), size1,
+                input2 ? g_memory.MapVirtual(input2) : 0, size2, input3 ? g_memory.MapVirtual(input3) : 0, size3, hex);
+        }
     }
 
     // Structured exception filter used by __try blocks. Exceptions are not raised in recompiled code, so it is only

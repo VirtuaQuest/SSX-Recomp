@@ -136,6 +136,7 @@ void InstallCrashHandler()
 static uint8_t* g_watchPages[3];
 static std::set<DWORD64> g_watchSeen;
 static thread_local bool t_watchStepping;
+static uint8_t* g_watchExact; // Only writes to these 8 bytes are logged, when set.
 
 static void ProtectWatch(DWORD protection)
 {
@@ -165,7 +166,9 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
 
     {
         std::lock_guard lock(g_crashMutex);
-        if (g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < 64)
+        bool exact = g_watchExact == nullptr || (address >= g_watchExact && address < g_watchExact + 8);
+        static int exactLogs;
+        if (exact && (g_watchExact != nullptr ? exactLogs++ < 64 : g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < 64))
         {
             fmt::print(stderr, "==== watch: write to guest 0x{:08X} on guest thread {}\n", g_memory.MapVirtual(address),
                 GetCurrentGuestThreadId());
@@ -184,6 +187,19 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
 
 void InstallMemoryWatch()
 {
+    if (const char* text = getenv("AR_WATCH_VIRTUAL"))
+    {
+        // A page outside the physical views: watched in its one view.
+        uint32_t address = uint32_t(strtoul(text, nullptr, 16));
+        uint32_t page = address & ~0xFFFu;
+        g_watchExact = g_memory.base + address;
+        for (auto& watched : g_watchPages)
+            watched = g_memory.base + page;
+        AddVectoredExceptionHandler(1, WatchHandler);
+        ProtectWatch(PAGE_READONLY);
+        return;
+    }
+
     const char* text = getenv("AR_WATCH_PHYSICAL");
     if (!text)
         return;
@@ -194,4 +210,13 @@ void InstallMemoryWatch()
     g_watchPages[2] = g_memory.base + 0xE0000000u + page; // Virtual 0xE0000000 + X is physical X + 0x1000, stored 4 KB up.
     AddVectoredExceptionHandler(1, WatchHandler);
     ProtectWatch(PAGE_READONLY);
+}
+
+// Prints the calling thread's host stack (recompiled functions are named after their guest addresses).
+void PrintCurrentStack(int maxFrames)
+{
+    CONTEXT context{};
+    RtlCaptureContext(&context);
+    std::lock_guard lock(g_crashMutex);
+    PrintStack(GetCurrentThread(), context, maxFrames);
 }
