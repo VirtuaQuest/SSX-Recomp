@@ -43,7 +43,7 @@ SamplerState xe_samplers[] : register(s0, space0);
 
 static const uint XE_FLAG_XY_NOT_DIVIDED = 1u;
 static const uint XE_FLAG_Z_NOT_DIVIDED = 2u;
-static const uint XE_FLAG_W_RECIPROCAL = 4u;
+static const uint XE_FLAG_W_NOT_RECIPROCAL = 4u;
 
 // Shader model 3 multiplication: zero times anything (including infinity and NaN) is zero.
 float4 xe_mul(float4 a, float4 b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
@@ -152,6 +152,27 @@ float xe_linear_to_gamma(float l)
 // Applies the fetch constant's per component sign (signed or gamma) and swizzle to a sampled value.
 float4 xe_texture_result(float4 value, uint4 info)
 {
+    // Depth buffer words (resolved from a depth buffer, as bytes from the low one up) fetched as depth: 24 bit unorm
+    // or float (4 bit exponent, 20 bit mantissa) depth above 8 bit stencil.
+    uint rawDepth = (info.w >> 8u) & 3u;
+    if (rawDepth != 0u)
+    {
+        uint4 bytes = uint4(round(saturate(value) * 255.0f));
+        uint depth24 = bytes.y | (bytes.z << 8u) | (bytes.w << 16u);
+        float depth;
+        if (rawDepth == 1u)
+        {
+            depth = float(depth24) / 16777215.0f;
+        }
+        else
+        {
+            uint exponent = depth24 >> 20u;
+            float mantissa = float(depth24 & 0xFFFFFu) / 1048576.0f;
+            depth = exponent == 0u ? mantissa * exp2(-14.0f) : (1.0f + mantissa) * exp2(float(exponent) - 15.0f);
+        }
+        value = float4(depth, depth, depth, depth);
+    }
+
     [unroll] for (uint i = 0u; i < 4u; i++)
     {
         if ((info.w >> i) & 1u)
@@ -1084,7 +1105,8 @@ XeOutput main(uint vertexId : SV_VertexID)
             out += R"(
     // Guest viewport transform to host clip space.
     float4 position = xe_position;
-    if (xe_flags & XE_FLAG_W_RECIPROCAL)
+    // PA_CL_VTE_CNTL.vtx_w0_fmt clear: the shader outputs 1/W.
+    if (!(xe_flags & XE_FLAG_W_NOT_RECIPROCAL))
         position.w = rcp(position.w);
     if (xe_flags & XE_FLAG_XY_NOT_DIVIDED)
         position.xy *= position.w;

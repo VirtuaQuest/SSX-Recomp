@@ -139,6 +139,7 @@ namespace gpu::d3d12
         Texture texture;
         uint32_t format;
         uint32_t rowBytes;
+        bool rawDepth = false; // Holds depth buffer words (from depth resolves), 8 bit stencil in the low byte.
     };
 
     struct CachedTexture
@@ -924,8 +925,12 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     // Returns the descriptor index for the texture a fetch constant describes. transform receives the UV scale and
     // offset that map the fetch's coordinates onto the host texture.
-    static uint32_t GetTexture(const TextureFetch& fetch, uint32_t dimension, float* transform)
+    //
+    // Depth formats (24_8 and 24_8_FLOAT) fetched from depth resolves hold raw words; rawDepth receives 1 or 2 for
+    // the shader to decode them as unorm or float depth.
+    static uint32_t GetTexture(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth)
     {
+        rawDepth = 0;
         transform[0] = transform[1] = 1.0f;
         transform[2] = transform[3] = 0.0f;
         uint32_t nullSrv = dimension == 3 ? NULL_SRV_CUBE : dimension == 2 ? NULL_SRV_3D : NULL_SRV_2D;
@@ -941,6 +946,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             transform[0] = float(fetch.Width()) / float(texture.width);
             transform[1] = float(fetch.Height()) / float(texture.height);
             transform[3] = float(row) / float(texture.height);
+            if (resolved->rawDepth && (fetch.Format() == 22 || fetch.Format() == 23))
+                rawDepth = fetch.Format() == 23 ? 2 : 1;
             Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             return texture.srv;
         }
@@ -1339,13 +1346,13 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = cull == 1 ? D3D12_CULL_MODE_FRONT : cull == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
         desc.RasterizerState.FrontCounterClockwise = ((key.rasterizer >> 2) & 1) == 0;
-        desc.RasterizerState.DepthClipEnable = !((key.rasterizer >> 3) & 1);
+        desc.RasterizerState.DepthClipEnable = !((key.rasterizer >> 3) & 1) && !getenv("AR_NO_DEPTH_CLIP");
 
         uint32_t depth = key.depthControl;
         auto& depthStencil = desc.DepthStencilState;
         depthStencil.DepthEnable = (depth >> 1) & 1;
         depthStencil.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-        depthStencil.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
+        depthStencil.DepthFunc = getenv("AR_NO_DEPTH_TEST") ? D3D12_COMPARISON_FUNC_ALWAYS : D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
         depthStencil.StencilEnable = depth & 1;
         depthStencil.StencilReadMask = UINT8(key.stencilMasks & 0xFF);
         depthStencil.StencilWriteMask = UINT8((key.stencilMasks >> 8) & 0xFF);
@@ -1661,10 +1668,15 @@ float4 main(float4 position : SV_Position) : SV_Target
                     }
 
                     auto& slot = system.textures[index];
-                    slot[0] = GetTexture(fetch, hostDimension, system.textureTransforms[index]);
-                    slot[1] = GetSampler(fetch);
+                    uint32_t rawDepth;
+                    slot[0] = GetTexture(fetch, hostDimension, system.textureTransforms[index], rawDepth);
+                    // Raw depth words can't be filtered.
+                    TextureFetch samplerFetch = fetch;
+                    if (rawDepth)
+                        samplerFetch.words[3] &= ~(0xFu << 19);
+                    slot[1] = GetSampler(samplerFetch);
                     slot[2] = fetch.Swizzle();
-                    slot[3] = signs;
+                    slot[3] = signs | (rawDepth << 8);
                 }
             };
         {
@@ -2117,6 +2129,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (target)
                 {
                     auto& resolved = *target;
+                    resolved.rawDepth = depthSource;
                     struct BlitConstants
                     {
                         int32_t sourceOffset[2];
