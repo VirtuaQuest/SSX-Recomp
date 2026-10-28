@@ -699,9 +699,38 @@ float4 xe_cube(float4 a, float4 b)
             break;
         }
 
+        case FetchOpcode::kGetTextureWeights:
+        {
+            // Bilinear weights: the fraction of the coordinates in texels, past the centers of the texels sampled
+            // (shaders use them to filter comparisons themselves, as in percentage closer shadow filtering).
+            if (!instr.has_result())
+                break;
+
+            uint32_t fetchConstant = instr.operands[1].storage_index;
+            const auto& attributes = instr.attributes;
+            bool point = attributes.mag_filter == xenos::TextureFilter::kPoint;
+            if (point || instr.dimension == xenos::FetchOpDimension::kCube || instr.dimension == xenos::FetchOpDimension::k3DOrStacked)
+            {
+                StoreResult(instr.result, "float4(0.0f, 0.0f, 0.0f, 0.0f)");
+                break;
+            }
+
+            Line("// getWeights tf{}", fetchConstant);
+            Line("xe_texture = xe_textures[{}];", fetchConstant);
+            Line("xe_coords = {};", Operand(instr.operands[0]));
+            Line("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)].GetDimensions(xe_size.x, xe_size.y);");
+            std::string coords = instr.dimension == xenos::FetchOpDimension::k1D ? "float2(xe_coords.x, 0.5f)" : "xe_coords.xy";
+            if (attributes.unnormalized_coordinates)
+                coords = fmt::format("({} / xe_size.xy + xe_texture_transforms[{}].zw)", coords, fetchConstant);
+            else
+                coords = fmt::format("({} * xe_texture_transforms[{}].xy + xe_texture_transforms[{}].zw)", coords, fetchConstant, fetchConstant);
+            StoreResult(instr.result, fmt::format("float4(frac({} * xe_size.xy + float2({}f, {}f) - 0.5f), 0.0f, 0.0f)",
+                coords, attributes.offset_x, attributes.offset_y));
+            break;
+        }
+
         case FetchOpcode::kGetTextureComputedLod:
         case FetchOpcode::kGetTextureGradients:
-        case FetchOpcode::kGetTextureWeights:
         case FetchOpcode::kGetTextureBorderColorFrac:
             if (instr.has_result())
                 StoreResult(instr.result, "float4(0.0f, 0.0f, 0.0f, 0.0f)");
