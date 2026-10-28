@@ -1032,6 +1032,25 @@ float4 main(float4 position : SV_Position) : SV_Target
             return texture.srv;
         }
 
+        // Diagnostics: textures overlapping resolved memory but not matched to a resolved texture are decoded from
+        // guest memory, which resolves don't write.
+        {
+            uint32_t start = fetch.BaseAddress(), end = start + std::max<uint32_t>(GetGuestTextureSize(fetch), 1);
+            for (auto& [base, other] : g.resolvedTextures)
+            {
+                uint64_t otherEnd = uint64_t(base) + uint64_t(other.rowBytes) * other.texture.height;
+                if (start < otherEnd && end > base)
+                {
+                    static std::set<uint64_t> logged;
+                    if (logged.insert((uint64_t(start) << 32) | (fetch.Format() << 24) | (fetch.Width() & 0xFFF) << 12 | (fetch.Height() & 0xFFF)).second && logged.size() < 200)
+                        LOGF_WARNING("texture 0x{:08X} {}x{} fmt {} dim {} tiled {} (pitch {}) overlaps resolved 0x{:08X} {}x{} fmt {} but isn't matched",
+                            start, fetch.Width(), fetch.Height(), fetch.Format(), dimension, fetch.Tiled(), fetch.Pitch(), base,
+                            other.texture.width, other.texture.height, other.format);
+                    break;
+                }
+            }
+        }
+
         if (GetHostTextureFormat(fetch.Format()) == DXGI_FORMAT_UNKNOWN)
         {
             if (g.warnedFormats.insert(fetch.Format()).second)
