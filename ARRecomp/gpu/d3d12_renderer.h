@@ -25,6 +25,9 @@ namespace gpu::d3d12
     void Draw(const be<uint32_t>* registers, const DrawCall& draw, const HostShader& vertexShader, const HostShader* pixelShader);
     void Present(const be<uint32_t>* registers, const SwapInfo& swap);
 
-    // Saves the front buffer every 300 frames, for debugging.
+    // Saves the front buffer every 300 frames (AR_SCREENSHOT_INTERVAL), for debugging.
     void EnableScreenshots(const std::filesystem::path& folder);
+
+    // Frames presented so far.
+    uint64_t GetFrameNumber();
 }

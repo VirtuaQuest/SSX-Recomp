@@ -207,12 +207,17 @@ namespace gpu::d3d12
         ComPtr<ID3D12RootSignature> rootSignature;
         std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
         std::vector<uint8_t> rectangleGeometryShader;
-        std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader;
+        std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader, depthCopyPixelShader;
+        bool stencilRefSupported = false;
+        std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthCopyPipelines;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthBlitPipelines;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> blitPipelines;
         ComPtr<ID3D12PipelineState> presentPipeline;
 
         std::unordered_map<RenderTargetKey, Texture, RenderTargetKeyHash> renderTargets;
+        // When each render target was last used: overlapping ones copy from those used after them.
+        std::unordered_map<RenderTargetKey, uint64_t, RenderTargetKeyHash> renderTargetStamps;
+        uint64_t renderTargetClock = 0;
         std::unordered_map<uint32_t, ResolvedTexture> resolvedTextures;
         std::unordered_map<uint64_t, CachedTexture> textures;
         std::set<uint32_t> warnedFormats;
@@ -482,6 +487,32 @@ float4 main(float4 position : SV_Position) : SV_Target
 }
 )";
 
+    // Copies depth and stencil between depth buffers (stencil only where the GPU lets shaders output it).
+    static constexpr const char* DEPTH_COPY_PS = R"(
+cbuffer DepthCopyConstants : register(b0)
+{
+    int2 sourceOffset;
+    uint depthIndex;
+    uint stencilIndex;
+};
+
+Texture2D<float4> textures[] : register(t0, space0);
+Texture2D<uint4> uintTextures[] : register(t0, space4);
+
+float main(float4 position : SV_Position
+#ifdef STENCIL_REF
+    , out uint stencil : SV_StencilRef
+#endif
+    ) : SV_Depth
+{
+    int3 coords = int3(int2(position.xy) + sourceOffset, 0);
+#ifdef STENCIL_REF
+    stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
+#endif
+    return textures[NonUniformResourceIndex(depthIndex)].Load(coords).r;
+}
+)";
+
     static constexpr const char* PRESENT_PS = R"(
 cbuffer PresentConstants : register(b0)
 {
@@ -600,6 +631,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
         if (options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_2)
             LOGF_WARNING("the GPU only supports resource binding tier 1; rendering may fail");
+        g.stencilRefSupported = options.PSSpecifiedStencilRefSupported;
 
         D3D12_COMMAND_QUEUE_DESC queueDesc{};
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -673,6 +705,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.blitPixelShader = CompileInternal(BLIT_PS, L"ps_6_0", "blit_ps");
         g.presentPixelShader = CompileInternal(PRESENT_PS, L"ps_6_0", "present_ps");
         g.depthBlitPixelShader = CompileInternal(DEPTH_BLIT_PS, L"ps_6_0", "depth_blit_ps");
+        g.depthCopyPixelShader = CompileInternal(
+            (std::string(g.stencilRefSupported ? "#define STENCIL_REF\n" : "") + DEPTH_COPY_PS).c_str(), L"ps_6_0", "depth_copy_ps");
         if (g.blitVertexShader.empty() || g.blitPixelShader.empty() || g.presentPixelShader.empty())
             return false;
 
@@ -959,6 +993,14 @@ float4 main(float4 position : SV_Position) : SV_Target
                     }
                     LOGF_INFO("texture {:08X} {}x{} format {} tiled {} endian {} pitch {}: bytes {}-{}", fetch.BaseAddress(), decoded.width,
                         decoded.height, fetch.Format(), fetch.Tiled(), fetch.Endian(), fetch.Pitch(), minimum, maximum);
+                    if (fetch.Height() == 1)
+                    {
+                        const uint8_t* raw = g_memory.Translate<uint8_t>(PhysicalToVirtual(fetch.BaseAddress()));
+                        std::string hex;
+                        for (uint32_t i = 0; i < 1024; i++)
+                            hex += fmt::format("{:02X}{}", raw[i], (i & 3) == 3 ? " " : "");
+                        LOGF_INFO("  raw: {}", hex);
+                    }
                     if (decoded.format == DXGI_FORMAT_R8G8B8A8_UNORM)
                         SaveScreenshot(entry.texture, decoded.width, decoded.height, fmt::format("screenshots/texture_{:08X}.bmp", fetch.BaseAddress()));
                 }
@@ -1047,12 +1089,88 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
     }
 
+    static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format);
+    static void SetViewportAndScissor(uint32_t width, uint32_t height, D3D12_RECT scissor);
+
+    // EDRAM tiles are 80x16 samples of 32 bits (40x16 of 64 bits).
+    static uint32_t EdramTileWidth(uint32_t format, bool depth)
+    {
+        return !depth && (format == 5 || format == 7 || format == 15) ? 40 : 80;
+    }
+
+    // Render targets whose EDRAM overlaps (same pitch and format, bases whole tile rows apart; games point
+    // surfaces into each other, like a tile's depth buffer inside the full screen one a clear wrote) are separate
+    // host textures, so a render target being used gets the overlapping rows of the ones used after it.
+    static void SyncRenderTarget(const RenderTargetKey& key, Texture& texture)
+    {
+        uint64_t& stamp = g.renderTargetStamps[key];
+        uint32_t pitchTiles = (key.pitch + EdramTileWidth(key.format, key.depth) - 1) / EdramTileWidth(key.format, key.depth);
+
+        std::vector<std::pair<uint64_t, std::pair<const RenderTargetKey*, Texture*>>> newer;
+        for (auto& [otherKey, other] : g.renderTargets)
+        {
+            if (otherKey == key || otherKey.depth != key.depth || otherKey.format != key.format || otherKey.pitch != key.pitch)
+                continue;
+            int32_t delta = int32_t(otherKey.base) - int32_t(key.base);
+            uint64_t otherStamp = g.renderTargetStamps[otherKey];
+            if (otherStamp > stamp && delta % int32_t(pitchTiles) == 0 &&
+                std::abs(delta / int32_t(pitchTiles)) * 16 < int32_t(RENDER_TARGET_HEIGHT))
+            {
+                newer.push_back({ otherStamp, { &otherKey, &other } });
+            }
+        }
+        std::sort(newer.begin(), newer.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        for (auto& [otherStamp, entry] : newer)
+        {
+            auto& [otherKey, other] = entry;
+            // The other target's row 0 is at this one's row `rows` (in samples).
+            int32_t rows = (int32_t(otherKey->base) - int32_t(key.base)) / int32_t(pitchTiles) * 16;
+            uint32_t sourceTop = uint32_t(std::max(0, -rows)), destTop = uint32_t(std::max(0, rows));
+            uint32_t height = RENDER_TARGET_HEIGHT - uint32_t(std::abs(rows));
+
+            if (key.depth)
+            {
+                Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                auto dsv = CpuDsv(texture.dsv);
+                g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+                SetViewportAndScissor(texture.width, texture.height,
+                    { 0, LONG(destTop), LONG(texture.width), LONG(destTop + height) });
+                g.list->SetPipelineState(GetDepthCopyPipeline(texture.format));
+                g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                struct
+                {
+                    int32_t sourceOffset[2];
+                    uint32_t depthIndex;
+                    uint32_t stencilIndex;
+                } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, other->stencilSrv };
+                g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+                g.list->DrawInstanced(3, 1, 0, 0);
+            }
+            else
+            {
+                Transition(*other, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Transition(texture, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION source{ other->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_TEXTURE_COPY_LOCATION dest{ texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_BOX box{ 0, sourceTop, 0, texture.width, sourceTop + height, 1 };
+                g.list->CopyTextureRegion(&dest, 0, destTop, 0, &source, &box);
+            }
+        }
+
+        stamp = ++g.renderTargetClock;
+    }
+
     static Texture* GetRenderTarget(uint32_t base, uint32_t pitch, uint32_t format, bool depth)
     {
         RenderTargetKey key{ base, pitch, format, depth };
         auto it = g.renderTargets.find(key);
         if (it != g.renderTargets.end())
+        {
+            SyncRenderTarget(key, it->second);
             return &it->second;
+        }
 
         DXGI_FORMAT hostFormat = depth ? (format ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT)
             : GetColorTargetFormat(format);
@@ -1073,7 +1191,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.list->ClearRenderTargetView(CpuRtv(texture.rtv), black, 0, nullptr);
         }
 
-        return &g.renderTargets.emplace(key, std::move(texture)).first->second;
+        Texture& created = g.renderTargets.emplace(key, std::move(texture)).first->second;
+        SyncRenderTarget(key, created);
+        return &created;
     }
 
     static float RegisterFloat(const be<uint32_t>* registers, uint32_t index)
@@ -1275,6 +1395,40 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.SampleDesc.Count = 1;
         if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline))))
             LOGF_ERROR("failed to create the blit pipeline for format {}", uint32_t(format));
+
+        return pipeline.Get();
+    }
+
+    static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format)
+    {
+        auto& pipeline = g.depthCopyPipelines[format];
+        if (pipeline)
+            return pipeline.Get();
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = g.rootSignature.Get();
+        desc.VS = Bytecode(g.blitVertexShader);
+        desc.PS = Bytecode(g.depthCopyPixelShader);
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.DepthStencilState.DepthEnable = TRUE;
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        if (g.stencilRefSupported)
+        {
+            desc.DepthStencilState.StencilEnable = TRUE;
+            desc.DepthStencilState.StencilReadMask = 0xFF;
+            desc.DepthStencilState.StencilWriteMask = 0xFF;
+            desc.DepthStencilState.FrontFace = { D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_REPLACE,
+                D3D12_COMPARISON_FUNC_ALWAYS };
+            desc.DepthStencilState.BackFace = desc.DepthStencilState.FrontFace;
+        }
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.DSVFormat = format;
+        desc.SampleDesc.Count = 1;
+        if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline))))
+            LOGF_ERROR("failed to create the depth copy pipeline for format {}", uint32_t(format));
 
         return pipeline.Get();
     }
@@ -1706,14 +1860,24 @@ float4 main(float4 position : SV_Position) : SV_Target
             for (uint32_t i = 0; i < 32; i++)
             {
                 if (system.textures[i][0] > 2)
-                    textures += fmt::format(" tf{}=srv{}@{:08X}/fmt{}", i, system.textures[i][0],
-                        registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0xFFFFF000, registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0x3F);
+                {
+                    TextureFetch fetch;
+                    for (uint32_t w = 0; w < 6; w++)
+                        fetch.words[w] = registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + w];
+                    textures += fmt::format(" tf{}=srv{}@{:08X}/fmt{}/{}x{}", i, system.textures[i][0],
+                        registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0xFFFFF000, registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0x3F,
+                        fetch.Width(), fetch.Height());
+                }
             }
             LOGF_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} rt {} mask {:04X} depth {:08X} pitch {} scissor {},{}-{},{} ndc {:.4f},{:.4f},{:.4f} / {:.4f},{:.4f},{:.4f} vte {:X} blend {:08X}{}",
                 uint32_t(draw.initiator.PrimType()), count, indexed, key.vertexShader, key.pixelShader, key.renderTargetCount,
                 colorMask, depthControl, pitch, scissor.left, scissor.top, scissor.right, scissor.bottom,
                 system.ndcScale[0], system.ndcScale[1], system.ndcScale[2], system.ndcOffset[0], system.ndcOffset[1], system.ndcOffset[2],
                 vte, key.blend[0], textures);
+            LOGF_INFO("  surface {:08X} color {:08X} depth {:08X} window {:08X} vport {} {} {} {}", uint32_t(registers[RB_SURFACE_INFO]),
+                uint32_t(registers[RB_COLOR_INFO]), uint32_t(registers[RB_DEPTH_INFO]), uint32_t(registers[PA_SC_WINDOW_OFFSET]),
+                RegisterFloat(registers, PA_CL_VPORT_XSCALE), RegisterFloat(registers, PA_CL_VPORT_XOFFSET),
+                RegisterFloat(registers, PA_CL_VPORT_YSCALE), RegisterFloat(registers, PA_CL_VPORT_YOFFSET));
         }
 
         // Record.
@@ -2000,6 +2164,11 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static std::filesystem::path g_screenshotFolder;
 
+    uint64_t GetFrameNumber()
+    {
+        return g.frameNumber;
+    }
+
     void EnableScreenshots(const std::filesystem::path& folder)
     {
         g_screenshotFolder = folder;
@@ -2111,7 +2280,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         g.list->ClearRenderTargetView(rtv, black, 0, nullptr);
 
-        if (resolved != g.resolvedTextures.end() && !g_screenshotFolder.empty() && g.frameNumber % 300 == 0 &&
+        static const uint64_t screenshotInterval = getenv("AR_SCREENSHOT_INTERVAL") ? std::max(1, atoi(getenv("AR_SCREENSHOT_INTERVAL"))) : 300;
+        if (resolved != g.resolvedTextures.end() && !g_screenshotFolder.empty() && g.frameNumber % screenshotInterval == 0 &&
             resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
         {
             SaveScreenshot(resolved->second.texture, swap.width ? swap.width : 1280, swap.height ? swap.height : 720,

@@ -3,6 +3,7 @@
 #include <kernel/imports.h>
 #include <kernel/xam.h>
 #include <Xinput.h>
+#include <gpu/d3d12_renderer.h>
 
 // XAMINPUT structures in xbox.h use the host XInput layout; guest memory holds them big endian.
 static void WriteGamepad(XAMINPUT_GAMEPAD* guest, const XINPUT_GAMEPAD& host)
@@ -129,11 +130,11 @@ static uint16_t AutoPressButtons()
         return 0;
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    if (elapsed < period * 1000 || elapsed % (period * 1000) >= 150)
+    if (elapsed < period * 1000 || elapsed % (period * 1000) >= 250)
         return 0;
 
     // AR_AUTO_SEQUENCE: comma separated buttons (A, B, X, Y, START, BACK, UP, DOWN, LEFT, RIGHT, LB, RB) pressed in
-    // order instead; after the last one, A repeats.
+    // order instead (WAIT skips a turn); after the last one, A repeats, or nothing when the list ends with WAIT.
     static const std::vector<uint16_t> sequence = []
         {
             std::vector<uint16_t> buttons;
@@ -149,6 +150,8 @@ static uint16_t AutoPressButtons()
                 {
                     size_t end = list.find(',', start);
                     std::string name = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    if (name == "WAIT")
+                        buttons.push_back(0);
                     for (auto& [buttonName, button] : names)
                     {
                         if (name == buttonName)
@@ -164,7 +167,7 @@ static uint16_t AutoPressButtons()
 
     size_t step = size_t(elapsed / (period * 1000)) - 1;
     if (!sequence.empty())
-        return step < sequence.size() ? sequence[step] : XINPUT_GAMEPAD_A;
+        return step < sequence.size() ? sequence[step] : sequence.back() == 0 ? 0 : XINPUT_GAMEPAD_A;
 
     return (elapsed / (period * 1000)) % 2 ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_START;
 }
@@ -180,11 +183,21 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
         // The packet number changes with the state, which is how titles notice input.
         static std::atomic<uint32_t> packet;
         static std::atomic<uint16_t> lastButtons;
-        state.Gamepad.wButtons |= AutoPressButtons();
+        uint16_t autoButtons = AutoPressButtons();
+        state.Gamepad.wButtons |= autoButtons;
+        // Directions also push the left stick, which some menus read instead of the D-pad.
+        if (autoButtons & XINPUT_GAMEPAD_DPAD_UP)
+            state.Gamepad.sThumbLY = 32767;
+        if (autoButtons & XINPUT_GAMEPAD_DPAD_DOWN)
+            state.Gamepad.sThumbLY = -32768;
+        if (autoButtons & XINPUT_GAMEPAD_DPAD_RIGHT)
+            state.Gamepad.sThumbLX = 32767;
+        if (autoButtons & XINPUT_GAMEPAD_DPAD_LEFT)
+            state.Gamepad.sThumbLX = -32768;
         if (lastButtons.exchange(state.Gamepad.wButtons) != state.Gamepad.wButtons)
         {
             packet++;
-            LOGF_INFO("auto press: buttons 0x{:04X}", state.Gamepad.wButtons);
+            LOGF_INFO("auto press: buttons 0x{:04X} at frame {}", state.Gamepad.wButtons, gpu::d3d12::GetFrameNumber());
         }
         state.dwPacketNumber = packet;
         return true;
