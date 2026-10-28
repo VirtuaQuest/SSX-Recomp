@@ -941,6 +941,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         uint32_t nullSrv = dimension == 3 ? NULL_SRV_CUBE : dimension == 2 ? NULL_SRV_3D : NULL_SRV_2D;
         if ((fetch.words[0] & 3) != 2) // Not a texture fetch constant.
             return nullSrv;
+        static const bool nullCubes = getenv("AR_NULL_CUBE") != nullptr;
+        if (nullCubes && dimension == 3)
+            return nullSrv;
 
         // Resolved render targets are used directly.
         uint32_t row;
@@ -1604,6 +1607,29 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (mode != EdramMode::ColorDepth && mode != EdramMode::DepthOnly)
             return;
 
+        // Debugging (AR_SKIP_PS=<hex hash prefixes, comma separated>): draws with these pixel shaders are skipped.
+        static const std::vector<std::string> skippedShaders = []
+            {
+                std::vector<std::string> list;
+                if (const char* text = getenv("AR_SKIP_PS"))
+                {
+                    std::stringstream stream(text);
+                    std::string item;
+                    while (std::getline(stream, item, ','))
+                        list.push_back(item);
+                }
+                return list;
+            }();
+        if (pixelShader && !skippedShaders.empty())
+        {
+            std::string hash = fmt::format("{:016X}", pixelShader->hash);
+            for (const auto& prefix : skippedShaders)
+            {
+                if (hash.rfind(prefix, 0) == 0)
+                    return;
+            }
+        }
+
         if (vertexShader.code == nullptr || vertexShader.code->empty())
         {
             if (TraceThisFrame())
@@ -1727,8 +1753,12 @@ float4 main(float4 position : SV_Position) : SV_Target
 
                     uint32_t dimension = uint32_t(binding.fetch_instr.dimension);
                     uint32_t hostDimension = dimension == 2 ? 2 : dimension == 3 ? 3 : 1;
+                    // Signedness and gamma apply to fixed point formats; float (16 and 32 bit) and depth formats
+                    // ignore them (games set them anyway, for example signed 16_16_16_16_FLOAT light buffers).
+                    uint32_t format = fetch.Format();
+                    bool fixedPoint = !(format == 22 || format == 23 || (format >= 30 && format <= 32) || (format >= 36 && format <= 38));
                     uint32_t signs = 0;
-                    for (uint32_t c = 0; c < 4; c++)
+                    for (uint32_t c = 0; c < 4 && fixedPoint; c++)
                     {
                         uint32_t sign = (fetch.words[0] >> (2 + c * 2)) & 3;
                         if (sign == 1)
@@ -2301,7 +2331,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                         static int sourceIndex;
                         SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
                     }
-                    if (TraceThisFrame() && destFormat == DXGI_FORMAT_R8G8B8A8_UNORM)
+                    if (TraceThisFrame() && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT))
                     {
                         static int resolveIndex;
                         SaveScreenshot(resolved.texture, destWidth, destHeight, fmt::format("screenshots/resolve_{:02}_{:08X}.bmp", resolveIndex++, destBase));
@@ -2394,9 +2424,31 @@ float4 main(float4 position : SV_Position) : SV_Target
             for (uint32_t x = 0; x < width; x++)
             {
                 uint8_t* out = &pixels[(size_t(y) * width + x) * 4];
-                out[0] = row[x * 4 + (swapRedBlue ? 0 : 2)];
-                out[1] = row[x * 4 + 1];
-                out[2] = row[x * 4 + (swapRedBlue ? 2 : 0)];
+                if (texture.format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                {
+                    // Half floats, clamped to 0-1.
+                    uint8_t rgb[3];
+                    for (uint32_t c = 0; c < 3; c++)
+                    {
+                        uint16_t half;
+                        memcpy(&half, row + x * 8 + c * 2, 2);
+                        uint32_t exponent = (half >> 10) & 0x1F, mantissa = half & 0x3FF;
+                        float value = exponent == 0 ? std::ldexp(float(mantissa), -24) :
+                            std::ldexp(float(mantissa | 0x400), int(exponent) - 25);
+                        if (half & 0x8000)
+                            value = 0.0f;
+                        rgb[c] = uint8_t(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    }
+                    out[0] = rgb[swapRedBlue ? 0 : 2];
+                    out[1] = rgb[1];
+                    out[2] = rgb[swapRedBlue ? 2 : 0];
+                }
+                else
+                {
+                    out[0] = row[x * 4 + (swapRedBlue ? 0 : 2)];
+                    out[1] = row[x * 4 + 1];
+                    out[2] = row[x * 4 + (swapRedBlue ? 2 : 0)];
+                }
                 out[3] = 255;
             }
         }
