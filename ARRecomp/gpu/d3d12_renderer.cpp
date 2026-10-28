@@ -1871,7 +1871,18 @@ float4 main(float4 position : SV_Position) : SV_Target
                     uint32_t rawDepth;
                     slot[0] = GetTexture(fetch, hostDimension, system.textureTransforms[index], rawDepth);
                     // Raw depth words can't be filtered.
+                    // Filters set in the fetch instruction override the fetch constant's.
                     TextureFetch samplerFetch = fetch;
+                    const auto& attributes = binding.fetch_instr.attributes;
+                    auto overrideField = [&](uint32_t value, uint32_t useFetchConst, uint32_t shift, uint32_t mask)
+                        {
+                            if (value != useFetchConst)
+                                samplerFetch.words[3] = (samplerFetch.words[3] & ~(mask << shift)) | (value << shift);
+                        };
+                    overrideField(uint32_t(attributes.mag_filter), 3, 19, 3);
+                    overrideField(uint32_t(attributes.min_filter), 3, 21, 3);
+                    overrideField(uint32_t(attributes.mip_filter), 3, 23, 3);
+                    overrideField(uint32_t(attributes.aniso_filter), 7, 25, 7);
                     if (rawDepth)
                         samplerFetch.words[3] &= ~(0xFu << 19);
                     slot[1] = GetSampler(samplerFetch);
@@ -2449,7 +2460,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                         static int sourceIndex;
                         SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
                     }
-                    if (TraceThisFrame() && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT))
+                    if (TraceThisFrame() && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || destFormat == DXGI_FORMAT_R32_FLOAT))
                     {
                         static int resolveIndex;
                         SaveScreenshot(resolved.texture, destWidth, destHeight, fmt::format("screenshots/resolve_{:02}_{:08X}.bmp", resolveIndex++, destBase));
@@ -2560,6 +2571,20 @@ float4 main(float4 position : SV_Position) : SV_Target
                     out[0] = rgb[swapRedBlue ? 0 : 2];
                     out[1] = rgb[1];
                     out[2] = rgb[swapRedBlue ? 2 : 0];
+                }
+                else if (texture.format == DXGI_FORMAT_R32_FLOAT)
+                {
+                    // Single floats: AR_DUMP_SCALE (default 100) maps to white; negative values are red.
+                    static const float scale = getenv("AR_DUMP_SCALE") ? float(atof(getenv("AR_DUMP_SCALE"))) : 100.0f;
+                    float value;
+                    memcpy(&value, row + x * 4, 4);
+                    uint8_t gray = uint8_t(std::clamp(std::abs(value) / scale, 0.0f, 1.0f) * 255.0f);
+                    out[0] = out[1] = gray;
+                    out[2] = value < 0.0f || std::isnan(value) ? 255 : gray;
+                }
+                else if (getenv("AR_DUMP_ALPHA") && path.filename().string().rfind("resolve", 0) == 0)
+                {
+                    out[0] = out[1] = out[2] = row[x * 4 + 3];
                 }
                 else
                 {
