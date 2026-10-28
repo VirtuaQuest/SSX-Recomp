@@ -502,6 +502,7 @@ cbuffer DepthBlitConstants : register(b0)
     uint stencilIndex;
     uint floatDepth;
     int2 sampleScale;
+    uint swapHalves; // Reading depth as colour EDRAM: 40-sample halves of each 80-sample tile are swapped.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
@@ -520,6 +521,8 @@ uint ToFloat24(float value)
 float4 main(float4 position : SV_Position) : SV_Target
 {
     int3 coords = int3((int2(position.xy) + sourceOffset) * sampleScale, 0);
+    if (swapHalves)
+        coords.x += (uint(coords.x) % 80u) < 40u ? 40 : -40;
     float depth = textures[NonUniformResourceIndex(depthIndex)].Load(coords).r;
     uint stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
     uint depth24 = floatDepth ? ToFloat24(depth) : uint(round(saturate(depth) * 16777215.0f));
@@ -572,7 +575,11 @@ float main(float4 position : SV_Position
 #endif
     ) : SV_Depth
 {
-    uint4 bytes = uint4(round(saturate(textures[NonUniformResourceIndex(colorIndex)].Load(int3(int2(position.xy) + sourceOffset, 0))) * 255.0f));
+    // Depth tiles have their 40-sample halves swapped relative to colour tiles; games writing depth through colour
+    // render targets swap them in their shaders.
+    int2 coords = int2(position.xy) + sourceOffset;
+    coords.x += (uint(coords.x) % 80u) < 40u ? 40 : -40;
+    uint4 bytes = uint4(round(saturate(textures[NonUniformResourceIndex(colorIndex)].Load(int3(coords, 0))) * 255.0f));
 #ifdef STENCIL_REF
     stencil = bytes.x;
 #endif
@@ -1328,8 +1335,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                     uint32_t stencilIndex;
                     uint32_t floatDepth;
                     int32_t sampleScale[2];
+                    uint32_t swapHalves;
                 } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, other->stencilSrv,
-                    otherKey->format == 1 ? 1u : 0u, { 1, 1 } };
+                    otherKey->format == 1 ? 1u : 0u, { 1, 1 }, 1u };
                 g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
                 g.list->DrawInstanced(3, 1, 0, 0);
             }
@@ -2194,6 +2202,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     }
                 }
             }
+            LOGF_INFO("  colorcontrol {:08X}", uint32_t(registers[RB_COLORCONTROL]));
             LOGF_INFO("  line {:08X} point {:08X} {:08X}", uint32_t(registers[0x2282]), uint32_t(registers[PA_SU_POINT_SIZE]),
                 uint32_t(registers[PA_SU_POINT_MINMAX]));
             LOGF_INFO("  surface {:08X} color {:08X} depth {:08X} window {:08X} vport {} {} {} {}", uint32_t(registers[RB_SURFACE_INFO]),
@@ -2496,6 +2505,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                         uint32_t stencilIndex;
                         uint32_t floatDepth;
                         int32_t sampleScale[2];
+                        uint32_t swapHalves;
                     } depthConstants{ { 0, -int32_t(row) }, source->srv, source->stencilSrv,
                         DepthInfo{ registers[RB_DEPTH_INFO] }.Format() == 1 ? 1u : 0u, { int32_t(sampleScale.x), int32_t(sampleScale.y) } };
 

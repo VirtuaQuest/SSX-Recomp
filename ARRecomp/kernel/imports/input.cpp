@@ -126,8 +126,9 @@ constexpr uint16_t AUTO_HOLD = 0x0800;
 
 // Debugging without a controller (AR_AUTO_PRESS=<seconds>): controller 0 taps a button every that many seconds,
 // alternating A and Start.
-static uint16_t AutoPressButtons()
+static uint16_t AutoPressButtons(float& stickAngle)
 {
+    stickAngle = -1.0f;
     static const int period = getenv("AR_AUTO_PRESS") ? atoi(getenv("AR_AUTO_PRESS")) : 0;
     static const auto start = std::chrono::steady_clock::now();
     if (period <= 0)
@@ -139,8 +140,10 @@ static uint16_t AutoPressButtons()
     bool tapped = elapsed % (period * 1000) < 250;
 
     // AR_AUTO_SEQUENCE: comma separated buttons (A, B, X, Y, START, BACK, UP, DOWN, LEFT, RIGHT, LB, RB, LT) pressed
-    // in order instead (WAIT skips a turn, LTHOLD holds the left trigger for the whole turn); after the last one, A
-    // repeats, or nothing when the list ends with WAIT.
+    // in order instead (WAIT skips a turn, LTHOLD holds the left trigger for the whole turn, MOVE<degrees> holds the
+    // left stick that many degrees counterclockwise from up for the whole turn); after the last one, A repeats, or
+    // nothing when the list ends with WAIT.
+    static std::vector<float> angles;
     static const std::vector<uint16_t> sequence = []
         {
             std::vector<uint16_t> buttons;
@@ -157,13 +160,18 @@ static uint16_t AutoPressButtons()
                 {
                     size_t end = list.find(',', start);
                     std::string name = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    size_t count = buttons.size();
                     if (name == "WAIT")
                         buttons.push_back(0);
+                    else if (name.rfind("MOVE", 0) == 0)
+                        buttons.push_back(AUTO_HOLD);
                     for (auto& [buttonName, button] : names)
                     {
                         if (name == buttonName)
                             buttons.push_back(button);
                     }
+                    if (buttons.size() > count)
+                        angles.push_back(name.rfind("MOVE", 0) == 0 ? float(atof(name.c_str() + 4)) : -1.0f);
                     if (end == std::string::npos)
                         break;
                     start = end + 1;
@@ -175,7 +183,11 @@ static uint16_t AutoPressButtons()
     size_t step = size_t(elapsed / (period * 1000)) - 1;
     uint16_t buttons;
     if (!sequence.empty())
+    {
         buttons = step < sequence.size() ? sequence[step] : sequence.back() == 0 ? 0 : XINPUT_GAMEPAD_A;
+        if (step < angles.size())
+            stickAngle = angles[step];
+    }
     else
         buttons = (elapsed / (period * 1000)) % 2 ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_START;
 
@@ -193,7 +205,14 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
         // The packet number changes with the state, which is how titles notice input.
         static std::atomic<uint32_t> packet;
         static std::atomic<uint16_t> lastButtons;
-        uint16_t autoButtons = AutoPressButtons();
+        float stickAngle;
+        uint16_t autoButtons = AutoPressButtons(stickAngle);
+        if (stickAngle >= 0.0f)
+        {
+            float radians = stickAngle * 3.14159265f / 180.0f;
+            state.Gamepad.sThumbLX = SHORT(-std::sin(radians) * 32767.0f);
+            state.Gamepad.sThumbLY = SHORT(std::cos(radians) * 32767.0f);
+        }
         state.Gamepad.wButtons |= autoButtons & ~(AUTO_LEFT_TRIGGER | AUTO_HOLD);
         if (autoButtons & AUTO_LEFT_TRIGGER)
             state.Gamepad.bLeftTrigger = 255;
