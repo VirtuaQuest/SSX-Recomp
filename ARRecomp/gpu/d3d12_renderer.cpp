@@ -210,7 +210,9 @@ namespace gpu::d3d12
         ComPtr<ID3D12RootSignature> rootSignature;
         std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
         std::vector<uint8_t> rectangleGeometryShader, pointGeometryShader;
-        std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader, depthCopyPixelShader;
+        std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader, depthCopyPixelShader,
+            colorToDepthPixelShader;
+        std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> colorToDepthPipelines;
         bool stencilRefSupported = false;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthCopyPipelines;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> depthBlitPipelines;
@@ -552,6 +554,37 @@ float main(float4 position : SV_Position
 }
 )";
 
+    // Depth buffers from 8888 color written over their EDRAM: the words hold 24 bit depth (unorm or float with a 4 bit
+    // exponent) above 8 bit stencil, from the low byte up.
+    static constexpr const char* COLOR_TO_DEPTH_PS = R"(
+cbuffer ColorToDepthConstants : register(b0)
+{
+    int2 sourceOffset;
+    uint colorIndex;
+    uint floatDepth;
+};
+
+Texture2D<float4> textures[] : register(t0, space0);
+
+float main(float4 position : SV_Position
+#ifdef STENCIL_REF
+    , out uint stencil : SV_StencilRef
+#endif
+    ) : SV_Depth
+{
+    uint4 bytes = uint4(round(saturate(textures[NonUniformResourceIndex(colorIndex)].Load(int3(int2(position.xy) + sourceOffset, 0))) * 255.0f));
+#ifdef STENCIL_REF
+    stencil = bytes.x;
+#endif
+    uint depth24 = bytes.y | (bytes.z << 8u) | (bytes.w << 16u);
+    if (floatDepth == 0u)
+        return float(depth24) / 16777215.0f;
+    uint exponent = depth24 >> 20u;
+    float mantissa = float(depth24 & 0xFFFFFu) / 1048576.0f;
+    return exponent == 0u ? mantissa * exp2(-14.0f) : (1.0f + mantissa) * exp2(float(exponent) - 15.0f);
+}
+)";
+
     static constexpr const char* PRESENT_PS = R"(
 cbuffer PresentConstants : register(b0)
 {
@@ -747,6 +780,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.blitPixelShader = CompileInternal(BLIT_PS, L"ps_6_0", "blit_ps");
         g.presentPixelShader = CompileInternal(PRESENT_PS, L"ps_6_0", "present_ps");
         g.depthBlitPixelShader = CompileInternal(DEPTH_BLIT_PS, L"ps_6_0", "depth_blit_ps");
+        g.colorToDepthPixelShader = CompileInternal(
+            (std::string(g.stencilRefSupported ? "#define STENCIL_REF\n" : "") + COLOR_TO_DEPTH_PS).c_str(), L"ps_6_0", "color_to_depth_ps");
         g.depthCopyPixelShader = CompileInternal(
             (std::string(g.stencilRefSupported ? "#define STENCIL_REF\n" : "") + DEPTH_COPY_PS).c_str(), L"ps_6_0", "depth_copy_ps");
         if (g.blitVertexShader.empty() || g.blitPixelShader.empty() || g.presentPixelShader.empty())
@@ -1141,7 +1176,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
     }
 
-    static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format);
+    static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format, bool fromColor = false);
     static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present, bool depth);
     static void SetViewportAndScissor(uint32_t width, uint32_t height, D3D12_RECT scissor);
 
@@ -1187,8 +1222,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             // 8888 color targets also take the raw words of depth buffers over them (games clear color by clearing
             // depth at the same EDRAM address).
             bool depthIntoColor = !key.depth && otherKey.depth && (key.format == 0 || key.format == 1);
+            bool colorIntoDepth = key.depth && !otherKey.depth && (otherKey.format == 0 || otherKey.format == 1);
             if (otherKey == key || otherKey.pitch != key.pitch ||
-                (!depthIntoColor && (otherKey.depth != key.depth || otherKey.format != key.format)))
+                (!depthIntoColor && !colorIntoDepth && (otherKey.depth != key.depth || otherKey.format != key.format)))
                 continue;
             int32_t delta = int32_t(otherKey.base) - int32_t(key.base);
             uint64_t otherStamp = g.renderTargetStamps[otherKey];
@@ -1208,10 +1244,10 @@ float4 main(float4 position : SV_Position) : SV_Target
             uint32_t sourceTop = uint32_t(std::max(0, -rows)), destTop = uint32_t(std::max(0, rows));
             uint32_t height = RENDER_TARGET_HEIGHT - uint32_t(std::abs(rows));
 
-            if (!key.depth && otherKey->depth)
+            if (key.depth != otherKey->depth)
             {
-                // Only what the depth buffer wrote since this target was last used: elsewhere its texture doesn't
-                // hold what EDRAM does (this target's own contents).
+                // Only what the other target wrote since this one was last used: elsewhere its texture doesn't hold
+                // what EDRAM does (this target's own contents).
                 D3D12_RECT written{};
                 bool any = false;
                 for (auto& [writeStamp, rect] : g.renderTargetWrites[*otherKey])
@@ -1227,6 +1263,29 @@ float4 main(float4 position : SV_Position) : SV_Target
 
                 written.top = std::max<LONG>(written.top + rows, LONG(destTop));
                 written.bottom = std::min<LONG>(written.bottom + rows, LONG(destTop + height));
+                if (written.top >= written.bottom || written.left >= written.right)
+                    continue;
+
+                if (key.depth)
+                {
+                    Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                    auto dsv = CpuDsv(texture.dsv);
+                    g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+                    SetViewportAndScissor(texture.width, texture.height, written);
+                    g.list->SetPipelineState(GetDepthCopyPipeline(texture.format, true));
+                    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    struct
+                    {
+                        int32_t sourceOffset[2];
+                        uint32_t colorIndex;
+                        uint32_t floatDepth;
+                    } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, key.format == 1 ? 1u : 0u };
+                    g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+                    g.list->DrawInstanced(3, 1, 0, 0);
+                    continue;
+                }
+
                 Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 Transition(texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 auto rtv = CpuRtv(texture.rtv);
@@ -1516,16 +1575,16 @@ float4 main(float4 position : SV_Position) : SV_Target
         return pipeline.Get();
     }
 
-    static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format)
+    static ID3D12PipelineState* GetDepthCopyPipeline(DXGI_FORMAT format, bool fromColor)
     {
-        auto& pipeline = g.depthCopyPipelines[format];
+        auto& pipeline = fromColor ? g.colorToDepthPipelines[format] : g.depthCopyPipelines[format];
         if (pipeline)
             return pipeline.Get();
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = g.rootSignature.Get();
         desc.VS = Bytecode(g.blitVertexShader);
-        desc.PS = Bytecode(g.depthCopyPixelShader);
+        desc.PS = Bytecode(fromColor ? g.colorToDepthPixelShader : g.depthCopyPixelShader);
         desc.SampleMask = UINT_MAX;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -1935,6 +1994,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         system.ndcOffset[1] = 1.0f - offsetY * 2.0f / height;
         system.ndcOffset[2] = offsetZ;
         system.flags = ((vte >> 8) & 1) | (((vte >> 9) & 1) << 1) | (((vte >> 10) & 1) << 2);
+        // Debugging (AR_HIGHLIGHT_PRIM=<primitive type>): those draws output solid magenta.
+        static const int highlightPrimitive = getenv("AR_HIGHLIGHT_PRIM") ? atoi(getenv("AR_HIGHLIGHT_PRIM")) : -1;
+        if (int(draw.initiator.PrimType()) == highlightPrimitive)
+            system.flags |= 16;
         if (draw.initiator.PrimType() == PrimitiveType::PointList)
         {
             // PA_SU_POINT_SIZE and PA_SU_POINT_MINMAX hold radii in 12.4 fixed point.
@@ -2064,6 +2127,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 colorMask, depthControl, pitch, scissor.left, scissor.top, scissor.right, scissor.bottom,
                 system.ndcScale[0], system.ndcScale[1], system.ndcScale[2], system.ndcOffset[0], system.ndcOffset[1], system.ndcOffset[2],
                 vte, key.blend[0], textures);
+            LOGF_INFO("  line {:08X} point {:08X} {:08X}", uint32_t(registers[0x2282]), uint32_t(registers[PA_SU_POINT_SIZE]),
+                uint32_t(registers[PA_SU_POINT_MINMAX]));
             LOGF_INFO("  surface {:08X} color {:08X} depth {:08X} window {:08X} vport {} {} {} {}", uint32_t(registers[RB_SURFACE_INFO]),
                 uint32_t(registers[RB_COLOR_INFO]), uint32_t(registers[RB_DEPTH_INFO]), uint32_t(registers[PA_SC_WINDOW_OFFSET]),
                 RegisterFloat(registers, PA_CL_VPORT_XSCALE), RegisterFloat(registers, PA_CL_VPORT_XOFFSET),

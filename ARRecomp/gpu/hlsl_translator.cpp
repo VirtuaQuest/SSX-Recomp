@@ -47,6 +47,7 @@ static const uint XE_FLAG_XY_NOT_DIVIDED = 1u;
 static const uint XE_FLAG_Z_NOT_DIVIDED = 2u;
 static const uint XE_FLAG_W_NOT_RECIPROCAL = 4u;
 static const uint XE_FLAG_POINT = 8u; // Drawing point sprites.
+static const uint XE_FLAG_DEBUG_HIGHLIGHT = 16u; // Debugging: the draw outputs solid magenta.
 
 // Shader model 3 multiplication: zero times anything (including infinity and NaN) is zero.
 float4 xe_mul(float4 a, float4 b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
@@ -1126,6 +1127,8 @@ XeOutput main(uint vertexId : SV_VertexID)
     }
     if (!alphaPass)
         discard;
+    if (xe_flags & XE_FLAG_DEBUG_HIGHLIGHT)
+        xe_color[0] = float4(1.0f, 0.0f, 1.0f, 1.0f);
     [unroll] for (int t = 0; t < 4; t++)
     {
         float4 color = xe_color[t] * xe_color_exp_bias[t];

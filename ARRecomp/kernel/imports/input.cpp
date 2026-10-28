@@ -120,6 +120,10 @@ static bool IsKeyDown(const XINPUT_GAMEPAD& pad, const KeyMapping& key)
 static std::mutex g_keystrokeMutex;
 static KeystrokeState g_keystrokes[XUSER_MAX_COUNT];
 
+// Unused XINPUT_GAMEPAD bits standing for the triggers, and for holding a step's buttons for its whole period.
+constexpr uint16_t AUTO_LEFT_TRIGGER = 0x0400;
+constexpr uint16_t AUTO_HOLD = 0x0800;
+
 // Debugging without a controller (AR_AUTO_PRESS=<seconds>): controller 0 taps a button every that many seconds,
 // alternating A and Start.
 static uint16_t AutoPressButtons()
@@ -130,18 +134,21 @@ static uint16_t AutoPressButtons()
         return 0;
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    if (elapsed < period * 1000 || elapsed % (period * 1000) >= 250)
+    if (elapsed < period * 1000)
         return 0;
+    bool tapped = elapsed % (period * 1000) < 250;
 
-    // AR_AUTO_SEQUENCE: comma separated buttons (A, B, X, Y, START, BACK, UP, DOWN, LEFT, RIGHT, LB, RB) pressed in
-    // order instead (WAIT skips a turn); after the last one, A repeats, or nothing when the list ends with WAIT.
+    // AR_AUTO_SEQUENCE: comma separated buttons (A, B, X, Y, START, BACK, UP, DOWN, LEFT, RIGHT, LB, RB, LT) pressed
+    // in order instead (WAIT skips a turn, LTHOLD holds the left trigger for the whole turn); after the last one, A
+    // repeats, or nothing when the list ends with WAIT.
     static const std::vector<uint16_t> sequence = []
         {
             std::vector<uint16_t> buttons;
             static const std::pair<const char*, uint16_t> names[] = { { "A", XINPUT_GAMEPAD_A }, { "B", XINPUT_GAMEPAD_B },
                 { "X", XINPUT_GAMEPAD_X }, { "Y", XINPUT_GAMEPAD_Y }, { "START", XINPUT_GAMEPAD_START }, { "BACK", XINPUT_GAMEPAD_BACK },
                 { "UP", XINPUT_GAMEPAD_DPAD_UP }, { "DOWN", XINPUT_GAMEPAD_DPAD_DOWN }, { "LEFT", XINPUT_GAMEPAD_DPAD_LEFT },
-                { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER } };
+                { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER },
+                { "LT", AUTO_LEFT_TRIGGER }, { "LTHOLD", AUTO_LEFT_TRIGGER | AUTO_HOLD } };
             if (const char* text = getenv("AR_AUTO_SEQUENCE"))
             {
                 std::string list = text;
@@ -166,10 +173,13 @@ static uint16_t AutoPressButtons()
         }();
 
     size_t step = size_t(elapsed / (period * 1000)) - 1;
+    uint16_t buttons;
     if (!sequence.empty())
-        return step < sequence.size() ? sequence[step] : sequence.back() == 0 ? 0 : XINPUT_GAMEPAD_A;
+        buttons = step < sequence.size() ? sequence[step] : sequence.back() == 0 ? 0 : XINPUT_GAMEPAD_A;
+    else
+        buttons = (elapsed / (period * 1000)) % 2 ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_START;
 
-    return (elapsed / (period * 1000)) % 2 ? XINPUT_GAMEPAD_A : XINPUT_GAMEPAD_START;
+    return tapped || (buttons & AUTO_HOLD) ? buttons : 0;
 }
 
 static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
@@ -184,7 +194,9 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
         static std::atomic<uint32_t> packet;
         static std::atomic<uint16_t> lastButtons;
         uint16_t autoButtons = AutoPressButtons();
-        state.Gamepad.wButtons |= autoButtons;
+        state.Gamepad.wButtons |= autoButtons & ~(AUTO_LEFT_TRIGGER | AUTO_HOLD);
+        if (autoButtons & AUTO_LEFT_TRIGGER)
+            state.Gamepad.bLeftTrigger = 255;
         // Directions also push the left stick, which some menus read instead of the D-pad.
         if (autoButtons & XINPUT_GAMEPAD_DPAD_UP)
             state.Gamepad.sThumbLY = 32767;
@@ -194,10 +206,11 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
             state.Gamepad.sThumbLX = 32767;
         if (autoButtons & XINPUT_GAMEPAD_DPAD_LEFT)
             state.Gamepad.sThumbLX = -32768;
-        if (lastButtons.exchange(state.Gamepad.wButtons) != state.Gamepad.wButtons)
+        uint16_t buttonState = state.Gamepad.wButtons | (state.Gamepad.bLeftTrigger > 64 ? AUTO_LEFT_TRIGGER : 0);
+        if (lastButtons.exchange(buttonState) != buttonState)
         {
             packet++;
-            LOGF_INFO("auto press: buttons 0x{:04X} at frame {}", state.Gamepad.wButtons, gpu::d3d12::GetFrameNumber());
+            LOGF_INFO("auto press: buttons 0x{:04X} at frame {}", buttonState, gpu::d3d12::GetFrameNumber());
         }
         state.dwPacketNumber = packet;
         return true;
