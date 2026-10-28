@@ -1528,11 +1528,19 @@ float4 main(float4 position : SV_Position) : SV_Target
             return;
 
         if (vertexShader.code == nullptr || vertexShader.code->empty())
+        {
+            if (TraceThisFrame())
+                LOGF_INFO("draw skipped: vertex shader {:016X} did not compile", vertexShader.hash);
             return;
+        }
         if (pixelShader && (pixelShader->code == nullptr || pixelShader->code->empty()))
         {
             if (mode == EdramMode::ColorDepth)
+            {
+                if (TraceThisFrame())
+                    LOGF_INFO("draw skipped: pixel shader {:016X} did not compile", pixelShader->hash);
                 return;
+            }
             pixelShader = nullptr;
         }
 
@@ -1588,7 +1596,13 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
 
         if (key.renderTargetCount == 0 && !depthTarget)
+        {
+            if (TraceThisFrame())
+                LOGF_INFO("draw skipped: no render targets (mask {:04X}, depth control {:08X}, mode {}, ps {:016X}, count {})",
+                    uint32_t(registers[RB_COLOR_MASK]), uint32_t(registers[RB_DEPTHCONTROL]), uint32_t(mode),
+                    pixelShader ? pixelShader->hash : 0, count);
             return;
+        }
 
         // Primitive type, and the conversions for the ones the host has no equivalent of.
         enum class Conversion { None, Fan, Quads, LineLoop } conversion = Conversion::None;
@@ -1617,7 +1631,11 @@ float4 main(float4 position : SV_Position) : SV_Target
         uint32_t modeControl = registers[PA_SU_SC_MODE_CNTL];
         uint32_t cull = topologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && !key.geometryShader ? (modeControl & 3) : 0;
         if (cull == 3)
+        {
+            if (TraceThisFrame())
+                LOGF_INFO("draw skipped: both faces culled");
             return;
+        }
         key.rasterizer = cull | (((modeControl >> 2) & 1) << 2) | (((registers[PA_CL_CLIP_CNTL] >> 16) & 1) << 3);
 
         // Textures first: their uploads are recorded as they are made, so they survive an upload flush.
@@ -1851,7 +1869,11 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         ID3D12PipelineState* pipeline = GetPipeline(key, vertexShader, pixelShader);
         if (!pipeline)
+        {
+            if (TraceThisFrame())
+                LOGF_INFO("draw skipped: no pipeline for vs {:016X} ps {:016X}", key.vertexShader, key.pixelShader);
             return;
+        }
 
         if (TraceThisFrame())
         {
