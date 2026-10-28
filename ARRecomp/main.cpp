@@ -17,6 +17,7 @@
 Memory g_memory;
 
 void InstallCrashHandler();
+void InstallMemoryWatch();
 
 static void PrintUsage()
 {
@@ -84,6 +85,7 @@ int main(int argc, char* argv[])
     }
 
     g_runtimeHeap.Init();
+    InstallMemoryWatch();
 
     if (!vfs::Mount(gamePath, userPath))
         return 1;

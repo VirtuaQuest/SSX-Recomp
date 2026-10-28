@@ -129,3 +129,69 @@ void InstallCrashHandler()
 {
     AddVectoredExceptionHandler(1, CrashHandler);
 }
+
+// Debugging (AR_WATCH_PHYSICAL=<hex physical address>): logs where writes to the 4 KB page holding a physical
+// address come from, once per host instruction. The page is made read only in every physical view; a write faults,
+// is logged, and runs with the page writable for one instruction.
+static uint8_t* g_watchPages[3];
+static std::set<DWORD64> g_watchSeen;
+static thread_local bool t_watchStepping;
+
+static void ProtectWatch(DWORD protection)
+{
+    DWORD old;
+    for (auto* page : g_watchPages)
+        VirtualProtect(page, 4096, protection, &old);
+}
+
+static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
+{
+    auto* record = info->ExceptionRecord;
+    if (record->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watchStepping)
+    {
+        t_watchStepping = false;
+        ProtectWatch(PAGE_READONLY);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    auto* address = reinterpret_cast<uint8_t*>(record->ExceptionInformation[1]);
+    bool watched = false;
+    for (auto* page : g_watchPages)
+        watched |= address >= page && address < page + 4096;
+    if (!watched)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    {
+        std::lock_guard lock(g_crashMutex);
+        if (g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < 64)
+        {
+            fmt::print(stderr, "==== watch: write to guest 0x{:08X} on guest thread {}\n", g_memory.MapVirtual(address),
+                GetCurrentGuestThreadId());
+            if (auto* ctx = GetPPCContext())
+                fmt::print(stderr, "     guest r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} r6 0x{:08X} r31 0x{:08X} lr 0x{:08X}\n",
+                    ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r31.u32, uint32_t(ctx->lr));
+            PrintStack(GetCurrentThread(), *info->ContextRecord, 8);
+        }
+    }
+
+    ProtectWatch(PAGE_READWRITE);
+    info->ContextRecord->EFlags |= 0x100; // Trap after the write.
+    t_watchStepping = true;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void InstallMemoryWatch()
+{
+    const char* text = getenv("AR_WATCH_PHYSICAL");
+    if (!text)
+        return;
+
+    uint32_t page = uint32_t(strtoul(text, nullptr, 16)) & ~0xFFFu;
+    g_watchPages[0] = g_memory.base + 0xA0000000u + page;
+    g_watchPages[1] = g_memory.base + 0xC0000000u + page;
+    g_watchPages[2] = g_memory.base + 0xE0000000u + page; // Virtual 0xE0000000 + X is physical X + 0x1000, stored 4 KB up.
+    AddVectoredExceptionHandler(1, WatchHandler);
+    ProtectWatch(PAGE_READONLY);
+}

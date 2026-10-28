@@ -1867,6 +1867,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                     textures += fmt::format(" tf{}=srv{}@{:08X}/fmt{}/{}x{}", i, system.textures[i][0],
                         registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0xFFFFF000, registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0x3F,
                         fetch.Width(), fetch.Height());
+                    if (getenv("AR_TRACE_FETCH"))
+                        textures += fmt::format("[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]", fetch.words[0], fetch.words[1],
+                            fetch.words[2], fetch.words[3], fetch.words[4], fetch.words[5]);
                 }
             }
             LOGF_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} rt {} mask {:04X} depth {:08X} pitch {} scissor {},{}-{},{} ndc {:.4f},{:.4f},{:.4f} / {:.4f},{:.4f},{:.4f} vte {:X} blend {:08X}{}",
@@ -2003,6 +2006,13 @@ float4 main(float4 position : SV_Position) : SV_Target
                 (control.value >> 8) & 3, vertices[0], vertices[1], vertices[2], vertices[3], vertices[4], vertices[5]);
         CopyDestInfo destInfo{ registers[RB_COPY_DEST_INFO] };
         CopyDestPitch destPitch{ registers[RB_COPY_DEST_PITCH] };
+        if (getenv("AR_LOG_RESOLVES"))
+        {
+            static std::set<uint64_t> logged;
+            if (logged.insert((uint64_t(destBase) << 32) | (uint32_t(x1 - x0) << 16) | uint32_t(y1 - y0)).second)
+                LOGF_INFO("frame {}: resolve {}x{} from {} to 0x{:08X} format {} pitch {}x{}", g.frameNumber, x1 - x0, y1 - y0,
+                    sourceSelect, destBase, destInfo.Format(), destPitch.Pitch(), destPitch.Height());
+        }
 
         if (destBase != 0 && control.Command() != 3)
         {

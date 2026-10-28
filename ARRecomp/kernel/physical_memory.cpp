@@ -7,7 +7,25 @@
 static std::mutex g_eViewMutex;
 static std::unordered_map<uint32_t, uint32_t> g_eViewAllocations;
 
+uint32_t AllocatePhysicalMemoryUnlogged(uint32_t size, uint32_t alignment, uint32_t view, uint32_t protect, bool topDown);
+
+// Debugging (AR_WATCH_PHYSICAL): logs allocations and frees covering the watched physical address.
+static void LogWatchedRange(const char* operation, uint32_t physical, uint32_t size, uint32_t address)
+{
+    static const uint32_t watched = getenv("AR_WATCH_PHYSICAL") ? uint32_t(strtoul(getenv("AR_WATCH_PHYSICAL"), nullptr, 16)) : 0;
+    if (watched != 0 && watched >= physical && watched - physical < size)
+        LOGF_WARNING("{} physical 0x{:08X}-0x{:08X} at 0x{:08X} covers the watched address", operation, physical, physical + size, address);
+}
+
 uint32_t AllocatePhysicalMemory(uint32_t size, uint32_t alignment, uint32_t view, uint32_t protect, bool topDown)
+{
+    uint32_t result = AllocatePhysicalMemoryUnlogged(size, alignment, view, protect, topDown);
+    if (result != 0)
+        LogWatchedRange("allocated", VirtualToPhysical(result), size, result);
+    return result;
+}
+
+uint32_t AllocatePhysicalMemoryUnlogged(uint32_t size, uint32_t alignment, uint32_t view, uint32_t protect, bool topDown)
 {
     alignment = std::max<uint32_t>(alignment, 0x1000);
 
@@ -32,6 +50,7 @@ uint32_t AllocatePhysicalMemory(uint32_t size, uint32_t alignment, uint32_t view
 
 void FreePhysicalMemory(uint32_t address)
 {
+    LogWatchedRange("freeing", VirtualToPhysical(address), 0x100000, address);
     if (address >= PHYSICAL_VIEW_4K)
     {
         std::lock_guard lock(g_eViewMutex);

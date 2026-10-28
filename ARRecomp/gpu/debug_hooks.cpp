@@ -43,3 +43,30 @@ PPC_FUNC(sub_8223F950)
         pendingQuery = 0;
     }
 }
+
+// Diagnostics for the game's backwards LZ decompressor (AR_DUMP_DECOMPRESS=<hex guest address>): saves the input
+// and output of calls whose output covers the address. Arguments: r4/r5 source and size, r6/r7 destination and size.
+PPC_FUNC_IMPL(__imp__sub_82570808);
+PPC_FUNC(sub_82570808)
+{
+    static const uint32_t watched = getenv("AR_DUMP_DECOMPRESS") ? uint32_t(strtoul(getenv("AR_DUMP_DECOMPRESS"), nullptr, 16)) : 0;
+    uint32_t source = ctx.r4.u32, sourceSize = ctx.r5.u32, dest = ctx.r6.u32, destSize = ctx.r7.u32;
+    bool dump = watched != 0 && watched >= dest && watched - dest < destSize;
+    static int index;
+    int call = index;
+    if (dump)
+    {
+        index++;
+        std::ofstream file(fmt::format("decompress_{}_in.bin", call), std::ios::binary);
+        file.write(reinterpret_cast<const char*>(g_memory.Translate(source)), sourceSize);
+    }
+
+    __imp__sub_82570808(ctx, base);
+
+    if (dump)
+    {
+        std::ofstream file(fmt::format("decompress_{}_out.bin", call), std::ios::binary);
+        file.write(reinterpret_cast<const char*>(g_memory.Translate(dest)), destSize);
+        LOGF_INFO("decompress {}: 0x{:08X} ({} bytes) to 0x{:08X} ({} bytes) returned {}", call, source, sourceSize, dest, destSize, ctx.r3.u32);
+    }
+}
