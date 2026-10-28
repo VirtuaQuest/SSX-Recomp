@@ -1223,7 +1223,11 @@ float4 main(float4 position : SV_Position) : SV_Target
             // depth at the same EDRAM address).
             bool depthIntoColor = !key.depth && otherKey.depth && (key.format == 0 || key.format == 1);
             static const bool noColorIntoDepth = getenv("AR_NO_COLOR_TO_DEPTH") != nullptr;
-            bool colorIntoDepth = !noColorIntoDepth && key.depth && !otherKey.depth && (otherKey.format == 0 || otherKey.format == 1);
+            // Only float depth buffers: the game restores its effects pass depth (D24FS8) by drawing the saved words as
+            // colour, while its unorm depth buffers share EDRAM with colour for combined clears, where converting
+            // colour into depth corrupts what is later drawn over it.
+            bool colorIntoDepth = !noColorIntoDepth && key.depth && key.format == 1 && !otherKey.depth &&
+                (otherKey.format == 0 || otherKey.format == 1);
             if (otherKey == key || otherKey.pitch != key.pitch ||
                 (!depthIntoColor && !colorIntoDepth && (otherKey.depth != key.depth || otherKey.format != key.format)))
                 continue;
@@ -1267,6 +1271,10 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (written.top >= written.bottom || written.left >= written.right)
                     continue;
 
+                if (TraceThisFrame())
+                    LOGF_INFO("  {} base {:X} format {} <- {} base {:X} format {}: rows {} rect {},{}-{},{}", key.depth ? "depth" : "color",
+                        key.base, key.format, otherKey->depth ? "depth" : "color", otherKey->base, otherKey->format, rows,
+                        written.left, written.top, written.right, written.bottom);
                 if (key.depth)
                 {
                     Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
