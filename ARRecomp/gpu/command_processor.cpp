@@ -711,6 +711,40 @@ namespace gpu
 
     static void RunCommandProcessor()
     {
+        // It does the work of a whole GPU front end (and the host renderer's recording) on one thread: keep it from
+        // being preempted by guest threads, and off efficiency cores where the CPU has them.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        if (!AR_ENV("AR_NO_CPU_SETS"))
+        {
+            ULONG length = 0;
+            GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+            std::vector<uint8_t> buffer(length);
+            auto* info = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+            if (length && GetSystemCpuSetInformation(info, length, &length, GetCurrentProcess(), 0))
+            {
+                // The highest efficiency class is the performance cores.
+                BYTE best = 0;
+                for (ULONG offset = 0; offset < length;)
+                {
+                    auto* set = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+                    best = std::max(best, set->CpuSet.EfficiencyClass);
+                    offset += set->Size;
+                }
+                std::vector<ULONG> ids;
+                for (ULONG offset = 0; offset < length;)
+                {
+                    auto* set = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+                    if (set->CpuSet.EfficiencyClass == best)
+                        ids.push_back(set->CpuSet.Id);
+                    offset += set->Size;
+                }
+                if (best > 0 && !ids.empty())
+                {
+                    SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), ULONG(ids.size()));
+                    LOGF_INFO("GPU command processor runs on {} performance cores", ids.size());
+                }
+            }
+        }
         auto lastWork = std::chrono::steady_clock::now();
         while (true)
         {
