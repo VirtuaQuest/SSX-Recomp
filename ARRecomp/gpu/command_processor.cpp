@@ -4,6 +4,7 @@
 #include <kernel/function.h>
 #include <kernel/memory.h>
 #include "registers.h"
+#include "video_settings.h"
 #include "renderer.h"
 
 namespace gpu
@@ -148,10 +149,12 @@ namespace gpu
 
     static void RunVblankThread()
     {
+        // The game presents every second vblank (30 fps at 60 Hz); a higher frame rate setting raises the rate.
+        const int64_t interval = 1000000 / (int64_t(g_videoSettings.frameRate) * 2);
         auto next = std::chrono::steady_clock::now();
         while (true)
         {
-            next += std::chrono::microseconds(16667);
+            next += std::chrono::microseconds(interval);
             std::this_thread::sleep_until(next);
 
             g_swapCounter++;

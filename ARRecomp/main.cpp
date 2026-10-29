@@ -3,6 +3,7 @@
 #include <gpu/command_processor.h>
 #include <gpu/renderer.h>
 #include <gpu/d3d12_renderer.h>
+#include <gpu/video_settings.h>
 #include <gpu/shader_compiler.h>
 #include <kernel/heap.h>
 #include <kernel/memory.h>
@@ -25,7 +26,11 @@ static void PrintUsage()
         "Usage: ARRecomp --game <path> [--xex <path>] [--user <path>] [--trace]\n"
         "  --game  The Xbox 360 disc image (.iso) or a folder with its extracted files.\n"
         "  --xex   The executable to load (default: default.xex from the game).\n"
-        "  --user  Folder for save data and caches (default: ./user).\n");
+        "  --user  Folder for save data and caches (default: ./user).\n"
+        "  --resolution WxH       Window or display resolution (default 1280x720).\n"
+        "  --display MODE         windowed, borderless or fullscreen (default windowed).\n"
+        "  --fps N                Frame rate: 30 (default), 60 or 120.\n"
+        "  --antialiasing N       Anti-aliasing samples (not implemented yet).\n");
 }
 
 int main(int argc, char* argv[])
@@ -59,6 +64,25 @@ int main(int argc, char* argv[])
             gpu::d3d12::EnableScreenshots("screenshots");
         else if (arg == "--headless")
             gpu::DisableRendering();
+        else if (arg == "--resolution" && i + 1 < argc)
+        {
+            unsigned width = 0, height = 0;
+            if (sscanf(argv[++i], "%ux%u", &width, &height) == 2 && width >= 320 && height >= 240 && width <= 7680 && height <= 4320)
+            {
+                gpu::g_videoSettings.width = width;
+                gpu::g_videoSettings.height = height;
+            }
+        }
+        else if (arg == "--display" && i + 1 < argc)
+        {
+            std::string_view mode = argv[++i];
+            gpu::g_videoSettings.mode = mode == "fullscreen" ? gpu::DisplayMode::Fullscreen :
+                mode == "borderless" ? gpu::DisplayMode::Borderless : gpu::DisplayMode::Windowed;
+        }
+        else if (arg == "--fps" && i + 1 < argc)
+            gpu::g_videoSettings.frameRate = std::clamp(atoi(argv[++i]), 30, 120);
+        else if (arg == "--antialiasing" && i + 1 < argc)
+            gpu::g_videoSettings.antiAliasing = atoi(argv[++i]);
         else if (arg == "--dump-threads" && i + 1 < argc)
             dumpThreadsAfter = atoi(argv[++i]);
         else

@@ -3,6 +3,7 @@
 #include "shader_compiler.h"
 #include "texture_decode.h"
 #include "window.h"
+#include "video_settings.h"
 #include <kernel/memory.h>
 #include "xenia/gpu/shader.h"
 
@@ -200,6 +201,7 @@ namespace gpu::d3d12
         uint32_t backBufferRtvs[FRAME_COUNT];
         uint32_t swapWidth = 0, swapHeight = 0;
         bool tearing = false;
+        bool exclusiveFullscreen = false; // Presenting with tearing isn't allowed then.
 
         FrameResources frames[FRAME_COUNT];
         uint32_t frameIndex = 0;
@@ -788,7 +790,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             return g.initialized;
 
         g.failed = true;
-        HWND hwnd = window::Create(1280, 720, "Anarchy Reigns");
+        HWND hwnd = window::Create("Anarchy Reigns");
 
         if (getenv("AR_D3D12_DEBUG"))
         {
@@ -937,8 +939,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
         g.tearing = tearing;
 
-        window::GetClientSize(g.swapWidth, g.swapHeight);
+        window::GetBufferSize(g.swapWidth, g.swapHeight);
         DXGI_SWAP_CHAIN_DESC1 swapDesc{};
+        swapDesc.Scaling = DXGI_SCALING_STRETCH;
         swapDesc.Width = g.swapWidth;
         swapDesc.Height = g.swapHeight;
         swapDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -959,6 +962,25 @@ float4 main(float4 position : SV_Position) : SV_Target
         for (auto& rtv : g.backBufferRtvs)
             rtv = g.rtvs.Allocate();
         CreateSwapChainBuffers();
+
+        if (g_videoSettings.mode == DisplayMode::Fullscreen)
+        {
+            // Exclusive fullscreen at the chosen resolution (the nearest mode the monitor has).
+            if (SUCCEEDED(g.swapChain->SetFullscreenState(TRUE, nullptr)))
+            {
+                DXGI_MODE_DESC mode{};
+                mode.Width = g_videoSettings.width;
+                mode.Height = g_videoSettings.height;
+                mode.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                g.swapChain->ResizeTarget(&mode);
+                g.exclusiveFullscreen = true;
+                g.swapWidth = 0; // The buffers are resized to the new mode on the first present.
+            }
+            else
+            {
+                LOGF_WARNING("exclusive fullscreen is not available; using a borderless window");
+            }
+        }
 
         g.frameIndex = g.swapChain->GetCurrentBackBufferIndex();
         g.initialized = true;
@@ -1238,7 +1260,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 UploadTexture(entry.texture, decoded);
                 entry.contentHash = hash;
 
-                if (TraceThisFrame() || (getenv("AR_TRACE_FRAME") && firstUpload))
+                if (TraceThisFrame() || (getenv("AR_DUMP_TEXTURES") && firstUpload))
                 {
                     uint32_t minimum = 255, maximum = 0;
                     for (uint8_t value : decoded.data)
@@ -3186,10 +3208,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         g.list->ResourceBarrier(1, &barrier);
         Submit();
-        g.swapChain->Present(0, g.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        g.swapChain->Present(0, g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
 
         uint32_t width, height;
-        window::GetClientSize(width, height);
+        window::GetBufferSize(width, height);
         if (width != g.swapWidth || height != g.swapHeight)
         {
             WaitForFence(g.fenceValue);

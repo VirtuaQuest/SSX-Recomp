@@ -1,5 +1,11 @@
 #include <stdafx.h>
 #include "window.h"
+#include "video_settings.h"
+
+namespace gpu
+{
+    VideoSettings g_videoSettings;
+}
 
 namespace gpu::window
 {
@@ -28,7 +34,7 @@ namespace gpu::window
         }
     }
 
-    HWND Create(uint32_t width, uint32_t height, const char* title)
+    HWND Create(const char* title)
     {
         static std::once_flag once;
         std::call_once(once, [&]
@@ -37,7 +43,7 @@ namespace gpu::window
                 std::condition_variable created;
                 std::string name = title;
 
-                std::thread([&, width, height, name]
+                std::thread([&, name]
                     {
                         WNDCLASSEXW windowClass{ sizeof(windowClass) };
                         windowClass.lpfnWndProc = WindowProc;
@@ -46,16 +52,46 @@ namespace gpu::window
                         windowClass.lpszClassName = L"ARRecomp";
                         RegisterClassExW(&windowClass);
 
-                        RECT rect{ 0, 0, LONG(width), LONG(height) };
-                        AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+                        const auto& settings = g_videoSettings;
+                        DWORD style = WS_OVERLAPPEDWINDOW;
+                        int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+                        RECT rect{ 0, 0, LONG(settings.width), LONG(settings.height) };
+
+                        // The monitor the window opens on (the primary one).
+                        MONITORINFO monitor{ sizeof(monitor) };
+                        GetMonitorInfoW(MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &monitor);
+
+                        if (settings.mode == DisplayMode::Borderless)
+                        {
+                            style = WS_POPUP;
+                            rect = monitor.rcMonitor;
+                            x = rect.left;
+                            y = rect.top;
+                        }
+                        else if (settings.mode == DisplayMode::Fullscreen)
+                        {
+                            // DXGI switches the display mode once the swap chain exists.
+                            style = WS_POPUP;
+                            x = monitor.rcMonitor.left;
+                            y = monitor.rcMonitor.top;
+                        }
+                        else
+                        {
+                            AdjustWindowRect(&rect, style, FALSE);
+                            // Centered in the work area.
+                            const RECT& work = monitor.rcWork;
+                            x = std::max<LONG>(work.left, work.left + ((work.right - work.left) - (rect.right - rect.left)) / 2);
+                            y = std::max<LONG>(work.top, work.top + ((work.bottom - work.top) - (rect.bottom - rect.top)) / 2);
+                        }
 
                         std::wstring wideName(name.begin(), name.end());
-                        HWND hwnd = CreateWindowExW(0, windowClass.lpszClassName, wideName.c_str(), WS_OVERLAPPEDWINDOW,
-                            CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr,
-                            windowClass.hInstance, nullptr);
+                        HWND hwnd = CreateWindowExW(0, windowClass.lpszClassName, wideName.c_str(), style, x, y,
+                            rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, windowClass.hInstance, nullptr);
 
-                        g_width = width;
-                        g_height = height;
+                        RECT client;
+                        GetClientRect(hwnd, &client);
+                        g_width = std::max<LONG>(client.right - client.left, 1);
+                        g_height = std::max<LONG>(client.bottom - client.top, 1);
                         ShowWindow(hwnd, SW_SHOW);
                         {
                             std::lock_guard lock(mutex);
@@ -82,5 +118,17 @@ namespace gpu::window
     {
         width = g_width;
         height = g_height;
+    }
+
+    void GetBufferSize(uint32_t& width, uint32_t& height)
+    {
+        if (g_videoSettings.mode == DisplayMode::Borderless)
+        {
+            width = g_videoSettings.width;
+            height = g_videoSettings.height;
+            return;
+        }
+
+        GetClientSize(width, height);
     }
 }

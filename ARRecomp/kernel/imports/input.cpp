@@ -134,7 +134,10 @@ static uint16_t AutoPressButtons(float& stickAngle)
     if (period <= 0)
         return 0;
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    // AR_AUTO_FRAMES: steps go by presented frames (period * 30 per step) instead of time, so slow runs stay in step.
+    static const bool byFrames = getenv("AR_AUTO_FRAMES") != nullptr;
+    auto elapsed = byFrames ? int64_t(gpu::d3d12::GetFrameNumber() * 1000 / 30) :
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     if (elapsed < period * 1000)
         return 0;
     bool tapped = elapsed % (period * 1000) < 250;
