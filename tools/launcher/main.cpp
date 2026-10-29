@@ -32,6 +32,7 @@ namespace
     constexpr const wchar_t* DISPLAY_ARGS[] = { L"windowed", L"borderless", L"fullscreen" };
     constexpr int FRAME_RATES[] = { 30, 60, 120 };
     constexpr const wchar_t* FRAME_RATE_LABELS[] = { L"30 FPS (original)", L"60 FPS (experimental)", L"120 FPS (experimental)" };
+    constexpr const wchar_t* SCALE_LABELS[] = { L"1x (1280 x 720, original)", L"2x (2560 x 1440)", L"3x (3840 x 2160)" };
     constexpr const wchar_t* AA_LABELS[] = { L"Off", L"2x MSAA (not implemented yet)", L"4x MSAA (not implemented yet)" };
 
     enum Control
@@ -40,12 +41,13 @@ namespace
         ID_DISPLAY,
         ID_FPS,
         ID_AA,
+        ID_SCALE,
         ID_GAME_PATH,
         ID_BROWSE,
         ID_LAUNCH,
     };
 
-    HWND g_resolution, g_display, g_fps, g_aa, g_gamePath;
+    HWND g_resolution, g_display, g_fps, g_aa, g_scale, g_gamePath;
     HFONT g_font;
     std::wstring g_folder, g_iniPath;
 
@@ -113,6 +115,7 @@ namespace
         int display = int(SendMessageW(g_display, CB_GETCURSEL, 0, 0));
         int fps = int(SendMessageW(g_fps, CB_GETCURSEL, 0, 0));
         int aa = int(SendMessageW(g_aa, CB_GETCURSEL, 0, 0));
+        int scale = int(SendMessageW(g_scale, CB_GETCURSEL, 0, 0));
         std::wstring gamePath = GetText(g_gamePath);
 
         if (GetFileAttributesW(gamePath.c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -125,13 +128,14 @@ namespace
         WriteSetting(L"Display", std::to_wstring(display));
         WriteSetting(L"FrameRate", std::to_wstring(fps));
         WriteSetting(L"AntiAliasing", std::to_wstring(aa));
+        WriteSetting(L"RenderScale", std::to_wstring(scale));
         WriteSetting(L"Game", gamePath);
 
         const Resolution& r = RESOLUTIONS[resolution];
         std::wstring exe = g_folder + L"\\ARRecomp.exe";
         std::wstring command = L"\"" + exe + L"\" --game \"" + gamePath + L"\" --resolution " + std::to_wstring(r.width) + L"x" +
             std::to_wstring(r.height) + L" --display " + DISPLAY_ARGS[display] + L" --fps " + std::to_wstring(FRAME_RATES[fps]) +
-            L" --antialiasing " + std::to_wstring(aa == 0 ? 0 : 1 << aa);
+            L" --antialiasing " + std::to_wstring(aa == 0 ? 0 : 1 << aa) + L" --render-scale " + std::to_wstring(scale + 1);
 
         // The game keeps its saves and caches in "user" next to where it runs: the folder set in launcher.ini
         // (WorkingFolder), or the launcher's own.
@@ -172,6 +176,10 @@ namespace
             AddLabel(window, L"Frame rate", labelX, y, 120);
             g_fps = AddCombo(window, ID_FPS, controlX, y, width, FRAME_RATE_LABELS, std::size(FRAME_RATE_LABELS),
                 ReadIndex(L"FrameRate", int(std::size(FRAME_RATES))));
+            y += 40;
+            AddLabel(window, L"Internal resolution", labelX, y, 125);
+            g_scale = AddCombo(window, ID_SCALE, controlX, y, width, SCALE_LABELS, std::size(SCALE_LABELS),
+                ReadIndex(L"RenderScale", int(std::size(SCALE_LABELS))));
             y += 40;
             AddLabel(window, L"Anti-aliasing", labelX, y, 120);
             g_aa = AddCombo(window, ID_AA, controlX, y, width, AA_LABELS, std::size(AA_LABELS), 0);
@@ -232,7 +240,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.lpszClassName = L"ARLauncher";
     RegisterClassExW(&windowClass);
 
-    RECT rect{ 0, 0, 480, 330 };
+    RECT rect{ 0, 0, 480, 370 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,

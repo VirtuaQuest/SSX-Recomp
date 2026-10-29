@@ -27,6 +27,16 @@ namespace gpu::d3d12
     constexpr uint32_t RTV_HEAP_SIZE = 1024;
     constexpr uint32_t DSV_HEAP_SIZE = 256;
     constexpr uint32_t RENDER_TARGET_HEIGHT = 2048;
+
+    // Internal resolution scale (g_videoSettings.renderScale): render targets and resolved textures are this many
+    // times larger in each direction. EDRAM bookkeeping (rectangles, rows) stays in guest samples, scaled when the
+    // GPU is told about it.
+    static uint32_t g_scale = 1;
+
+    static D3D12_RECT Scaled(D3D12_RECT rect)
+    {
+        return { LONG(rect.left * g_scale), LONG(rect.top * g_scale), LONG(rect.right * g_scale), LONG(rect.bottom * g_scale) };
+    }
     constexpr uint32_t NULL_SRV_2D = 0, NULL_SRV_3D = 1, NULL_SRV_CUBE = 2;
 
     // Must match XeSystemConstants in hlsl_translator.cpp.
@@ -43,7 +53,8 @@ namespace gpu::d3d12
         float alphaRef;
         uint32_t alphaFunc;
         uint32_t gammaTargets;
-        float padding[2];
+        float resolutionScale;
+        float padding;
         float colorExpBias[4];
         uint32_t textures[32][4];
         int32_t vertexDataOffsets[96];
@@ -518,17 +529,19 @@ cbuffer BlitConstants : register(b0)
     uint swapRedBlue;
     float4 scale;
     int2 sampleScale; // Samples per pixel of the source, averaged.
+    uint resolutionScale; // sourceOffset and samples are in guest pixels, each resolutionScale texels square.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
 
 float4 main(float4 position : SV_Position) : SV_Target
 {
-    int2 coords = (int2(position.xy) + sourceOffset) * sampleScale;
+    int2 pixel = int2(position.xy) / int(resolutionScale), sub = int2(position.xy) % int(resolutionScale);
+    int2 coords = (pixel + sourceOffset) * sampleScale;
     float4 color = 0.0f;
     for (int y = 0; y < sampleScale.y; y++)
         for (int x = 0; x < sampleScale.x; x++)
-            color += textures[NonUniformResourceIndex(sourceIndex)].Load(int3(coords + int2(x, y), 0));
+            color += textures[NonUniformResourceIndex(sourceIndex)].Load(int3((coords + int2(x, y)) * int(resolutionScale) + sub, 0));
     color /= float(sampleScale.x * sampleScale.y);
     if (swapRedBlue)
         color = color.bgra;
@@ -547,6 +560,7 @@ cbuffer DepthBlitConstants : register(b0)
     uint floatDepth;
     int2 sampleScale;
     uint swapHalves; // Reading depth as colour EDRAM: 40-sample halves of each 80-sample tile are swapped.
+    uint resolutionScale; // As in BLIT_PS.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
@@ -564,9 +578,11 @@ uint ToFloat24(float value)
 
 float4 main(float4 position : SV_Position) : SV_Target
 {
-    int3 coords = int3((int2(position.xy) + sourceOffset) * sampleScale, 0);
+    int2 pixel = int2(position.xy) / int(resolutionScale), sub = int2(position.xy) % int(resolutionScale);
+    int2 guest = (pixel + sourceOffset) * sampleScale;
     if (swapHalves)
-        coords.x += (uint(coords.x) % 80u) < 40u ? 40 : -40;
+        guest.x += (uint(guest.x) % 80u) < 40u ? 40 : -40;
+    int3 coords = int3(guest * int(resolutionScale) + sub, 0);
     float depth = textures[NonUniformResourceIndex(depthIndex)].Load(coords).r;
     uint stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
     uint depth24 = floatDepth ? ToFloat24(depth) : uint(round(saturate(depth) * 16777215.0f));
@@ -609,6 +625,7 @@ cbuffer ColorToDepthConstants : register(b0)
     int2 sourceOffset;
     uint colorIndex;
     uint floatDepth;
+    uint resolutionScale; // sourceOffset is in host texels; the swap works on guest samples.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
@@ -622,7 +639,8 @@ float main(float4 position : SV_Position
     // Depth tiles have their 40-sample halves swapped relative to colour tiles; games writing depth through colour
     // render targets swap them in their shaders.
     int2 coords = int2(position.xy) + sourceOffset;
-    coords.x += (uint(coords.x) % 80u) < 40u ? 40 : -40;
+    int scale = int(resolutionScale);
+    coords.x += (uint(coords.x / scale) % 80u) < 40u ? 40 * scale : -40 * scale;
     uint4 bytes = uint4(round(saturate(textures[NonUniformResourceIndex(colorIndex)].Load(int3(coords, 0))) * 255.0f));
 #ifdef STENCIL_REF
     stencil = bytes.x;
@@ -647,7 +665,9 @@ cbuffer LayoutConstants : register(b0)
     uint stencilIndex;
     uint fromLayout;
     uint toLayout;
+    uint resolutionScale; // Samples are resolutionScale texels square.
 };
+
 
 Texture2D<float4> textures[] : register(t0, space0);
 Texture2D<uint4> uintTextures[] : register(t0, space4);
@@ -683,6 +703,12 @@ uint2 FromCanonical(uint layout, uint2 c)
     return c;
 }
 
+uint2 Reorder(uint2 h)
+{
+    uint2 sample = h / resolutionScale, sub = h % resolutionScale;
+    return FromCanonical(fromLayout, ToCanonical(toLayout, sample)) * resolutionScale + sub;
+}
+
 #ifdef DEPTH
 float main(float4 position : SV_Position
 #ifdef STENCIL_REF
@@ -690,7 +716,7 @@ float main(float4 position : SV_Position
 #endif
     ) : SV_Depth
 {
-    int3 coords = int3(FromCanonical(fromLayout, ToCanonical(toLayout, uint2(position.xy))), 0);
+    int3 coords = int3(Reorder(uint2(position.xy)), 0);
 #ifdef STENCIL_REF
     stencil = uintTextures[NonUniformResourceIndex(stencilIndex)].Load(coords).g;
 #endif
@@ -699,7 +725,7 @@ float main(float4 position : SV_Position
 #else
 float4 main(float4 position : SV_Position) : SV_Target
 {
-    int3 coords = int3(FromCanonical(fromLayout, ToCanonical(toLayout, uint2(position.xy))), 0);
+    int3 coords = int3(Reorder(uint2(position.xy)), 0);
     return textures[NonUniformResourceIndex(sourceIndex)].Load(coords);
 }
 #endif
@@ -791,6 +817,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         g.failed = true;
         HWND hwnd = window::Create("Anarchy Reigns");
+        g_scale = std::clamp<uint32_t>(g_videoSettings.renderScale, 1, 4);
 
         if (getenv("AR_D3D12_DEBUG"))
         {
@@ -1159,7 +1186,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         for (auto& [base, resolved] : g.resolvedTextures)
         {
-            uint64_t end = uint64_t(base) + uint64_t(resolved.rowBytes) * resolved.texture.height;
+            uint64_t end = uint64_t(base) + uint64_t(resolved.rowBytes) * (resolved.texture.height / g_scale);
             if (address > base && address < end && (rowBytes == 0 || resolved.rowBytes == rowBytes) &&
                 (address - base) % resolved.rowBytes == 0)
             {
@@ -1194,9 +1221,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (resolved)
         {
             auto& texture = resolved->texture;
-            transform[0] = float(fetch.Width()) / float(texture.width);
-            transform[1] = float(fetch.Height()) / float(texture.height);
-            transform[3] = float(row) / float(texture.height);
+            transform[0] = float(fetch.Width() * g_scale) / float(texture.width);
+            transform[1] = float(fetch.Height() * g_scale) / float(texture.height);
+            transform[3] = float(row * g_scale) / float(texture.height);
+            rawDepth |= 4; // Scaled: unnormalized coordinates and offsets are in guest texels.
             if (resolved->rawDepth && (fetch.Format() == 22 || fetch.Format() == 23))
                 rawDepth = fetch.Format() == 23 ? 2 : 1;
             Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1464,7 +1492,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             uint32_t stencilIndex;
             uint32_t fromLayout;
             uint32_t toLayout;
-        } constants{ scratch.srv, scratch.stencilSrv, texture.layout, layout };
+            uint32_t resolutionScale;
+        } constants{ scratch.srv, scratch.stencilSrv, texture.layout, layout, g_scale };
         g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
         g.list->DrawInstanced(3, 1, 0, 0);
         texture.layout = layout;
@@ -1567,7 +1596,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                     auto dsv = CpuDsv(texture.dsv);
                     g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
-                    SetViewportAndScissor(texture.width, texture.height, written);
+                    SetViewportAndScissor(texture.width, texture.height, Scaled(written));
                     g.list->SetPipelineState(GetDepthCopyPipeline(texture.format, true));
                     g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     struct
@@ -1575,7 +1604,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                         int32_t sourceOffset[2];
                         uint32_t colorIndex;
                         uint32_t floatDepth;
-                    } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, key.format == 1 ? 1u : 0u };
+                        uint32_t resolutionScale;
+                    } constants{ { 0, (int32_t(sourceTop) - int32_t(destTop)) * int32_t(g_scale) }, other->srv, key.format == 1 ? 1u : 0u,
+                        g_scale };
                     g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
                     g.list->DrawInstanced(3, 1, 0, 0);
                     continue;
@@ -1585,7 +1616,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 Transition(texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 auto rtv = CpuRtv(texture.rtv);
                 g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-                SetViewportAndScissor(texture.width, texture.height, written);
+                SetViewportAndScissor(texture.width, texture.height, Scaled(written));
                 g.list->SetPipelineState(GetBlitPipeline(texture.format, false, true));
                 g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 struct
@@ -1596,8 +1627,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                     uint32_t floatDepth;
                     int32_t sampleScale[2];
                     uint32_t swapHalves;
+                    uint32_t resolutionScale;
                 } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, other->stencilSrv,
-                    otherKey->format == 1 ? 1u : 0u, { 1, 1 }, 1u };
+                    otherKey->format == 1 ? 1u : 0u, { 1, 1 }, 1u, g_scale };
                 g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
                 g.list->DrawInstanced(3, 1, 0, 0);
             }
@@ -1608,7 +1640,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 auto dsv = CpuDsv(texture.dsv);
                 g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
                 SetViewportAndScissor(texture.width, texture.height,
-                    { 0, LONG(destTop), LONG(texture.width), LONG(destTop + height) });
+                    { 0, LONG(destTop * g_scale), LONG(texture.width), LONG((destTop + height) * g_scale) });
                 g.list->SetPipelineState(GetDepthCopyPipeline(texture.format));
                 g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 struct
@@ -1616,7 +1648,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     int32_t sourceOffset[2];
                     uint32_t depthIndex;
                     uint32_t stencilIndex;
-                } constants{ { 0, int32_t(sourceTop) - int32_t(destTop) }, other->srv, other->stencilSrv };
+                } constants{ { 0, (int32_t(sourceTop) - int32_t(destTop)) * int32_t(g_scale) }, other->srv, other->stencilSrv };
                 g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
                 g.list->DrawInstanced(3, 1, 0, 0);
             }
@@ -1626,8 +1658,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 Transition(texture, D3D12_RESOURCE_STATE_COPY_DEST);
                 D3D12_TEXTURE_COPY_LOCATION source{ other->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
                 D3D12_TEXTURE_COPY_LOCATION dest{ texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-                D3D12_BOX box{ 0, sourceTop, 0, texture.width, sourceTop + height, 1 };
-                g.list->CopyTextureRegion(&dest, 0, destTop, 0, &source, &box);
+                D3D12_BOX box{ 0, sourceTop * g_scale, 0, texture.width, (sourceTop + height) * g_scale, 1 };
+                g.list->CopyTextureRegion(&dest, 0, destTop * g_scale, 0, &source, &box);
             }
         }
 
@@ -1646,7 +1678,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         DXGI_FORMAT hostFormat = depth ? (format ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT)
             : GetColorTargetFormat(format);
-        Texture texture = CreateTexture(pitch, RENDER_TARGET_HEIGHT, 1, false, hostFormat,
+        Texture texture = CreateTexture(pitch * g_scale, RENDER_TARGET_HEIGHT * g_scale, 1, false, hostFormat,
             depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (!texture.resource)
@@ -2237,7 +2269,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     overrideField(uint32_t(attributes.min_filter), 3, 21, 3);
                     overrideField(uint32_t(attributes.mip_filter), 3, 23, 3);
                     overrideField(uint32_t(attributes.aniso_filter), 7, 25, 7);
-                    if (rawDepth)
+                    if (rawDepth & 3)
                         samplerFetch.words[3] &= ~(0xFu << 19);
                     slot[1] = GetSampler(samplerFetch);
                     slot[2] = fetch.Swizzle();
@@ -2453,6 +2485,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         uint32_t colorControl = registers[RB_COLORCONTROL];
         system.alphaFunc = ((colorControl >> 3) & 1) ? (colorControl & 7) : 7;
         system.alphaRef = RegisterFloat(registers, RB_ALPHA_REF);
+        system.resolutionScale = float(g_scale);
 
         // Only the constants up to the highest one the shader reads are copied (all of them when it indexes them).
         auto uploadFloatConstants = [&](uint32_t baseRegister, const HostShader* shader)
@@ -2685,7 +2718,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             dsv = CpuDsv(depthTarget->dsv);
         }
         g.list->OMSetRenderTargets(key.renderTargetCount, rtvs, FALSE, depthTarget ? &dsv : nullptr);
-        SetViewportAndScissor(pitch, RENDER_TARGET_HEIGHT, ScaleRect(GetScissor(registers), sampleScale));
+        SetViewportAndScissor(pitch * g_scale, RENDER_TARGET_HEIGHT * g_scale, Scaled(ScaleRect(GetScissor(registers), sampleScale)));
 
         g.list->SetPipelineState(pipeline);
         g.list->IASetPrimitiveTopology(topology);
@@ -2823,8 +2856,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 // strip's resolve at its rows), so they go to the resolved texture holding the address when it fits.
                 uint32_t row = 0;
                 ResolvedTexture* target = FindResolved(destBase, rowBytes, row);
-                if (target && (target->texture.format != destFormat || target->texture.width != destWidth ||
-                    row + uint32_t(y1) > target->texture.height || (row == 0 && target->texture.height != destHeight)))
+                if (target && (target->texture.format != destFormat || target->texture.width != destWidth * g_scale ||
+                    row + uint32_t(y1) > target->texture.height / g_scale || (row == 0 && target->texture.height != destHeight * g_scale)))
                 {
                     target = nullptr;
                 }
@@ -2832,7 +2865,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (!target)
                 {
                     ResolvedTexture created;
-                    created.texture = CreateTexture(destWidth, destHeight, 1, false, destFormat,
+                    created.texture = CreateTexture(destWidth * g_scale, destHeight * g_scale, 1, false, destFormat,
                         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
                     created.format = destInfo.Format();
                     created.rowBytes = rowBytes;
@@ -2850,14 +2883,14 @@ float4 main(float4 position : SV_Position) : SV_Target
                             bool inside = it->first >= destBase && it->first < end && inner.rowBytes == rowBytes &&
                                 (it->first - destBase) % rowBytes == 0;
                             uint32_t innerRow = inside ? (it->first - destBase) / rowBytes : 0;
-                            if (inside && inner.texture.format == destFormat && inner.texture.width == destWidth &&
-                                innerRow + inner.texture.height <= destHeight)
+                            if (inside && inner.texture.format == destFormat && inner.texture.width == destWidth * g_scale &&
+                                innerRow + inner.texture.height / g_scale <= destHeight)
                             {
                                 Transition(inner.texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
                                 Transition(created.texture, D3D12_RESOURCE_STATE_COPY_DEST);
                                 D3D12_TEXTURE_COPY_LOCATION source{ inner.texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
                                 D3D12_TEXTURE_COPY_LOCATION dest{ created.texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-                                g.list->CopyTextureRegion(&dest, 0, innerRow, 0, &source, nullptr);
+                                g.list->CopyTextureRegion(&dest, 0, innerRow * g_scale, 0, &source, nullptr);
                             }
 
                             if (inside || it->first == destBase)
@@ -2886,7 +2919,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                         uint32_t swapRedBlue;
                         float scale[4];
                         int32_t sampleScale[2];
+                        uint32_t resolutionScale;
                     } constants{ { 0, -int32_t(row) }, source->srv, destInfo.Swap() ? 1u : 0u };
+                    constants.resolutionScale = g_scale;
                     constants.sampleScale[0] = int32_t(sampleScale.x);
                     constants.sampleScale[1] = int32_t(sampleScale.y);
                     float scale = std::ldexp(1.0f, destInfo.ExpBias());
@@ -2901,15 +2936,17 @@ float4 main(float4 position : SV_Position) : SV_Target
                         uint32_t floatDepth;
                         int32_t sampleScale[2];
                         uint32_t swapHalves;
+                        uint32_t resolutionScale;
                     } depthConstants{ { 0, -int32_t(row) }, source->srv, source->stencilSrv,
-                        DepthInfo{ registers[RB_DEPTH_INFO] }.Format() == 1 ? 1u : 0u, { int32_t(sampleScale.x), int32_t(sampleScale.y) } };
+                        DepthInfo{ registers[RB_DEPTH_INFO] }.Format() == 1 ? 1u : 0u, { int32_t(sampleScale.x), int32_t(sampleScale.y) },
+                        0u, g_scale };
 
                     Transition(*source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     Transition(resolved.texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
                     auto rtv = CpuRtv(resolved.texture.rtv);
                     g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                     D3D12_RECT destRect{ rect.left, rect.top + LONG(row), rect.right, rect.bottom + LONG(row) };
-                    SetViewportAndScissor(resolved.texture.width, resolved.texture.height, destRect);
+                    SetViewportAndScissor(resolved.texture.width, resolved.texture.height, Scaled(destRect));
                     g.list->SetPipelineState(GetBlitPipeline(destFormat, false, depthSource));
                     g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS,
@@ -2924,7 +2961,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     if (TraceThisFrame() && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || destFormat == DXGI_FORMAT_R32_FLOAT))
                     {
                         static int resolveIndex;
-                        SaveScreenshot(resolved.texture, destWidth, destHeight, fmt::format("screenshots/resolve_{:02}_{:08X}.bmp", resolveIndex++, destBase));
+                        SaveScreenshot(resolved.texture, destWidth * g_scale, destHeight * g_scale, fmt::format("screenshots/resolve_{:02}_{:08X}.bmp", resolveIndex++, destBase));
                     }
                 }
             }
@@ -2938,7 +2975,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 float((clear >> 16) & 0xFF) / 255.0f, float(clear >> 24) / 255.0f };
             Transition(*source, D3D12_RESOURCE_STATE_RENDER_TARGET);
             D3D12_RECT sourceRect = ScaleRect(rect, sampleScale);
-            g.list->ClearRenderTargetView(CpuRtv(source->rtv), color, 1, &sourceRect);
+            D3D12_RECT hostRect = Scaled(sourceRect);
+            g.list->ClearRenderTargetView(CpuRtv(source->rtv), color, 1, &hostRect);
             ColorInfo info{ registers[sourceSelect == 0 ? RB_COLOR_INFO : RB_COLOR1_INFO + sourceSelect - 1] };
             RecordWrite({ info.Base(), pitch * sampleScale.x, info.Format(), false }, sourceRect);
         }
@@ -2950,9 +2988,10 @@ float4 main(float4 position : SV_Position) : SV_Target
             {
                 uint32_t clear = registers[RB_DEPTH_CLEAR];
                 D3D12_RECT depthRect = ScaleRect(rect, sampleScale);
+                D3D12_RECT hostRect = Scaled(depthRect);
                 Transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 g.list->ClearDepthStencilView(CpuDsv(depth->dsv), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                    float(clear >> 8) / 16777215.0f, UINT8(clear & 0xFF), 1, &depthRect);
+                    float(clear >> 8) / 16777215.0f, UINT8(clear & 0xFF), 1, &hostRect);
                 RecordWrite({ info.Base(), pitch * sampleScale.x, info.Format(), true }, depthRect);
             }
         }
@@ -3169,7 +3208,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (resolved != g.resolvedTextures.end() && !g_screenshotFolder.empty() && g.frameNumber % screenshotInterval == 0 &&
             resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
         {
-            SaveScreenshot(resolved->second.texture, swap.width ? swap.width : 1280, swap.height ? swap.height : 720,
+            SaveScreenshot(resolved->second.texture, (swap.width ? swap.width : 1280) * g_scale, (swap.height ? swap.height : 720) * g_scale,
                 g_screenshotFolder / fmt::format("frame_{:06}.bmp", g.frameNumber), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2);
         }
 
@@ -3190,7 +3229,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 uint32_t samplerIndex;
                 uint32_t swapRedBlue;
             } constants{ { viewX, viewY },
-                { viewWidth * float(resolved->second.texture.width) / sourceWidth, viewHeight * float(resolved->second.texture.height) / sourceHeight },
+                { viewWidth * float(resolved->second.texture.width) / (sourceWidth * g_scale),
+                    viewHeight * float(resolved->second.texture.height) / (sourceHeight * g_scale) },
                 resolved->second.texture.srv, GetLinearClampSampler(), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2 ? 1u : 0u };
 
             Transition(resolved->second.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

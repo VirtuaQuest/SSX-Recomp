@@ -23,7 +23,8 @@ cbuffer XeSystemConstants : register(b0)
     float xe_alpha_ref;
     uint xe_alpha_func;
     uint xe_gamma_targets;
-    float2 xe_padding;
+    float xe_resolution_scale; // Internal resolution scale: host pixels per guest pixel in each direction.
+    float xe_padding;
     float4 xe_color_exp_bias;
     uint4 xe_textures[32];          // Descriptor index, sampler index, swizzle, sign/gamma flags.
     int4 xe_vertex_data_offsets[24]; // Byte offset from a guest address to the draw's vertex data.
@@ -673,7 +674,9 @@ float4 xe_cube(float4 a, float4 b)
             case xenos::FetchOpDimension::k1D:
             case xenos::FetchOpDimension::k2D:
             {
+                // Sizes in guest texels (resolved textures are larger by the resolution scale).
                 Line("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)].GetDimensions(xe_size.x, xe_size.y);");
+                Line("xe_size.xy /= ((xe_texture.w >> 10u) & 1u) ? xe_resolution_scale : 1.0f;");
                 std::string coords = instr.dimension == xenos::FetchOpDimension::k1D ? "float2(xe_coords.x, 0.5f)" : "xe_coords.xy";
                 if (attributes.unnormalized_coordinates)
                     coords = fmt::format("({} / xe_size.xy)", coords);
@@ -723,6 +726,7 @@ float4 xe_cube(float4 a, float4 b)
             Line("xe_texture = xe_textures[{}];", fetchConstant);
             Line("xe_coords = {};", Operand(instr.operands[0]));
             Line("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)].GetDimensions(xe_size.x, xe_size.y);");
+            Line("xe_size.xy /= ((xe_texture.w >> 10u) & 1u) ? xe_resolution_scale : 1.0f;");
             std::string coords = instr.dimension == xenos::FetchOpDimension::k1D ? "float2(xe_coords.x, 0.5f)" : "xe_coords.xy";
             if (attributes.unnormalized_coordinates)
                 coords = fmt::format("({} / xe_size.xy + xe_texture_transforms[{}].zw)", coords, fetchConstant);
@@ -1031,7 +1035,7 @@ XeOutput main(XeInput input)
     if (xe_param_gen_register >= 0 && xe_param_gen_register < XE_REGISTER_COUNT)
     {
         // Pixel position (negative x for back faces; for points, negative y) and point sprite coordinates.
-        float2 pixel = input.position.xy - 0.5f;
+        float2 pixel = floor(input.position.xy / xe_resolution_scale);
         if (xe_flags & XE_FLAG_POINT)
             xe_r[xe_param_gen_register] = float4(abs(pixel.x), -abs(pixel.y), saturate(input.extra.zw));
         else

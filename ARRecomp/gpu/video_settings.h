@@ -17,6 +17,7 @@ namespace gpu
         DisplayMode mode = DisplayMode::Windowed;
         uint32_t frameRate = 30;     // Target frame rate; the game runs at 30 on the console.
         uint32_t antiAliasing = 0;   // Not implemented yet.
+        uint32_t renderScale = 1;    // Internal resolution: 1 is the game's own (720p), 2 is 1440p, 3 is 2160p.
     };
 
     extern VideoSettings g_videoSettings;

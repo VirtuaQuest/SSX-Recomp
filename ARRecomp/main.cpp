@@ -30,7 +30,8 @@ static void PrintUsage()
         "  --resolution WxH       Window or display resolution (default 1280x720).\n"
         "  --display MODE         windowed, borderless or fullscreen (default windowed).\n"
         "  --fps N                Frame rate: 30 (default), 60 or 120.\n"
-        "  --antialiasing N       Anti-aliasing samples (not implemented yet).\n");
+        "  --antialiasing N       Anti-aliasing samples (not implemented yet).\n"
+        "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n");
 }
 
 int main(int argc, char* argv[])
@@ -81,6 +82,8 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--fps" && i + 1 < argc)
             gpu::g_videoSettings.frameRate = std::clamp(atoi(argv[++i]), 30, 120);
+        else if (arg == "--render-scale" && i + 1 < argc)
+            gpu::g_videoSettings.renderScale = std::clamp(atoi(argv[++i]), 1, 4);
         else if (arg == "--antialiasing" && i + 1 < argc)
             gpu::g_videoSettings.antiAliasing = atoi(argv[++i]);
         else if (arg == "--dump-threads" && i + 1 < argc)
