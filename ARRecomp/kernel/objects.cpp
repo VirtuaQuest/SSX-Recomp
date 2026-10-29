@@ -84,10 +84,30 @@ std::optional<std::chrono::steady_clock::time_point> MillisecondsToDeadline(uint
 
 // ---- Dispatcher ----
 
-// All dispatcher state changes and waits are serialized by one lock, and waiters are woken through one condition
-// variable. This is simple and correct; it can be refined if contention shows up.
+// All dispatcher state changes and waits are serialized by one lock. Each waiting thread has its own condition
+// variable and is registered under the objects it waits on, so signaling an object wakes only the threads waiting on
+// it (waking every waiter on every signal kept dozens of guest threads busy re-checking their waits).
 static std::mutex g_dispatcherMutex;
-static std::condition_variable g_dispatcherCondition;
+
+struct Waiter
+{
+    std::condition_variable condition;
+};
+
+static std::unordered_map<XDISPATCHER_HEADER*, std::vector<Waiter*>> g_waiters;
+
+// Waiters also re-check this often, in case guest code changes a signal state without going through the kernel.
+constexpr auto WAIT_RECHECK = std::chrono::milliseconds(10);
+
+static void WakeWaiters(XDISPATCHER_HEADER* header)
+{
+    auto it = g_waiters.find(header);
+    if (it == g_waiters.end())
+        return;
+
+    for (Waiter* waiter : it->second)
+        waiter->condition.notify_one();
+}
 
 struct TimerState
 {
@@ -181,6 +201,26 @@ uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, 
 
     std::unique_lock lock(g_dispatcherMutex);
 
+    static thread_local Waiter waiter;
+    bool registered = false;
+    auto unregister = [&]
+        {
+            if (!registered)
+                return;
+            for (auto* header : objects)
+            {
+                auto& list = g_waiters[header];
+                auto found = std::find(list.begin(), list.end(), &waiter);
+                if (found != list.end())
+                {
+                    *found = list.back();
+                    list.pop_back();
+                }
+            }
+        };
+    struct Unregister { decltype(unregister)& function; ~Unregister() { function(); } } unregisterOnExit{ unregister };
+
+    bool rechecked = false;
     while (true)
     {
         auto now = std::chrono::steady_clock::now();
@@ -190,6 +230,11 @@ uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, 
             bool all = std::all_of(objects.begin(), objects.end(), [&](auto* header) { return IsSignaled(header, thread, now); });
             if (all)
             {
+                if (rechecked)
+                {
+                    static std::once_flag once;
+                    std::call_once(once, [&] { LOGF_WARNING("wait on 0x{:08X} satisfied without a signal from the kernel", g_memory.MapVirtual(objects[0])); });
+                }
                 for (auto* header : objects)
                     Acquire(header, thread);
 
@@ -202,6 +247,12 @@ uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, 
             {
                 if (IsSignaled(objects[i], thread, now))
                 {
+                    if (rechecked && objects[i]->Type != DISPATCHER_NOTIFICATION_TIMER && objects[i]->Type != DISPATCHER_SYNCHRONIZATION_TIMER)
+                    {
+                        static std::once_flag once;
+                        std::call_once(once, [&] { LOGF_WARNING("wait on 0x{:08X} (type {}) satisfied without a signal from the kernel",
+                            g_memory.MapVirtual(objects[i]), uint32_t(objects[i]->Type)); });
+                    }
                     Acquire(objects[i], thread);
                     return X_STATUS_WAIT_0 + uint32_t(i);
                 }
@@ -220,10 +271,16 @@ uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, 
                 wake = it->second.due;
         }
 
-        if (wake.has_value())
-            g_dispatcherCondition.wait_until(lock, *wake);
-        else
-            g_dispatcherCondition.wait(lock);
+        if (!registered)
+        {
+            for (auto* header : objects)
+                g_waiters[header].push_back(&waiter);
+            registered = true;
+        }
+
+        auto recheck = now + WAIT_RECHECK;
+        rechecked = waiter.condition.wait_until(lock, wake.has_value() ? std::min(*wake, recheck) : recheck) == std::cv_status::timeout &&
+            (!wake.has_value() || recheck < *wake);
     }
 }
 
@@ -233,7 +290,7 @@ int32_t SetDispatcherEvent(XDISPATCHER_HEADER* event)
 
     int32_t previous = SignalState(event);
     SetSignalState(event, 1);
-    g_dispatcherCondition.notify_all();
+    WakeWaiters(event);
     return previous;
 }
 
@@ -253,7 +310,7 @@ int32_t PulseDispatcherEvent(XDISPATCHER_HEADER* event)
         std::lock_guard lock(g_dispatcherMutex);
         previous = SignalState(event);
         SetSignalState(event, 1);
-        g_dispatcherCondition.notify_all();
+        WakeWaiters(event);
     }
 
     // Give waiters a chance to observe the signal before it is reset.
@@ -276,7 +333,7 @@ bool ReleaseDispatcherSemaphore(XDISPATCHER_HEADER* semaphore, int32_t count, in
         return false;
 
     SetSignalState(semaphore, previous + count);
-    g_dispatcherCondition.notify_all();
+    WakeWaiters(semaphore);
     return true;
 }
 
@@ -285,7 +342,7 @@ void SignalDispatcherObject(XDISPATCHER_HEADER* object, int32_t signalState)
     std::lock_guard lock(g_dispatcherMutex);
 
     SetSignalState(object, signalState);
-    g_dispatcherCondition.notify_all();
+    WakeWaiters(object);
 }
 
 void SetDispatcherTimer(XDISPATCHER_HEADER* timer, const be<int64_t>* dueTime, uint32_t periodMs)
@@ -296,7 +353,7 @@ void SetDispatcherTimer(XDISPATCHER_HEADER* timer, const be<int64_t>* dueTime, u
 
     SetSignalState(timer, 0);
     g_timers[timer] = TimerState{ due, std::chrono::milliseconds(periodMs), true };
-    g_dispatcherCondition.notify_all();
+    WakeWaiters(timer); // To wait for the new due time.
 }
 
 bool CancelDispatcherTimer(XDISPATCHER_HEADER* timer)
@@ -315,5 +372,9 @@ bool CancelDispatcherTimer(XDISPATCHER_HEADER* timer)
 void NotifyDispatcher()
 {
     std::lock_guard lock(g_dispatcherMutex);
-    g_dispatcherCondition.notify_all();
+    for (auto& [header, waiters] : g_waiters)
+    {
+        for (Waiter* waiter : waiters)
+            waiter->condition.notify_one();
+    }
 }

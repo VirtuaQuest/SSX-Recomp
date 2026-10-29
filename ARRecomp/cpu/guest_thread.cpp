@@ -3,6 +3,7 @@
 #include "ppc_context.h"
 #include <kernel/heap.h>
 #include <kernel/memory.h>
+#include <dbghelp.h>
 
 void PrintThreadStack(HANDLE thread, int maxFrames);
 
@@ -282,4 +283,145 @@ std::shared_ptr<ThreadObject> FindThreadByKThread(uint32_t kthread)
     }
 
     return nullptr;
+}
+
+// Diagnostics (AR_THREAD_PROFILE): samples where each guest thread runs and reports the busy ones every two seconds.
+// Each sample suspends the thread and unwinds to the first frame in the executable, so time in imports and system
+// code is attributed to the recompiled function that called them.
+void StartThreadProfiler()
+{
+    if (!AR_ENV("AR_THREAD_PROFILE"))
+        return;
+
+    std::thread([]
+        {
+            SetThreadDescription(GetCurrentThread(), L"Thread profiler");
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            HMODULE exe = GetModuleHandleW(nullptr);
+            auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+            auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(exe) + dos->e_lfanew);
+            uint64_t exeStart = uint64_t(exe), exeEnd = exeStart + nt->OptionalHeader.SizeOfImage;
+
+            struct Samples
+            {
+                std::unordered_map<uint64_t, uint32_t> callers; // First return address in the executable.
+                std::unordered_map<const char*, uint32_t> imports;
+                uint32_t total = 0;
+                uint64_t lastCpu = 0;
+            };
+            std::unordered_map<uint32_t, Samples> samples;
+            auto lastReport = std::chrono::steady_clock::now();
+
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+
+            while (true)
+            {
+                Sleep(1);
+                std::vector<std::shared_ptr<ThreadObject>> threads;
+                {
+                    std::lock_guard lock(g_threadsMutex);
+                    for (const auto& [id, weak] : g_threads)
+                    {
+                        if (auto thread = weak.lock(); thread && !thread->finished)
+                            threads.push_back(thread);
+                    }
+                }
+
+                for (const auto& thread : threads)
+                {
+                    if (SuspendThread(thread->hostThread) == DWORD(-1))
+                        continue;
+                    CONTEXT context{};
+                    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                    uint64_t caller = 0;
+                    if (GetThreadContext(thread->hostThread, &context))
+                    {
+                        // Unwinding only reads the suspended thread's stack and the unwind tables (no allocation).
+                        for (int frame = 0; frame < 32 && context.Rip != 0; frame++)
+                        {
+                            if (context.Rip >= exeStart && context.Rip < exeEnd)
+                            {
+                                caller = context.Rip;
+                                break;
+                            }
+                            DWORD64 imageBase;
+                            auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+                            if (function == nullptr)
+                            {
+                                context.Rip = *reinterpret_cast<const uint64_t*>(context.Rsp);
+                                context.Rsp += 8;
+                                continue;
+                            }
+                            void* handlerData;
+                            DWORD64 establisher;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+                        }
+                    }
+                    ResumeThread(thread->hostThread);
+
+                    auto& entry = samples[thread->threadId];
+                    entry.callers[caller]++;
+                    entry.imports[thread->lastImport.load()]++;
+                    entry.total++;
+                }
+
+                auto now = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(now - lastReport).count();
+                if (elapsed < 2.0)
+                    continue;
+                lastReport = now;
+
+                for (const auto& thread : threads)
+                {
+                    auto& entry = samples[thread->threadId];
+                    FILETIME creation, exit, kernel, user;
+                    uint64_t cpu = 0;
+                    if (GetThreadTimes(thread->hostThread, &creation, &exit, &kernel, &user))
+                        cpu = (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime) + (uint64_t(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime);
+                    double percent = entry.lastCpu != 0 ? double(cpu - entry.lastCpu) / 1e7 / elapsed * 100.0 : 0.0;
+                    entry.lastCpu = cpu;
+
+                    if (percent >= 10.0 && entry.total != 0)
+                    {
+                        std::vector<std::pair<uint32_t, std::string>> top;
+                        std::unordered_map<std::string, uint32_t> byFunction;
+                        for (const auto& [address, count] : entry.callers)
+                        {
+                            std::string name = "?";
+                            alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256]{};
+                            auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                            symbol->MaxNameLen = 255;
+                            DWORD64 displacement;
+                            if (address != 0 && SymFromAddr(GetCurrentProcess(), address, &displacement, symbol))
+                                name = symbol->Name;
+                            byFunction[name] += count;
+                        }
+                        for (const auto& [name, count] : byFunction)
+                            top.emplace_back(count, name);
+                        std::sort(top.begin(), top.end(), std::greater<>());
+                        std::string summary;
+                        for (size_t i = 0; i < std::min<size_t>(top.size(), 4); i++)
+                            summary += fmt::format(" {} {}%", top[i].second, top[i].first * 100 / entry.total);
+
+                        const char* import = nullptr;
+                        uint32_t importCount = 0;
+                        for (const auto& [name, count] : entry.imports)
+                        {
+                            if (count > importCount)
+                            {
+                                import = name;
+                                importCount = count;
+                            }
+                        }
+                        LOGF_INFO("thread profile: {:3} start 0x{:08X} {:.0f}% CPU, last import {} ({}%), in{}", thread->threadId,
+                            thread->params.startAddress, percent, import ? import : "-", importCount * 100 / entry.total, summary);
+                    }
+                    entry.callers.clear();
+                    entry.imports.clear();
+                    entry.total = 0;
+                }
+            }
+        }).detach();
 }

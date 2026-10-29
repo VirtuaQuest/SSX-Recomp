@@ -4,6 +4,7 @@
 #include "texture_decode.h"
 #include "window.h"
 #include "video_settings.h"
+#include "deferred_list.h"
 #include <kernel/memory.h>
 #include "xenia/gpu/shader.h"
 
@@ -131,6 +132,9 @@ namespace gpu::d3d12
         uint64_t fenceValue = 0;
         std::vector<ComPtr<ID3D12Resource>> releasedResources;
         std::vector<uint32_t> releasedSrvs;
+        // Render target and depth views are read when commands are replayed, so they are reused after the frame too.
+        std::vector<uint32_t> releasedRtvs;
+        std::vector<uint32_t> releasedDsvs;
     };
 
     struct RenderTargetKey
@@ -263,7 +267,8 @@ namespace gpu::d3d12
         uint32_t pipelinesLoaded = 0;
         bool pipelineLibraryDirty = false;
         ComPtr<ID3D12CommandQueue> queue;
-        ComPtr<ID3D12GraphicsCommandList> list;
+        // Recorded here, replayed and submitted on the submission thread.
+        DeferredList list;
         ComPtr<ID3D12Fence> fence;
         HANDLE fenceEvent = nullptr;
         uint64_t fenceValue = 0;
@@ -427,8 +432,10 @@ namespace gpu::d3d12
             frame.releasedSrvs.push_back(texture.srv);
         if (texture.stencilSrv != UINT32_MAX)
             frame.releasedSrvs.push_back(texture.stencilSrv);
-        g.rtvs.Free(texture.rtv);
-        g.dsvs.Free(texture.dsv);
+        if (texture.rtv != UINT32_MAX)
+            frame.releasedRtvs.push_back(texture.rtv);
+        if (texture.dsv != UINT32_MAX)
+            frame.releasedDsvs.push_back(texture.dsv);
         texture = {};
     }
 
@@ -469,8 +476,14 @@ namespace gpu::d3d12
         for (uint32_t srv : frame.releasedSrvs)
             g.views.Free(srv);
         frame.releasedSrvs.clear();
+        for (uint32_t rtv : frame.releasedRtvs)
+            g.rtvs.Free(rtv);
+        frame.releasedRtvs.clear();
+        for (uint32_t dsv : frame.releasedDsvs)
+            g.dsvs.Free(dsv);
+        frame.releasedDsvs.clear();
 
-        frame.allocator->Reset();
+        g.list->ResetAllocator(frame.allocator.Get());
         g.list->Reset(frame.allocator.Get(), nullptr);
         g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
         g.vertexUploads.clear();
@@ -480,9 +493,7 @@ namespace gpu::d3d12
     static void Submit()
     {
         g.list->Close();
-        ID3D12CommandList* lists[] = { g.list.Get() };
-        g.queue->ExecuteCommandLists(1, lists);
-        g.queue->Signal(g.fence.Get(), ++g.fenceValue);
+        g.list->Execute(++g.fenceValue);
         g.frames[g.frameIndex].fenceValue = g.fenceValue;
     }
 
@@ -492,7 +503,7 @@ namespace gpu::d3d12
         Submit();
         WaitForFence(g.fenceValue);
         auto& frame = g.frames[g.frameIndex];
-        frame.allocator->Reset();
+        g.list->ResetAllocator(frame.allocator.Get());
         g.list->Reset(frame.allocator.Get(), nullptr);
         g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
         g.vertexUploads.clear();
@@ -974,8 +985,8 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         for (auto& frame : g.frames)
             g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator));
-        g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g.list));
-        g.list->Close();
+        g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g.list.real));
+        g.list.real->Close();
         g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence));
         g.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
@@ -1101,6 +1112,13 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
 
         g.frameIndex = g.swapChain->GetCurrentBackBufferIndex();
+        g.list.queue = g.queue.Get();
+        g.list.fence = g.fence.Get();
+        g.list.swapChain = g.swapChain.Get();
+        // AR_SINGLE_THREAD records straight into the command list on the GPU thread.
+        g.list.Start(!AR_ENV("AR_SINGLE_THREAD"));
+        if (!AR_ENV("AR_SINGLE_THREAD"))
+            LOGF_INFO("command submission runs on its own thread");
         g.initialized = true;
         g.failed = false;
         BeginFrame();
@@ -3400,8 +3418,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             static uint32_t lastCreated, lastDraws;
             static double lastDrawTime, lastWait, lastPrepare, lastTextures;
             if (frameTime > 100.0 && g.frameNumber > 120)
-                LOGF_INFO("hitch: frame {} took {:.0f} ms ({} pipelines created, {} draws in {:.1f} ms, textures {:.1f} ms, prepare {:.1f} ms, "
-                    "GPU wait {:.1f} ms)", g.frameNumber, frameTime, g.pipelinesCreated - lastCreated, g_profile.draws - lastDraws,
+                LOGF_INFO("hitch: tick {} frame {} took {:.0f} ms ({} pipelines created, {} draws in {:.1f} ms, textures {:.1f} ms, prepare {:.1f} ms, "
+                    "GPU wait {:.1f} ms)", uint32_t(GetTickCount() & 0x7FFFFFFF), g.frameNumber, frameTime, g.pipelinesCreated - lastCreated, g_profile.draws - lastDraws,
                     g_profile.draw - lastDrawTime, g_profile.textures - lastTextures, g_profile.prepare - lastPrepare,
                     g_profile.presentWait - lastWait);
             lastCreated = g.pipelinesCreated;
@@ -3503,12 +3521,15 @@ float4 main(float4 position : SV_Position) : SV_Target
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         g.list->ResourceBarrier(1, &barrier);
         Submit();
-        g.swapChain->Present(0, g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        g.list->Present(0, g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        // Flip model swap chains go through their buffers in order.
+        g.frameIndex = (g.frameIndex + 1) % FRAME_COUNT;
 
         uint32_t width, height;
         window::GetBufferSize(width, height);
         if (width != g.swapWidth || height != g.swapHeight)
         {
+            g.list.WaitIdle();
             WaitForFence(g.fenceValue);
             for (auto& buffer : g.backBuffers)
                 buffer.Reset();
@@ -3517,9 +3538,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.swapWidth = width;
             g.swapHeight = height;
             CreateSwapChainBuffers();
+            g.frameIndex = g.swapChain->GetCurrentBackBufferIndex();
         }
 
-        g.frameIndex = g.swapChain->GetCurrentBackBufferIndex();
         g.frameNumber++;
         BeginFrame();
     }

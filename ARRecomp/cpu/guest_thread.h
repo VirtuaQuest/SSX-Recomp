@@ -87,3 +87,6 @@ void RecordWait(uint32_t object);
 
 // Prints every guest thread's last import and the object it is waiting on.
 void DumpGuestThreads();
+
+// Diagnostics: with AR_THREAD_PROFILE set, logs where busy guest threads spend their time.
+void StartThreadProfiler();
