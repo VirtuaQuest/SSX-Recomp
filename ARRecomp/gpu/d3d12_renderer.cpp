@@ -2272,6 +2272,11 @@ float4 main(float4 position : SV_Position) : SV_Target
                     if (rawDepth & 3)
                         samplerFetch.words[3] &= ~(0xFu << 19);
                     slot[1] = GetSampler(samplerFetch);
+                    // Point sampled (magnification and minification): coordinates snap to texel centers in the shader.
+                    bool pointSampled = ((samplerFetch.words[3] >> 19) & 3) == 0 && ((samplerFetch.words[3] >> 21) & 3) == 0 &&
+                        ((samplerFetch.words[3] >> 25) & 7) < 2;
+                    if (pointSampled && !getenv("AR_NO_POINT_SNAP"))
+                        rawDepth |= 8;
                     slot[2] = fetch.Swizzle();
                     slot[3] = signs | (rawDepth << 8);
                 }

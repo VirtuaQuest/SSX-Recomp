@@ -676,6 +676,7 @@ float4 xe_cube(float4 a, float4 b)
             {
                 // Sizes in guest texels (resolved textures are larger by the resolution scale).
                 Line("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)].GetDimensions(xe_size.x, xe_size.y);");
+                Line("xe_host_size = xe_size.xy;");
                 Line("xe_size.xy /= ((xe_texture.w >> 10u) & 1u) ? xe_resolution_scale : 1.0f;");
                 std::string coords = instr.dimension == xenos::FetchOpDimension::k1D ? "float2(xe_coords.x, 0.5f)" : "xe_coords.xy";
                 if (attributes.unnormalized_coordinates)
@@ -687,6 +688,10 @@ float4 xe_cube(float4 a, float4 b)
                     coords = fmt::format("({} + xe_texture_transforms[{}].zw)", coords, fetchConstant);
                 else
                     coords = fmt::format("({} * xe_texture_transforms[{}].xy + xe_texture_transforms[{}].zw)", coords, fetchConstant, fetchConstant);
+                // Point sampling picks the texel the coordinates are in. The host converts normalized coordinates back to
+                // texels with limited precision, so coordinates on a texel edge (games sample at whole pixel positions)
+                // can land in the previous texel; they're moved to the texel's center.
+                coords = fmt::format("(((xe_texture.w >> 11u) & 1u) ? (floor({0} * xe_host_size) + 0.5f) / xe_host_size : {0})", coords);
                 value = sample("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)]", coords);
                 break;
             }
@@ -1079,6 +1084,7 @@ XeOutput main(uint vertexId : SV_VertexID)
     float4 xe_temp2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 xe_coords = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float3 xe_size = float3(1.0f, 1.0f, 1.0f);
+    float2 xe_host_size = float2(1.0f, 1.0f);
     uint4 xe_texture = uint4(0u, 0u, 0u, 0u);
     float xe_ps = 0.0f;
     float xe_ps_next = 0.0f;
