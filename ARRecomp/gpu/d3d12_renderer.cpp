@@ -181,6 +181,14 @@ namespace gpu::d3d12
 
         ComPtr<IDXGIFactory4> factory;
         ComPtr<ID3D12Device> device;
+
+        // Pipeline cache (SetPipelineCacheFile). The serialized blob must outlive the library.
+        std::filesystem::path pipelineCachePath;
+        std::vector<uint8_t> pipelineCacheBlob;
+        ComPtr<ID3D12PipelineLibrary> pipelineLibrary;
+        uint32_t pipelinesCreated = 0;
+        uint32_t pipelinesLoaded = 0;
+        bool pipelineLibraryDirty = false;
         ComPtr<ID3D12CommandQueue> queue;
         ComPtr<ID3D12GraphicsCommandList> list;
         ComPtr<ID3D12Fence> fence;
@@ -813,6 +821,29 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+
+        // Pipeline library from the last run, or an empty one (also when the driver changed).
+        if (ComPtr<ID3D12Device1> device1; !g.pipelineCachePath.empty() && SUCCEEDED(g.device.As(&device1)))
+        {
+            std::ifstream file(g.pipelineCachePath, std::ios::binary | std::ios::ate);
+            if (file)
+            {
+                g.pipelineCacheBlob.resize(size_t(file.tellg()));
+                file.seekg(0);
+                file.read(reinterpret_cast<char*>(g.pipelineCacheBlob.data()), g.pipelineCacheBlob.size());
+            }
+            if (g.pipelineCacheBlob.empty() || FAILED(device1->CreatePipelineLibrary(g.pipelineCacheBlob.data(),
+                g.pipelineCacheBlob.size(), IID_PPV_ARGS(&g.pipelineLibrary))))
+            {
+                g.pipelineCacheBlob.clear();
+                if (FAILED(device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&g.pipelineLibrary))))
+                    LOGF_WARNING("pipeline libraries are not supported; pipelines are created every run");
+            }
+            else
+            {
+                LOGF_INFO("pipeline cache loaded ({} KB)", g.pipelineCacheBlob.size() / 1024);
+            }
+        }
         if (options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_2)
             LOGF_WARNING("the GPU only supports resource binding tier 1; rendering may fail");
         g.stencilRefSupported = options.PSSpecifiedStencilRefSupported;
@@ -1785,12 +1816,23 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.DSVFormat = key.depthFormat;
         desc.SampleDesc.Count = 1;
 
+        wchar_t name[17];
+        swprintf(name, 17, L"%016llX", (unsigned long long)hash);
+        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->LoadGraphicsPipeline(name, &desc, IID_PPV_ARGS(&pipeline))))
+        {
+            g.pipelinesLoaded++;
+            return pipeline.Get();
+        }
+
         if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline))))
         {
             LOGF_ERROR("failed to create a pipeline for shaders {:016X} / {:016X}", vertexShader.hash, pixelShader ? pixelShader->hash : 0);
             return nullptr;
         }
 
+        g.pipelinesCreated++;
+        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->StorePipeline(name, pipeline.Get())))
+            g.pipelineLibraryDirty = true;
         return pipeline.Get();
     }
 
@@ -2898,6 +2940,32 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static std::filesystem::path g_screenshotFolder;
 
+    void SetPipelineCacheFile(const std::filesystem::path& path)
+    {
+        g.pipelineCachePath = path;
+    }
+
+    // Writes the pipeline library when pipelines were added (every few seconds of play).
+    static void SavePipelineCache()
+    {
+        if (!g.pipelineLibrary || !g.pipelineLibraryDirty)
+            return;
+
+        g.pipelineLibraryDirty = false;
+        std::vector<uint8_t> data(g.pipelineLibrary->GetSerializedSize());
+        if (FAILED(g.pipelineLibrary->Serialize(data.data(), data.size())))
+            return;
+
+        auto temp = g.pipelineCachePath;
+        temp += ".tmp";
+        {
+            std::ofstream file(temp, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(data.data()), data.size());
+        }
+        std::error_code ec;
+        std::filesystem::rename(temp, g.pipelineCachePath, ec);
+    }
+
     uint64_t GetFrameNumber()
     {
         return g.frameNumber;
@@ -3008,16 +3076,39 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (!Initialize())
             return;
 
+        static auto lastPresent = std::chrono::steady_clock::now();
+        {
+            // Hitches: frames taking over 100 ms once the game is running.
+            auto now = std::chrono::steady_clock::now();
+            double frameTime = std::chrono::duration<double, std::milli>(now - lastPresent).count();
+            lastPresent = now;
+            static uint32_t lastCreated, lastDraws;
+            static double lastDrawTime, lastWait, lastPrepare, lastTextures;
+            if (frameTime > 100.0 && g.frameNumber > 120)
+                LOGF_INFO("hitch: frame {} took {:.0f} ms ({} pipelines created, {} draws in {:.1f} ms, textures {:.1f} ms, prepare {:.1f} ms, "
+                    "GPU wait {:.1f} ms)", g.frameNumber, frameTime, g.pipelinesCreated - lastCreated, g_profile.draws - lastDraws,
+                    g_profile.draw - lastDrawTime, g_profile.textures - lastTextures, g_profile.prepare - lastPrepare,
+                    g_profile.presentWait - lastWait);
+            lastCreated = g.pipelinesCreated;
+            lastDraws = g_profile.draws;
+            lastDrawTime = g_profile.draw;
+            lastWait = g_profile.presentWait;
+            lastPrepare = g_profile.prepare;
+            lastTextures = g_profile.textures;
+        }
         static auto lastReport = std::chrono::steady_clock::now();
+        if (g.frameNumber % 300 == 150)
+            SavePipelineCache();
         if (g.frameNumber % 300 == 0 && g.frameNumber != 0 && getenv("AR_PROFILE"))
         {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double, std::milli>(now - lastReport).count();
             lastReport = now;
             LOGF_INFO("profile: {:.1f} fps; per frame {:.2f} ms draws ({:.0f} draws, textures {:.2f}, vertices {:.2f}, constants {:.2f}, "
-                "indices {:.2f}, pipeline {:.2f}, targets {:.2f}, setup {:.2f}, record {:.2f}, prepare {:.2f}, flushes {}, vertex MB {:.1f}), present {:.2f} (waiting {:.2f})",
+                "indices {:.2f}, pipeline {:.2f}, targets {:.2f}, setup {:.2f}, record {:.2f}, prepare {:.2f}, flushes {}, vertex MB {:.1f}), "
+                "pipelines created {} loaded {}, present {:.2f} (waiting {:.2f})",
                 300000.0 / elapsed, g_profile.draw / 300, g_profile.draws / 300.0, g_profile.textures / 300, g_profile.vertices / 300,
-                g_profile.constants / 300, g_profile.indices / 300, g_profile.pipeline / 300, g_profile.targets / 300, g_profile.setup / 300, g_profile.record / 300, g_profile.prepare / 300, g_profile.flushes, g_profile.vertexBytes / 300.0 / 1048576.0,
+                g_profile.constants / 300, g_profile.indices / 300, g_profile.pipeline / 300, g_profile.targets / 300, g_profile.setup / 300, g_profile.record / 300, g_profile.prepare / 300, g_profile.flushes, g_profile.vertexBytes / 300.0 / 1048576.0, g.pipelinesCreated, g.pipelinesLoaded,
                 g_profile.present / 300, g_profile.presentWait / 300);
             g_profile = {};
         }

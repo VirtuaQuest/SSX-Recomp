@@ -37,7 +37,7 @@ namespace gpu
             return !microcode.code.empty();
 
         microcode.translated = true;
-        static xe::StringBuffer buffer;
+        static thread_local xe::StringBuffer buffer;
         microcode.shader = std::make_unique<xe::gpu::Shader>(microcode.type == 0 ? xe::gpu::xenos::ShaderType::kVertex :
             xe::gpu::xenos::ShaderType::kPixel, microcode.hash, microcode.words.data(), microcode.words.size(), std::endian::little);
         microcode.shader->AnalyzeUcode(buffer);
@@ -53,8 +53,70 @@ namespace gpu
         return !microcode.code.empty();
     }
 
+    // Shaders seen for the first time while playing are prepared on the spot (timed, to find hitches).
+    static bool PrepareShaderTimed(ShaderMicrocode& microcode)
+    {
+        if (microcode.translated)
+            return !microcode.code.empty();
+
+        auto start = std::chrono::steady_clock::now();
+        bool result = PrepareShader(microcode);
+        LOGF_INFO("{} {:016X} prepared while playing in {:.1f} ms", microcode.type == 0 ? "vertex shader" : "pixel shader",
+            microcode.hash, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        return result;
+    }
+
     static std::unordered_map<uint64_t, std::unique_ptr<ShaderMicrocode>> g_shaders;
     static ShaderMicrocode* g_activeShaders[2];
+    static std::filesystem::path g_microcodeFolder;
+    static uint64_t HashWords(const uint32_t* words, size_t count);
+
+    void PrecompileShaders(const std::filesystem::path& microcodeFolder)
+    {
+        g_microcodeFolder = microcodeFolder;
+        std::error_code ec;
+        std::filesystem::create_directories(microcodeFolder, ec);
+
+        std::vector<std::unique_ptr<ShaderMicrocode>> shaders;
+        for (const auto& entry : std::filesystem::directory_iterator(microcodeFolder, ec))
+        {
+            std::string name = entry.path().filename().string();
+            if (name.size() != 23 || (name.rfind("vs_", 0) != 0 && name.rfind("ps_", 0) != 0) || entry.path().extension() != ".bin")
+                continue;
+
+            std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+            std::vector<uint32_t> words(size_t(file.tellg()) / 4);
+            file.seekg(0);
+            file.read(reinterpret_cast<char*>(words.data()), words.size() * 4);
+            uint32_t type = name[0] == 'v' ? 0 : 1;
+            uint64_t hash = HashWords(words.data(), words.size()) ^ type;
+            shaders.push_back(std::make_unique<ShaderMicrocode>(ShaderMicrocode{ type, hash, std::move(words) }));
+        }
+        if (shaders.empty())
+            return;
+
+        auto start = std::chrono::steady_clock::now();
+        std::atomic<size_t> next = 0;
+        std::vector<std::thread> threads;
+        for (uint32_t i = 0; i < std::max(1u, std::thread::hardware_concurrency()); i++)
+        {
+            threads.emplace_back([&]
+                {
+                    for (size_t index; (index = next++) < shaders.size();)
+                        PrepareShader(*shaders[index]);
+                });
+        }
+        for (auto& thread : threads)
+            thread.join();
+
+        for (auto& shader : shaders)
+        {
+            uint64_t hash = shader->hash;
+            g_shaders.emplace(hash, std::move(shader));
+        }
+        LOGF_INFO("{} shaders prepared in {:.1f} s", g_shaders.size(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    }
 
     static uint64_t HashWords(const uint32_t* words, size_t count)
     {
@@ -177,6 +239,13 @@ namespace gpu
         {
             shader = std::make_unique<ShaderMicrocode>(ShaderMicrocode{ type, hash, std::move(words) });
 
+            if (!g_microcodeFolder.empty())
+            {
+                auto path = g_microcodeFolder / fmt::format("{}_{:016X}.bin", type == 0 ? "vs" : "ps", hash);
+                std::ofstream file(path, std::ios::binary);
+                file.write(reinterpret_cast<const char*>(shader->words.data()), shader->words.size() * sizeof(uint32_t));
+            }
+
             if (!g_surveyFolder.empty())
             {
                 auto path = g_surveyFolder / fmt::format("{}_{:016X}.bin", type == 0 ? "vs" : "ps", hash);
@@ -203,10 +272,10 @@ namespace gpu
         d3d12::HostShader vertexShader{}, pixelShader{};
         if (mode != EdramMode::Copy)
         {
-            if (!vertex || !PrepareShader(*vertex))
+            if (!vertex || !PrepareShaderTimed(*vertex))
                 return;
             vertexShader = { vertex->shader.get(), &vertex->code, vertex->hash };
-            if (pixel && PrepareShader(*pixel))
+            if (pixel && PrepareShaderTimed(*pixel))
                 pixelShader = { pixel->shader.get(), &pixel->code, pixel->hash };
         }
 

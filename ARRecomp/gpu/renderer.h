@@ -33,4 +33,8 @@ namespace gpu
 
     // Logs a summary of the GPU work of every 300th frame and saves the shaders to the folder (empty: off).
     void EnableSurvey(const std::filesystem::path& shaderFolder);
+
+    // Shader microcode the game has loaded is saved to the folder; at startup, every saved shader is translated and
+    // compiled ahead of time (in parallel), so the game doesn't stall compiling them the first time it draws.
+    void PrecompileShaders(const std::filesystem::path& microcodeFolder);
 }

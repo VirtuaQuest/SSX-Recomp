@@ -28,6 +28,9 @@ namespace gpu::d3d12
     // Saves the front buffer every 300 frames (AR_SCREENSHOT_INTERVAL), for debugging.
     void EnableScreenshots(const std::filesystem::path& folder);
 
+    // Pipeline states are kept in a D3D12 pipeline library saved to this file, so later runs don't recreate them.
+    void SetPipelineCacheFile(const std::filesystem::path& path);
+
     // Frames presented so far.
     uint64_t GetFrameNumber();
 }

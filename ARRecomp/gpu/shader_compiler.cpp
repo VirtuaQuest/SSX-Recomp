@@ -8,8 +8,8 @@ using Microsoft::WRL::ComPtr;
 namespace gpu
 {
     static std::filesystem::path g_cacheFolder;
-    static ComPtr<IDxcCompiler3> g_compiler;
-    static ComPtr<IDxcUtils> g_utils;
+    static thread_local ComPtr<IDxcCompiler3> g_compiler;
+    static thread_local ComPtr<IDxcUtils> g_utils;
 
     void SetShaderCacheFolder(const std::filesystem::path& folder)
     {
@@ -20,7 +20,7 @@ namespace gpu
 
     static bool InitializeCompiler()
     {
-        static bool initialized = [] {
+        static thread_local bool initialized = [] {
             HMODULE module = LoadLibraryW(L"dxcompiler.dll");
             if (module == nullptr)
             {
