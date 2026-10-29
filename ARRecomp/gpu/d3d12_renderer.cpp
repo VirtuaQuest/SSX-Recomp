@@ -17,7 +17,10 @@ namespace gpu::d3d12
     using namespace reg;
 
     constexpr uint32_t FRAME_COUNT = 2;
-    constexpr uint64_t UPLOAD_SIZE = 96ull << 20;
+    constexpr uint64_t UPLOAD_SIZE = 256ull << 20;
+    // Vertex buffers that don't change are kept past the per-frame upload space, in the same buffer.
+    constexpr uint64_t VERTEX_CACHE_BASE = UPLOAD_SIZE + 4096;
+    constexpr uint64_t VERTEX_CACHE_SIZE = 384ull << 20;
     constexpr uint32_t VIEW_HEAP_SIZE = 65536;
     constexpr uint32_t SAMPLER_HEAP_SIZE = 2048;
     constexpr uint32_t RTV_HEAP_SIZE = 1024;
@@ -203,6 +206,17 @@ namespace gpu::d3d12
         // reuse its copy.
         std::unordered_map<uint64_t, uint64_t> vertexUploads;
 
+        struct CachedVertices
+        {
+            uint64_t offset = 0;
+            uint64_t hash = 0;
+            uint32_t changes = 0;
+            bool valid = false;
+        };
+        std::unordered_map<uint64_t, CachedVertices> vertexCache;
+        uint64_t vertexCacheOffset = VERTEX_CACHE_BASE;
+        bool vertexCacheFull = false;
+
         ComPtr<ID3D12DescriptorHeap> viewHeap, samplerHeap, rtvHeap, dsvHeap;
         uint32_t viewSize = 0, samplerSize = 0, rtvSize = 0, dsvSize = 0;
         DescriptorAllocator views, rtvs, dsvs;
@@ -240,8 +254,22 @@ namespace gpu::d3d12
     struct Profile
     {
         double draw, textures, vertices, present, presentWait;
-        uint32_t draws;
+        double constants, indices, pipeline, record, targets, setup, prepare;
+        uint32_t draws, flushes;
+        uint64_t vertexBytes, uploadBytes;
     } static g_profile;
+
+    // Adds the time since the last lap to a profile slot.
+    struct LapTimer
+    {
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        void Lap(double& target)
+        {
+            auto now = std::chrono::steady_clock::now();
+            target += std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+        }
+    };
 
     struct ScopedTimer
     {
@@ -838,7 +866,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_HEAP_PROPERTIES uploadHeap{ D3D12_HEAP_TYPE_UPLOAD };
         D3D12_RESOURCE_DESC bufferDesc{};
         bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufferDesc.Width = UPLOAD_SIZE;
+        bufferDesc.Width = VERTEX_CACHE_BASE + VERTEX_CACHE_SIZE; // 4 KB padding: constants are read as 4 KB.
         bufferDesc.Height = 1;
         bufferDesc.DepthOrArraySize = 1;
         bufferDesc.MipLevels = 1;
@@ -1006,15 +1034,20 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static uint64_t HashMemory(const uint8_t* data, size_t size)
     {
-        uint64_t hash = 0xCBF29CE484222325ull;
+        // Four independent lanes, so the multiplications overlap.
+        uint64_t lanes[4] = { 0xCBF29CE484222325ull, 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull };
         size_t i = 0;
-        for (; i + 8 <= size; i += 8)
+        for (; i + 32 <= size; i += 32)
         {
-            uint64_t value;
-            memcpy(&value, data + i, 8);
-            hash = (hash ^ value) * 0x100000001B3ull;
-            hash ^= hash >> 29;
+            for (int lane = 0; lane < 4; lane++)
+            {
+                uint64_t value;
+                memcpy(&value, data + i + lane * 8, 8);
+                lanes[lane] = (lanes[lane] ^ value) * 0x100000001B3ull;
+                lanes[lane] ^= lanes[lane] >> 29;
+            }
         }
+        uint64_t hash = lanes[0] ^ (lanes[1] * 3) ^ (lanes[2] * 5) ^ (lanes[3] * 7) ^ size;
         for (; i < size; i++)
             hash = (hash ^ data[i]) * 0x100000001B3ull;
         return hash;
@@ -1888,6 +1921,49 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static void Resolve(const be<uint32_t>* registers);
 
+    // Returns the upload buffer offset of a vertex buffer's data: cached across frames while its contents stay the
+    // same, copied into the frame's upload space when they keep changing.
+    static uint64_t UploadVertexData(uint32_t address, uint32_t size)
+    {
+        const uint8_t* source = g_memory.Translate<uint8_t>(PhysicalToVirtual(address));
+        uint64_t key = (uint64_t(address) << 32) | size;
+        auto* entry = &g.vertexCache[key];
+        if (entry->changes < 3 && size <= VERTEX_CACHE_SIZE / 16)
+        {
+            uint64_t hash = HashMemory(source, size);
+            if (entry->valid && entry->hash == hash)
+                return entry->offset;
+            if (entry->valid)
+                entry->changes++;
+
+            if (entry->changes < 3)
+            {
+                uint64_t offset = (g.vertexCacheOffset + 15) & ~15ull;
+                if (offset + size > VERTEX_CACHE_BASE + VERTEX_CACHE_SIZE)
+                {
+                    // Full: emptied before the next draw's uploads (Draw), copied per frame meanwhile.
+                    g.vertexCacheFull = true;
+                    auto allocation = Upload(size, 16);
+                    memcpy(allocation.cpu, source, size);
+                    g_profile.vertexBytes += size;
+                    return allocation.offset;
+                }
+                memcpy(g.uploadCpu + offset, source, size);
+                g.vertexCacheOffset = offset + size;
+                g_profile.vertexBytes += size;
+                entry->offset = offset;
+                entry->hash = hash;
+                entry->valid = true;
+                return offset;
+            }
+        }
+
+        auto allocation = Upload(size, 16);
+        memcpy(allocation.cpu, source, size);
+        g_profile.vertexBytes += size;
+        return allocation.offset;
+    }
+
     // Logs every draw of one frame, for debugging (frame number from AR_TRACE_FRAME).
     bool TraceThisFrame()
     {
@@ -1902,6 +1978,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         ScopedTimer timer{ g_profile.draw };
         g_profile.draws++;
+        LapTimer setupLap;
 
         auto mode = EdramMode(registers[RB_MODECONTROL] & 7);
         if (mode == EdramMode::Copy)
@@ -2104,11 +2181,13 @@ float4 main(float4 position : SV_Position) : SV_Target
                 }
             };
         {
+            setupLap.Lap(g_profile.setup);
             ScopedTimer textureTimer{ g_profile.textures };
             bindTextures(vertexShader);
             if (pixelShader)
                 bindTextures(*pixelShader);
         }
+        auto textureEnd = std::chrono::steady_clock::now();
 
         // Index data.
         std::vector<uint32_t> indices;
@@ -2149,37 +2228,102 @@ float4 main(float4 position : SV_Position) : SV_Target
                 return;
         }
 
-        // Vertex data: every vertex buffer the shader fetches from is copied into the upload buffer.
+        // Vertex data: the part of every vertex buffer the shader fetches from that the draw's vertex indices reach is
+        // copied into the upload buffer (games point fetch constants into large shared buffers, the size reaching
+        // to their end).
+        uint32_t vertexCount = UINT32_MAX;
+        {
+            uint32_t maxIndex = 0;
+            bool known = true;
+            if (!indices.empty())
+            {
+                for (uint32_t value : indices)
+                {
+                    if (value != UINT32_MAX)
+                        maxIndex = std::max(maxIndex, value);
+                }
+            }
+            else if (indexed)
+            {
+                const uint8_t* source = g_memory.Translate<uint8_t>(PhysicalToVirtual(draw.indexBase));
+                bool index32 = draw.initiator.Index32();
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    uint32_t value;
+                    if (index32)
+                    {
+                        memcpy(&value, source + i * 4, 4);
+                        value = GpuSwap(value, draw.indexEndian);
+                    }
+                    else
+                    {
+                        uint16_t value16;
+                        memcpy(&value16, source + i * 2, 2);
+                        value = draw.indexEndian == 1 ? ByteSwap(value16) : value16;
+                        if (value == 0xFFFF && primitiveReset)
+                            continue;
+                    }
+                    if (value != UINT32_MAX)
+                        maxIndex = std::max(maxIndex, value);
+                }
+            }
+            else
+            {
+                maxIndex = count ? count - 1 : 0;
+            }
+
+            int32_t indexOffset = int32_t(uint32_t(registers[VGT_INDX_OFFSET]));
+            static const bool fullBuffers = getenv("AR_FULL_VERTEX_BUFFERS") != nullptr;
+            if (known && !fullBuffers && indexOffset >= 0 && maxIndex < 0x1000000)
+                vertexCount = maxIndex + uint32_t(indexOffset) + 1;
+        }
+
         uint64_t frameBase = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
         uint64_t uploadSize = 3 * 4096 + indices.size() * 4 + size_t(count) * 4;
         std::vector<std::pair<uint32_t, uint32_t>> vertexRanges;
         for (const auto& binding : vertexShader.shader->vertex_bindings())
         {
             uint32_t index = binding.fetch_constant;
-            uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
             uint32_t size = ((registers[SHADER_CONSTANT_FETCH_00_0 + index * 2 + 1] >> 2) & 0xFFFFFF) * 4;
+            if (vertexCount != UINT32_MAX && binding.stride_words != 0)
+            {
+                uint64_t needed = (uint64_t(vertexCount) * binding.stride_words * 4 + 255) & ~255ull;
+                size = uint32_t(std::min<uint64_t>(size, needed));
+            }
             vertexRanges.emplace_back(index, size);
             uploadSize += size + 16;
         }
 
-        if (g.uploadOffset + uploadSize > frameBase + UPLOAD_SIZE / FRAME_COUNT)
+        if (g.uploadOffset + uploadSize > frameBase + UPLOAD_SIZE / FRAME_COUNT || g.vertexCacheFull)
+        {
+            g_profile.flushes++;
             FlushAndWait();
+            if (g.vertexCacheFull)
+            {
+                // The GPU is done with everything: the vertex cache starts over.
+                g.vertexCache.clear();
+                g.vertexCacheOffset = VERTEX_CACHE_BASE;
+                g.vertexCacheFull = false;
+            }
+        }
 
-        ScopedTimer vertexTimer{ g_profile.vertices };
+        LapTimer lap;
+        g_profile.prepare += std::chrono::duration<double, std::milli>(lap.last - textureEnd).count();
         for (auto [index, size] : vertexRanges)
         {
             if (size == 0)
                 continue;
             uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
-            auto& uploaded = g.vertexUploads[(uint64_t(address) << 32) | size];
+            if (TraceThisFrame())
+                LOGF_INFO("  vertex fetch {} at 0x{:08X}: {} bytes, {} indices, {} vertices", index, address, size, count,
+                    draw.initiator.Source() == SourceSelect::AutoIndex ? "auto" : "indexed");
+            uint64_t& uploaded = g.vertexUploads[(uint64_t(address) << 32) | size];
             if (uploaded == 0)
-            {
-                auto allocation = Upload(size, 16);
-                memcpy(allocation.cpu, g_memory.Translate(PhysicalToVirtual(address)), size);
-                uploaded = allocation.offset + 1;
-            }
-            system.vertexDataOffsets[index] = int32_t(uploaded - 1 - frameBase) - int32_t(address);
+                uploaded = UploadVertexData(address, size) + 1;
+            system.vertexDataOffsets[index] = int32_t(uploaded - 1) - int32_t(address);
         }
+
+        lap.Lap(g_profile.vertices);
 
         // Constants.
         for (uint32_t i = 0; i < 8; i++)
@@ -2263,7 +2407,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                 }
 
                 uint32_t base = std::min<uint32_t>(baseRegister & 0x1FF, 256);
-                auto allocation = Upload(4096, 256);
+                // Only the registers read are uploaded; the shader declares all 256, so reads past them land in
+                // later upload space (or the buffer's padding), which it never uses.
+                auto allocation = Upload(std::max<uint32_t>(count * 16, 256), 256);
                 auto* out = reinterpret_cast<uint32_t*>(allocation.cpu);
                 for (uint32_t i = 0; i < count * 4; i++)
                     out[i] = registers[SHADER_CONSTANT_000_X + base * 4 + i];
@@ -2273,6 +2419,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_GPU_VIRTUAL_ADDRESS pixelConstants = uploadFloatConstants(registers[0x2308], pixelShader);
         D3D12_GPU_VIRTUAL_ADDRESS systemConstants = UploadConstants(system);
 
+        lap.Lap(g_profile.constants);
         D3D12_INDEX_BUFFER_VIEW indexView{};
         if (indexed && !indices.empty())
         {
@@ -2310,6 +2457,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
             indexView = { allocation.gpu, size, index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
         }
+
+        lap.Lap(g_profile.indices);
 
         // Pipeline state.
         key.vertexShader = vertexShader.hash;
@@ -2387,6 +2536,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 RegisterFloat(registers, PA_CL_VPORT_YSCALE), RegisterFloat(registers, PA_CL_VPORT_YOFFSET));
         }
 
+        lap.Lap(g_profile.pipeline);
+
         // Regions written, for render targets sharing EDRAM. Clears drawn as a rectangle in screen coordinates
         // cover their rectangle, not the scissor (which is often the whole 8192x8192 space).
         {
@@ -2447,6 +2598,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
         }
 
+        lap.Lap(g_profile.targets);
+
         // Record.
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4]{};
         for (uint32_t i = 0; i < key.renderTargetCount; i++)
@@ -2475,7 +2628,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, systemConstants);
         g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, vertexConstants);
         g.list->SetGraphicsRootConstantBufferView(ROOT_PIXEL_FLOAT_CONSTANTS, pixelConstants);
-        g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu + frameBase);
+        g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu);
 
         float blendFactor[4] = { RegisterFloat(registers, RB_BLEND_RED), RegisterFloat(registers, RB_BLEND_GREEN),
             RegisterFloat(registers, RB_BLEND_BLUE), RegisterFloat(registers, RB_BLEND_ALPHA) };
@@ -2491,6 +2644,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             g.list->DrawInstanced(count, 1, 0, 0);
         }
+        lap.Lap(g_profile.record);
     }
 
     // ---- Resolves ----
@@ -2860,8 +3014,10 @@ float4 main(float4 position : SV_Position) : SV_Target
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double, std::milli>(now - lastReport).count();
             lastReport = now;
-            LOGF_INFO("profile: {:.1f} fps; per frame {:.2f} ms draws ({:.0f} draws, textures {:.2f}, vertices {:.2f}), present {:.2f} (waiting {:.2f})",
+            LOGF_INFO("profile: {:.1f} fps; per frame {:.2f} ms draws ({:.0f} draws, textures {:.2f}, vertices {:.2f}, constants {:.2f}, "
+                "indices {:.2f}, pipeline {:.2f}, targets {:.2f}, setup {:.2f}, record {:.2f}, prepare {:.2f}, flushes {}, vertex MB {:.1f}), present {:.2f} (waiting {:.2f})",
                 300000.0 / elapsed, g_profile.draw / 300, g_profile.draws / 300.0, g_profile.textures / 300, g_profile.vertices / 300,
+                g_profile.constants / 300, g_profile.indices / 300, g_profile.pipeline / 300, g_profile.targets / 300, g_profile.setup / 300, g_profile.record / 300, g_profile.prepare / 300, g_profile.flushes, g_profile.vertexBytes / 300.0 / 1048576.0,
                 g_profile.present / 300, g_profile.presentWait / 300);
             g_profile = {};
         }
