@@ -1044,7 +1044,8 @@ XeOutput main(XeInput input)
         if (xe_flags & XE_FLAG_POINT)
             xe_r[xe_param_gen_register] = float4(abs(pixel.x), -abs(pixel.y), saturate(input.extra.zw));
         else
-            xe_r[xe_param_gen_register] = float4(input.frontFace ? pixel.x : -pixel.x - 1.0f, pixel.y, 0.0f, 0.0f);
+            // Back faces set the sign bit of x (also for x = 0); the magnitude stays the pixel position.
+            xe_r[xe_param_gen_register] = float4(input.frontFace ? pixel.x : asfloat(asuint(pixel.x) | 0x80000000u), pixel.y, 0.0f, 0.0f);
     }
     float4 xe_color[4] = { float4(0.0f, 0.0f, 0.0f, 0.0f), float4(0.0f, 0.0f, 0.0f, 0.0f),
         float4(0.0f, 0.0f, 0.0f, 0.0f), float4(0.0f, 0.0f, 0.0f, 0.0f) };
