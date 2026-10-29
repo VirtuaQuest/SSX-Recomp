@@ -132,7 +132,7 @@ namespace imports
 
     uint32_t KeDelayExecutionThread(uint32_t processorMode, uint32_t alertable, be<int64_t>* interval)
     {
-        if (getenv("AR_LOG_DELAYS") && interval != nullptr)
+        if (AR_ENV("AR_LOG_DELAYS") && interval != nullptr)
         {
             static std::mutex mutex;
             static std::map<std::pair<uint32_t, int64_t>, uint32_t> counts;
@@ -142,7 +142,7 @@ namespace imports
         }
 
         // Experiment: Unleashed Recompiled ends alertable delays immediately with STATUS_USER_APC.
-        if (alertable && getenv("AR_UR_ALERTABLE"))
+        if (alertable && AR_ENV("AR_UR_ALERTABLE"))
             return 0x000000C0; // STATUS_USER_APC
 
         auto deadline = GuestTimeoutToDeadline(interval);

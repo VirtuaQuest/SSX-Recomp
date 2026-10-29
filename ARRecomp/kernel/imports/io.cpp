@@ -208,7 +208,7 @@ namespace imports
         SetIoStatus(ioStatus, status, uint32_t(read));
         SignalCompletion(event, apcRoutine);
 
-        if (getenv("AR_LOG_READS"))
+        if (AR_ENV("AR_LOG_READS"))
             LOGF_INFO("read {} at 0x{:X}: 0x{:X} of 0x{:X} bytes to 0x{:08X}, event 0x{:X}, apc 0x{:X}, status 0x{:X}", file->path, offset, read,
                 length, g_memory.MapVirtual(buffer), event, apcRoutine, status);
 

@@ -40,3 +40,7 @@
 #include <xbox.h>
 
 #include "os/logger.h"
+
+// An environment variable's value, read once per call site (getenv scans the environment block under a lock, too
+// slow for per-draw or per-packet checks).
+#define AR_ENV(name) ([]() -> const char* { static const char* const value = getenv(name); return value; }())

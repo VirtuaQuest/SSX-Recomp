@@ -6,7 +6,7 @@
 PPC_FUNC_IMPL(__imp__sub_8223F950);
 PPC_FUNC(sub_8223F950)
 {
-    static const bool enabled = getenv("AR_LOG_QUERIES") != nullptr;
+    static const bool enabled = AR_ENV("AR_LOG_QUERIES") != nullptr;
     uint32_t query = ctx.r3.u32;
     __imp__sub_8223F950(ctx, base);
     if (!enabled)
@@ -49,7 +49,7 @@ PPC_FUNC(sub_8223F950)
 PPC_FUNC_IMPL(__imp__sub_82570808);
 PPC_FUNC(sub_82570808)
 {
-    static const uint32_t watched = getenv("AR_DUMP_DECOMPRESS") ? uint32_t(strtoul(getenv("AR_DUMP_DECOMPRESS"), nullptr, 16)) : 0;
+    static const uint32_t watched = AR_ENV("AR_DUMP_DECOMPRESS") ? uint32_t(strtoul(AR_ENV("AR_DUMP_DECOMPRESS"), nullptr, 16)) : 0;
     uint32_t source = ctx.r4.u32, sourceSize = ctx.r5.u32, dest = ctx.r6.u32, destSize = ctx.r7.u32;
     bool dump = watched != 0 && watched >= dest && watched - dest < destSize;
     static int index;
@@ -77,7 +77,7 @@ void PrintCurrentStack(int maxFrames);
 PPC_FUNC_IMPL(__imp__sub_826E3D88);
 PPC_FUNC(sub_826E3D88)
 {
-    if (getenv("AR_LOG_SAVE_ERRORS"))
+    if (AR_ENV("AR_LOG_SAVE_ERRORS"))
     {
         LOGF_INFO("save task 0x{:08X} result {} (r5 0x{:08X} r6 0x{:08X})", ctx.r3.u32, ctx.r4.s32, ctx.r5.u32, ctx.r6.u32);
         PrintCurrentStack(8);

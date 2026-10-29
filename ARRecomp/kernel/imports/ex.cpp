@@ -195,7 +195,7 @@ namespace imports
         if (output != nullptr)
             memcpy(output, digest, std::min<uint32_t>(outputSize, sizeof(digest)));
 
-        if (getenv("AR_LOG_SHA"))
+        if (AR_ENV("AR_LOG_SHA"))
         {
             std::string hex;
             for (auto byte : digest)

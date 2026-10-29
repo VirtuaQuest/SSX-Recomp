@@ -291,7 +291,7 @@ namespace gpu
         g_surveyFrame++;
 
         // Debugging the intro movie: log when its frame buffer changes (AR_WATCH_MOVIE).
-        if (getenv("AR_WATCH_MOVIE") && g_surveyFrame % 10 == 0)
+        if (AR_ENV("AR_WATCH_MOVIE") && g_surveyFrame % 10 == 0)
         {
             static uint64_t lastHash;
             static uint32_t changes;

@@ -162,10 +162,71 @@ namespace gpu::d3d12
         bool rawDepth = false; // Holds depth buffer words (from depth resolves), 8 bit stencil in the low byte.
     };
 
+    // Detects changes of guest memory a cached copy was made from. Small ranges are hashed whole every check. Large
+    // ones that have stayed the same for a while are checked with a sampled hash (spread over the range, so most
+    // writes show), and hashed whole every 30 frames.
+    struct ContentCheck
+    {
+        uint64_t hash = 0;
+        uint64_t sampleHash = 0;
+        uint32_t stableChecks = 0;
+        uint32_t phase = 0; // Spreads the full checks of different ranges over frames.
+    };
+
+    static uint64_t HashMemory(const uint8_t* data, size_t size);
+
+    static uint64_t SampleHash(const uint8_t* data, size_t size)
+    {
+        constexpr size_t SAMPLES = 64, CHUNK = 64;
+        uint64_t hash = size;
+        size_t step = (size - CHUNK) / (SAMPLES - 1);
+        for (size_t i = 0; i < SAMPLES; i++)
+        {
+            const uint8_t* chunk = data + std::min(i * step, size - CHUNK);
+            for (size_t j = 0; j < CHUNK; j += 8)
+            {
+                uint64_t value;
+                memcpy(&value, chunk + j, 8);
+                hash = (hash ^ value) * 0x100000001B3ull;
+                hash ^= hash >> 29;
+            }
+        }
+        return hash;
+    }
+
+    // Returns whether the contents changed since the last check (always true the first time).
+    static bool ContentChanged(ContentCheck& check, const uint8_t* data, size_t size, uint64_t frame, bool first)
+    {
+        static const bool fullChecks = AR_ENV("AR_FULL_HASH") != nullptr;
+        constexpr size_t SMALL = 16384;
+        if (first || size <= SMALL || fullChecks)
+        {
+            uint64_t hash = HashMemory(data, size);
+            bool changed = first || hash != check.hash;
+            check.hash = hash;
+            if (size > SMALL)
+                check.sampleHash = SampleHash(data, size);
+            check.stableChecks = changed ? 0 : check.stableChecks + 1;
+            return changed;
+        }
+
+        uint64_t sample = SampleHash(data, size);
+        bool full = sample != check.sampleHash || check.stableChecks < 8 || (frame + check.phase) % 30 == 0;
+        check.sampleHash = sample;
+        if (!full)
+            return false;
+
+        uint64_t hash = HashMemory(data, size);
+        bool changed = hash != check.hash;
+        check.hash = hash;
+        check.stableChecks = changed ? 0 : check.stableChecks + 1;
+        return changed;
+    }
+
     struct CachedTexture
     {
         Texture texture;
-        uint64_t contentHash = 0;
+        ContentCheck content;
         uint64_t checkedFrame = UINT64_MAX;
     };
 
@@ -230,7 +291,7 @@ namespace gpu::d3d12
         struct CachedVertices
         {
             uint64_t offset = 0;
-            uint64_t hash = 0;
+            ContentCheck content;
             uint32_t changes = 0;
             bool valid = false;
         };
@@ -263,6 +324,33 @@ namespace gpu::d3d12
         std::unordered_map<RenderTargetKey, Texture, RenderTargetKeyHash> renderTargets;
         // When each render target was last used: overlapping ones copy from those used after them.
         std::unordered_map<RenderTargetKey, uint64_t, RenderTargetKeyHash> renderTargetStamps;
+        // Render targets whose EDRAM can overlap each one's (rebuilt when render targets are added).
+        std::unordered_map<RenderTargetKey, std::vector<RenderTargetKey>, RenderTargetKeyHash> renderTargetOverlaps;
+        bool renderTargetOverlapsDirty = true;
+
+        // Pipeline state the last draw set, to skip setting it again (invalid after anything else records).
+        struct DrawState
+        {
+            bool valid = false;
+            uint32_t renderTargetCount = 0;
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4]{};
+            D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+            uint32_t viewportWidth = 0, viewportHeight = 0;
+            D3D12_RECT scissor{};
+            ID3D12PipelineState* pipeline = nullptr;
+            D3D12_PRIMITIVE_TOPOLOGY topology{};
+            float blendFactor[4]{};
+            uint32_t stencilRef = 0;
+        } drawState;
+
+        // Texture lookups made this frame (cleared at resolves, which change resolved textures).
+        struct TextureLookup
+        {
+            uint32_t srv;
+            float transform[4];
+            uint32_t rawDepth;
+        };
+        std::unordered_map<uint64_t, TextureLookup> textureLookups;
         // Regions recently written in each render target (in samples), with the stamp they were written under.
         std::unordered_map<RenderTargetKey, std::vector<std::pair<uint64_t, D3D12_RECT>>, RenderTargetKeyHash> renderTargetWrites;
         uint64_t renderTargetClock = 0;
@@ -276,7 +364,8 @@ namespace gpu::d3d12
     {
         double draw, textures, vertices, present, presentWait;
         double constants, indices, pipeline, record, targets, setup, prepare;
-        uint32_t draws, flushes;
+        uint32_t draws, flushes, textureLookups, textureMisses, textureUploads;
+        double textureHash, textureDecode;
         uint64_t vertexBytes, uploadBytes;
     } static g_profile;
 
@@ -356,6 +445,8 @@ namespace gpu::d3d12
 
     static void BindHeaps()
     {
+        g.drawState.valid = false;
+        g.textureLookups.clear();
         ID3D12DescriptorHeap* heaps[] = { g.viewHeap.Get(), g.samplerHeap.Get() };
         g.list->SetDescriptorHeaps(2, heaps);
         g.list->SetGraphicsRootSignature(g.rootSignature.Get());
@@ -819,7 +910,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         HWND hwnd = window::Create("Anarchy Reigns");
         g_scale = std::clamp<uint32_t>(g_videoSettings.renderScale, 1, 4);
 
-        if (getenv("AR_D3D12_DEBUG"))
+        if (AR_ENV("AR_D3D12_DEBUG"))
         {
             ComPtr<ID3D12Debug> debug;
             if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
@@ -1203,7 +1294,41 @@ float4 main(float4 position : SV_Position) : SV_Target
     //
     // Depth formats (24_8 and 24_8_FLOAT) fetched from depth resolves hold raw words; rawDepth receives 1 or 2 for
     // the shader to decode them as unorm or float depth.
+    static uint32_t GetTextureUncached(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth);
+
     static uint32_t GetTexture(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth)
+    {
+        uint32_t keyWords[7];
+        memcpy(keyWords, fetch.words, sizeof(fetch.words));
+        keyWords[6] = dimension;
+        uint64_t key = HashMemory(reinterpret_cast<const uint8_t*>(keyWords), sizeof(keyWords));
+        g_profile.textureLookups++;
+        auto it = g.textureLookups.find(key);
+        if (it == g.textureLookups.end())
+        {
+            g_profile.textureMisses++;
+            State::TextureLookup lookup;
+            lookup.srv = GetTextureUncached(fetch, dimension, lookup.transform, lookup.rawDepth);
+            it = g.textureLookups.emplace(key, lookup).first;
+        }
+        else if (it->second.srv != NULL_SRV_2D && it->second.srv != NULL_SRV_3D && it->second.srv != NULL_SRV_CUBE)
+        {
+            // Still transitioned for this draw: resolves render into resolved textures between draws.
+            for (auto& [base, resolved] : g.resolvedTextures)
+            {
+                if (resolved.texture.srv == it->second.srv)
+                {
+                    Transition(resolved.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    break;
+                }
+            }
+        }
+        memcpy(transform, it->second.transform, sizeof(it->second.transform));
+        rawDepth = it->second.rawDepth;
+        return it->second.srv;
+    }
+
+    static uint32_t GetTextureUncached(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth)
     {
         rawDepth = 0;
         transform[0] = transform[1] = 1.0f;
@@ -1211,7 +1336,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         uint32_t nullSrv = dimension == 3 ? NULL_SRV_CUBE : dimension == 2 ? NULL_SRV_3D : NULL_SRV_2D;
         if ((fetch.words[0] & 3) != 2) // Not a texture fetch constant.
             return nullSrv;
-        static const bool nullCubes = getenv("AR_NULL_CUBE") != nullptr;
+        static const bool nullCubes = AR_ENV("AR_NULL_CUBE") != nullptr;
         if (nullCubes && dimension == 3)
             return nullSrv;
 
@@ -1231,8 +1356,10 @@ float4 main(float4 position : SV_Position) : SV_Target
             return texture.srv;
         }
 
-        // Diagnostics: textures overlapping resolved memory but not matched to a resolved texture are decoded from
-        // guest memory, which resolves don't write.
+        // Diagnostics (AR_LOG_UNMATCHED): textures overlapping resolved memory but not matched to a resolved texture
+        // are decoded from guest memory, which resolves don't write.
+        static const bool logUnmatched = AR_ENV("AR_LOG_UNMATCHED") != nullptr;
+        if (logUnmatched)
         {
             uint32_t start = fetch.BaseAddress(), end = start + std::max<uint32_t>(GetGuestTextureSize(fetch), 1);
             for (auto& [base, other] : g.resolvedTextures)
@@ -1266,9 +1393,17 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             entry.checkedFrame = g.frameNumber;
             uint32_t size = GetGuestTextureSize(fetch);
-            uint64_t hash = HashMemory(g_memory.Translate<uint8_t>(PhysicalToVirtual(fetch.BaseAddress())), size);
-            if (!entry.texture.resource || hash != entry.contentHash)
+            if (entry.content.phase == 0)
+                entry.content.phase = uint32_t(key % 30) + 1;
+            bool newTexture = !entry.texture.resource;
+            LapTimer hashLap;
+            bool changed = ContentChanged(entry.content, g_memory.Translate<uint8_t>(PhysicalToVirtual(fetch.BaseAddress())), size,
+                g.frameNumber, !entry.texture.resource);
+            hashLap.Lap(g_profile.textureHash);
+            if (changed)
             {
+                ScopedTimer decodeTimer{ g_profile.textureDecode };
+                g_profile.textureUploads++;
                 DecodedTexture decoded;
                 if (!DecodeTexture(fetch, decoded))
                     return nullSrv;
@@ -1281,14 +1416,13 @@ float4 main(float4 position : SV_Position) : SV_Target
                         return nullSrv;
                 }
 
-                bool firstUpload = entry.contentHash == 0;
+                bool firstUpload = newTexture;
                 static int changeLogs;
-                if (!firstUpload && getenv("AR_TRACE_FRAME") && changeLogs++ < 40)
+                if (!firstUpload && AR_ENV("AR_TRACE_FRAME") && changeLogs++ < 40)
                     LOGF_INFO("texture {:08X} changed in frame {}", fetch.BaseAddress(), g.frameNumber);
                 UploadTexture(entry.texture, decoded);
-                entry.contentHash = hash;
 
-                if (TraceThisFrame() || (getenv("AR_DUMP_TEXTURES") && firstUpload))
+                if (TraceThisFrame() || (AR_ENV("AR_DUMP_TEXTURES") && firstUpload))
                 {
                     uint32_t minimum = 255, maximum = 0;
                     for (uint8_t value : decoded.data)
@@ -1451,7 +1585,7 @@ float4 main(float4 position : SV_Position) : SV_Target
     // Reorders a render target's texels into another sample layout, through a scratch copy.
     static void ConvertLayout(Texture& texture, uint32_t layout)
     {
-        static const bool disabled = getenv("AR_NO_LAYOUT") != nullptr;
+        static const bool disabled = AR_ENV("AR_NO_LAYOUT") != nullptr;
         if (disabled || texture.layout == layout || !texture.resource)
             return;
 
@@ -1529,13 +1663,40 @@ float4 main(float4 position : SV_Position) : SV_Target
         uint64_t& stamp = g.renderTargetStamps[key];
         uint32_t pitchTiles = (key.pitch + EdramTileWidth(key.format, key.depth) - 1) / EdramTileWidth(key.format, key.depth);
 
-        std::vector<std::pair<uint64_t, std::pair<const RenderTargetKey*, Texture*>>> newer;
-        for (auto& [otherKey, other] : g.renderTargets)
+        if (g.renderTargetOverlapsDirty)
         {
+            g.renderTargetOverlapsDirty = false;
+            g.renderTargetOverlaps.clear();
+            for (auto& [a, ignored] : g.renderTargets)
+            {
+                auto& list = g.renderTargetOverlaps[a];
+                uint32_t tiles = (a.pitch + EdramTileWidth(a.format, a.depth) - 1) / EdramTileWidth(a.format, a.depth);
+                for (auto& [b, ignored2] : g.renderTargets)
+                {
+                    bool depthIntoColor = !a.depth && b.depth && (a.format == 0 || a.format == 1);
+                    static const bool noColorIntoDepth = AR_ENV("AR_NO_COLOR_TO_DEPTH") != nullptr;
+                    bool colorIntoDepth = !noColorIntoDepth && a.depth && a.format == 1 && !b.depth && (b.format == 0 || b.format == 1);
+                    if (b == a || b.pitch != a.pitch || (!depthIntoColor && !colorIntoDepth && (b.depth != a.depth || b.format != a.format)))
+                        continue;
+                    int32_t delta = int32_t(b.base) - int32_t(a.base);
+                    if (delta % int32_t(tiles) == 0 && std::abs(delta / int32_t(tiles)) * 16 < int32_t(RENDER_TARGET_HEIGHT))
+                        list.push_back(b);
+                }
+            }
+        }
+
+        std::vector<std::pair<uint64_t, std::pair<const RenderTargetKey*, Texture*>>> newer;
+        for (const RenderTargetKey& candidate : g.renderTargetOverlaps[key])
+        {
+            auto found = g.renderTargets.find(candidate);
+            if (found == g.renderTargets.end())
+                continue;
+            const RenderTargetKey& otherKey = found->first;
+            Texture& other = found->second;
             // 8888 color targets also take the raw words of depth buffers over them (games clear color by clearing
             // depth at the same EDRAM address).
             bool depthIntoColor = !key.depth && otherKey.depth && (key.format == 0 || key.format == 1);
-            static const bool noColorIntoDepth = getenv("AR_NO_COLOR_TO_DEPTH") != nullptr;
+            static const bool noColorIntoDepth = AR_ENV("AR_NO_COLOR_TO_DEPTH") != nullptr;
             // Only float depth buffers: the game restores its effects pass depth (D24FS8) by drawing the saved words as
             // colour, while its unorm depth buffers share EDRAM with colour for combined clears, where converting
             // colour into depth corrupts what is later drawn over it.
@@ -1695,6 +1856,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.list->ClearRenderTargetView(CpuRtv(texture.rtv), black, 0, nullptr);
         }
 
+        g.renderTargetOverlapsDirty = true;
         Texture& created = g.renderTargets.emplace(key, std::move(texture)).first->second;
         SyncRenderTarget(key, created);
         return &created;
@@ -1843,13 +2005,13 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = cull == 1 ? D3D12_CULL_MODE_FRONT : cull == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
         desc.RasterizerState.FrontCounterClockwise = ((key.rasterizer >> 2) & 1) == 0;
-        desc.RasterizerState.DepthClipEnable = !((key.rasterizer >> 3) & 1) && !getenv("AR_NO_DEPTH_CLIP");
+        desc.RasterizerState.DepthClipEnable = !((key.rasterizer >> 3) & 1) && !AR_ENV("AR_NO_DEPTH_CLIP");
 
         uint32_t depth = key.depthControl;
         auto& depthStencil = desc.DepthStencilState;
         depthStencil.DepthEnable = (depth >> 1) & 1;
         depthStencil.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-        depthStencil.DepthFunc = getenv("AR_NO_DEPTH_TEST") ? D3D12_COMPARISON_FUNC_ALWAYS : D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
+        depthStencil.DepthFunc = AR_ENV("AR_NO_DEPTH_TEST") ? D3D12_COMPARISON_FUNC_ALWAYS : D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
         depthStencil.StencilEnable = depth & 1;
         depthStencil.StencilReadMask = UINT8(key.stencilMasks & 0xFF);
         depthStencil.StencilWriteMask = UINT8((key.stencilMasks >> 8) & 0xFF);
@@ -1963,6 +2125,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static void SetViewportAndScissor(uint32_t width, uint32_t height, D3D12_RECT scissor)
     {
+        g.drawState.valid = false; // Used by everything recording outside draws.
         D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f };
         g.list->RSSetViewports(1, &viewport);
         scissor.right = std::min<LONG>(scissor.right, LONG(width));
@@ -2026,8 +2189,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         auto* entry = &g.vertexCache[key];
         if (entry->changes < 3 && size <= VERTEX_CACHE_SIZE / 16)
         {
-            uint64_t hash = HashMemory(source, size);
-            if (entry->valid && entry->hash == hash)
+            if (entry->content.phase == 0)
+                entry->content.phase = uint32_t(key % 30) + 1;
+            if (!ContentChanged(entry->content, source, size, g.frameNumber, !entry->valid))
                 return entry->offset;
             if (entry->valid)
                 entry->changes++;
@@ -2048,7 +2212,6 @@ float4 main(float4 position : SV_Position) : SV_Target
                 g.vertexCacheOffset = offset + size;
                 g_profile.vertexBytes += size;
                 entry->offset = offset;
-                entry->hash = hash;
                 entry->valid = true;
                 return offset;
             }
@@ -2063,7 +2226,7 @@ float4 main(float4 position : SV_Position) : SV_Target
     // Logs every draw of one frame, for debugging (frame number from AR_TRACE_FRAME).
     bool TraceThisFrame()
     {
-        static int64_t frame = getenv("AR_TRACE_FRAME") ? atoll(getenv("AR_TRACE_FRAME")) : -1;
+        static int64_t frame = AR_ENV("AR_TRACE_FRAME") ? atoll(AR_ENV("AR_TRACE_FRAME")) : -1;
         return int64_t(g.frameNumber) == frame;
     }
 
@@ -2090,7 +2253,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         static const std::vector<std::string> skippedShaders = []
             {
                 std::vector<std::string> list;
-                if (const char* text = getenv("AR_SKIP_PS"))
+                if (const char* text = AR_ENV("AR_SKIP_PS"))
                 {
                     std::stringstream stream(text);
                     std::string item;
@@ -2258,7 +2421,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     // Raw depth words can't be filtered.
                     // Filters set in the fetch instruction override the fetch constant's.
                     TextureFetch samplerFetch = fetch;
-                    static const bool noFilterOverride = getenv("AR_NO_FILTER_OVERRIDE") != nullptr;
+                    static const bool noFilterOverride = AR_ENV("AR_NO_FILTER_OVERRIDE") != nullptr;
                     const auto& attributes = binding.fetch_instr.attributes;
                     auto overrideField = [&](uint32_t value, uint32_t useFetchConst, uint32_t shift, uint32_t mask)
                         {
@@ -2275,7 +2438,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     // Point sampled (magnification and minification): coordinates snap to texel centers in the shader.
                     bool pointSampled = ((samplerFetch.words[3] >> 19) & 3) == 0 && ((samplerFetch.words[3] >> 21) & 3) == 0 &&
                         ((samplerFetch.words[3] >> 25) & 7) < 2;
-                    if (pointSampled && !getenv("AR_NO_POINT_SNAP"))
+                    if (pointSampled && !AR_ENV("AR_NO_POINT_SNAP"))
                         rawDepth |= 8;
                     slot[2] = fetch.Swizzle();
                     slot[3] = signs | (rawDepth << 8);
@@ -2348,24 +2511,53 @@ float4 main(float4 position : SV_Position) : SV_Target
             {
                 const uint8_t* source = g_memory.Translate<uint8_t>(PhysicalToVirtual(draw.indexBase));
                 bool index32 = draw.initiator.Index32();
-                for (uint32_t i = 0; i < count; i++)
+                if (!index32 && draw.indexEndian == 1 && (uintptr_t(source) & 1) == 0)
                 {
-                    uint32_t value;
-                    if (index32)
+                    // Common case, written so the compiler vectorizes it: 16 bit big endian indices (0xFFFF is the
+                    // strip reset, or a real index the guest GPU couldn't reach past anyway).
+                    const auto* values = reinterpret_cast<const uint16_t*>(source);
+                    uint32_t highest = 0;
+                    for (uint32_t i = 0; i < count; i++)
                     {
-                        memcpy(&value, source + i * 4, 4);
-                        value = GpuSwap(value, draw.indexEndian);
+                        uint16_t value = __builtin_bswap16(values[i]);
+                        uint32_t candidate = value == 0xFFFF && primitiveReset ? 0u : value;
+                        highest = highest > candidate ? highest : candidate;
                     }
-                    else
+                    maxIndex = highest;
+                }
+                else if (index32 && draw.indexEndian == 2 && (uintptr_t(source) & 3) == 0)
+                {
+                    const auto* values = reinterpret_cast<const uint32_t*>(source);
+                    uint32_t highest = 0;
+                    for (uint32_t i = 0; i < count; i++)
                     {
-                        uint16_t value16;
-                        memcpy(&value16, source + i * 2, 2);
-                        value = draw.indexEndian == 1 ? ByteSwap(value16) : value16;
-                        if (value == 0xFFFF && primitiveReset)
-                            continue;
+                        uint32_t value = __builtin_bswap32(values[i]);
+                        uint32_t candidate = value == UINT32_MAX ? 0u : value;
+                        highest = highest > candidate ? highest : candidate;
                     }
-                    if (value != UINT32_MAX)
-                        maxIndex = std::max(maxIndex, value);
+                    maxIndex = highest;
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < count; i++)
+                    {
+                        uint32_t value;
+                        if (index32)
+                        {
+                            memcpy(&value, source + i * 4, 4);
+                            value = GpuSwap(value, draw.indexEndian);
+                        }
+                        else
+                        {
+                            uint16_t value16;
+                            memcpy(&value16, source + i * 2, 2);
+                            value = draw.indexEndian == 1 ? ByteSwap(value16) : value16;
+                            if (value == 0xFFFF && primitiveReset)
+                                continue;
+                        }
+                        if (value != UINT32_MAX)
+                            maxIndex = std::max(maxIndex, value);
+                    }
                 }
             }
             else
@@ -2374,7 +2566,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
 
             int32_t indexOffset = int32_t(uint32_t(registers[VGT_INDX_OFFSET]));
-            static const bool fullBuffers = getenv("AR_FULL_VERTEX_BUFFERS") != nullptr;
+            static const bool fullBuffers = AR_ENV("AR_FULL_VERTEX_BUFFERS") != nullptr;
             if (known && !fullBuffers && indexOffset >= 0 && maxIndex < 0x1000000)
                 vertexCount = maxIndex + uint32_t(indexOffset) + 1;
         }
@@ -2464,11 +2656,11 @@ float4 main(float4 position : SV_Position) : SV_Target
         system.ndcOffset[2] = offsetZ;
         system.flags = ((vte >> 8) & 1) | (((vte >> 9) & 1) << 1) | (((vte >> 10) & 1) << 2);
         // Debugging (AR_HIGHLIGHT_PRIM=<primitive type>): those draws output solid magenta.
-        static const int highlightPrimitive = getenv("AR_HIGHLIGHT_PRIM") ? atoi(getenv("AR_HIGHLIGHT_PRIM")) : -1;
+        static const int highlightPrimitive = AR_ENV("AR_HIGHLIGHT_PRIM") ? atoi(AR_ENV("AR_HIGHLIGHT_PRIM")) : -1;
         if (int(draw.initiator.PrimType()) == highlightPrimitive)
             system.flags |= 16;
         // AR_HIGHLIGHT_PS=<hash prefix>: draws with that pixel shader output solid magenta.
-        static const char* highlightShader = getenv("AR_HIGHLIGHT_PS");
+        static const char* highlightShader = AR_ENV("AR_HIGHLIGHT_PS");
         if (highlightShader && pixelShader && fmt::format("{:016X}", pixelShader->hash).rfind(highlightShader, 0) == 0)
             system.flags |= 16;
         if (draw.initiator.PrimType() == PrimitiveType::PointList)
@@ -2513,8 +2705,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                 // later upload space (or the buffer's padding), which it never uses.
                 auto allocation = Upload(std::max<uint32_t>(count * 16, 256), 256);
                 auto* out = reinterpret_cast<uint32_t*>(allocation.cpu);
+                const auto* in = reinterpret_cast<const uint32_t*>(&registers[SHADER_CONSTANT_000_X + base * 4]);
                 for (uint32_t i = 0; i < count * 4; i++)
-                    out[i] = registers[SHADER_CONSTANT_000_X + base * 4 + i];
+                    out[i] = __builtin_bswap32(in[i]);
                 return allocation.gpu;
             };
         D3D12_GPU_VIRTUAL_ADDRESS vertexConstants = uploadFloatConstants(registers[0x2307], &vertexShader);
@@ -2549,12 +2742,22 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
             else
             {
-                for (uint32_t i = 0; i < count; i++)
+                if (draw.indexEndian == 1 && (uintptr_t(source) & 1) == 0)
                 {
-                    uint16_t value;
-                    memcpy(&value, source + i * 2, 2);
-                    value = draw.indexEndian == 1 ? ByteSwap(value) : value;
-                    memcpy(allocation.cpu + i * 2, &value, 2);
+                    const auto* in = reinterpret_cast<const uint16_t*>(source);
+                    auto* out = reinterpret_cast<uint16_t*>(allocation.cpu);
+                    for (uint32_t i = 0; i < count; i++)
+                        out[i] = __builtin_bswap16(in[i]);
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < count; i++)
+                    {
+                        uint16_t value;
+                        memcpy(&value, source + i * 2, 2);
+                        value = draw.indexEndian == 1 ? ByteSwap(value) : value;
+                        memcpy(allocation.cpu + i * 2, &value, 2);
+                    }
                 }
             }
             indexView = { allocation.gpu, size, index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
@@ -2596,7 +2799,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     textures += fmt::format(" tf{}=srv{}@{:08X}/fmt{}/{}x{}", i, system.textures[i][0],
                         registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0xFFFFF000, registers[SHADER_CONSTANT_FETCH_00_0 + i * 6 + 1] & 0x3F,
                         fetch.Width(), fetch.Height());
-                    if (getenv("AR_TRACE_FETCH"))
+                    if (AR_ENV("AR_TRACE_FETCH"))
                         textures += fmt::format("[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]", fetch.words[0], fetch.words[1],
                             fetch.words[2], fetch.words[3], fetch.words[4], fetch.words[5]);
                 }
@@ -2607,7 +2810,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 system.ndcScale[0], system.ndcScale[1], system.ndcScale[2], system.ndcOffset[0], system.ndcOffset[1], system.ndcOffset[2],
                 vte, key.blend[0], textures);
             // AR_TRACE_PS=<hash prefix>: the float constants that draw's shaders read.
-            if (const char* tracePs = getenv("AR_TRACE_PS"); tracePs && pixelShader &&
+            if (const char* tracePs = AR_ENV("AR_TRACE_PS"); tracePs && pixelShader &&
                 fmt::format("{:016X}", pixelShader->hash).rfind(tracePs, 0) == 0)
             {
                 LOGF_INFO("  loop constants 31 {:08X} 0 {:08X}, bool {:08X} {:08X}", uint32_t(registers[SHADER_CONSTANT_LOOP_00 + 31]),
@@ -2722,20 +2925,65 @@ float4 main(float4 position : SV_Position) : SV_Target
             Transition(*depthTarget, D3D12_RESOURCE_STATE_DEPTH_WRITE);
             dsv = CpuDsv(depthTarget->dsv);
         }
-        g.list->OMSetRenderTargets(key.renderTargetCount, rtvs, FALSE, depthTarget ? &dsv : nullptr);
-        SetViewportAndScissor(pitch * g_scale, RENDER_TARGET_HEIGHT * g_scale, Scaled(ScaleRect(GetScissor(registers), sampleScale)));
+        auto& state = g.drawState;
+        bool known = state.valid;
+        if (!known || state.renderTargetCount != key.renderTargetCount || memcmp(state.rtvs, rtvs, sizeof(rtvs)) != 0 ||
+            state.dsv.ptr != dsv.ptr)
+        {
+            g.list->OMSetRenderTargets(key.renderTargetCount, rtvs, FALSE, depthTarget ? &dsv : nullptr);
+            state.renderTargetCount = key.renderTargetCount;
+            memcpy(state.rtvs, rtvs, sizeof(rtvs));
+            state.dsv = dsv;
+        }
 
-        g.list->SetPipelineState(pipeline);
-        g.list->IASetPrimitiveTopology(topology);
+        uint32_t viewportWidth = pitch * g_scale, viewportHeight = RENDER_TARGET_HEIGHT * g_scale;
+        D3D12_RECT scissor = Scaled(ScaleRect(GetScissor(registers), sampleScale));
+        scissor.right = std::min<LONG>(scissor.right, LONG(viewportWidth));
+        scissor.bottom = std::min<LONG>(scissor.bottom, LONG(viewportHeight));
+        scissor.left = std::min(scissor.left, scissor.right);
+        scissor.top = std::min(scissor.top, scissor.bottom);
+        if (!known || state.viewportWidth != viewportWidth || state.viewportHeight != viewportHeight)
+        {
+            D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(viewportWidth), float(viewportHeight), 0.0f, 1.0f };
+            g.list->RSSetViewports(1, &viewport);
+            state.viewportWidth = viewportWidth;
+            state.viewportHeight = viewportHeight;
+        }
+        if (!known || memcmp(&state.scissor, &scissor, sizeof(scissor)) != 0)
+        {
+            g.list->RSSetScissorRects(1, &scissor);
+            state.scissor = scissor;
+        }
+
+        if (!known || state.pipeline != pipeline)
+        {
+            g.list->SetPipelineState(pipeline);
+            state.pipeline = pipeline;
+        }
+        if (!known || state.topology != topology)
+        {
+            g.list->IASetPrimitiveTopology(topology);
+            state.topology = topology;
+        }
         g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, systemConstants);
         g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, vertexConstants);
         g.list->SetGraphicsRootConstantBufferView(ROOT_PIXEL_FLOAT_CONSTANTS, pixelConstants);
-        g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu);
+        if (!known)
+            g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu);
 
         float blendFactor[4] = { RegisterFloat(registers, RB_BLEND_RED), RegisterFloat(registers, RB_BLEND_GREEN),
             RegisterFloat(registers, RB_BLEND_BLUE), RegisterFloat(registers, RB_BLEND_ALPHA) };
-        g.list->OMSetBlendFactor(blendFactor);
-        g.list->OMSetStencilRef(stencilRefMask & 0xFF);
+        if (!known || memcmp(state.blendFactor, blendFactor, sizeof(blendFactor)) != 0)
+        {
+            g.list->OMSetBlendFactor(blendFactor);
+            memcpy(state.blendFactor, blendFactor, sizeof(blendFactor));
+        }
+        if (!known || state.stencilRef != (stencilRefMask & 0xFF))
+        {
+            g.list->OMSetStencilRef(stencilRefMask & 0xFF);
+            state.stencilRef = stencilRefMask & 0xFF;
+        }
+        state.valid = true;
 
         if (indexed)
         {
@@ -2753,6 +3001,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static void Resolve(const be<uint32_t>* registers)
     {
+        g.textureLookups.clear();
         CopyControl control{ registers[RB_COPY_CONTROL] };
         SampleScale sampleScale = GetSampleScale(registers);
         uint32_t pitch = SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch();
@@ -2814,7 +3063,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         D3D12_RECT rect{ x0, y0, x1, y1 };
         uint32_t destBase = registers[RB_COPY_DEST_BASE] & 0x1FFFFFFF;
-        if (getenv("AR_LOG_PRESENT") && g.frameNumber >= 300 && g.frameNumber < 303 && destBase == 0x0CEF0000)
+        if (AR_ENV("AR_LOG_PRESENT") && g.frameNumber >= 300 && g.frameNumber < 303 && destBase == 0x0CEF0000)
             LOGF_INFO("frame {}: resolve to front buffer {},{}-{},{} from {} (base {}, pitch {}), command {}, clear {:X}", g.frameNumber,
                 x0, y0, x1, y1, sourceSelect, ColorInfo{ registers[RB_COLOR_INFO] }.Base(), pitch, control.Command(), (control.value >> 8) & 3);
         if (TraceThisFrame())
@@ -2827,7 +3076,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 (control.value >> 8) & 3, vertices[0], vertices[1], vertices[2], vertices[3], vertices[4], vertices[5]);
         CopyDestInfo destInfo{ registers[RB_COPY_DEST_INFO] };
         CopyDestPitch destPitch{ registers[RB_COPY_DEST_PITCH] };
-        if (getenv("AR_LOG_RESOLVES"))
+        if (AR_ENV("AR_LOG_RESOLVES"))
         {
             static std::set<uint64_t> logged;
             if (logged.insert((uint64_t(destBase) << 32) | (uint32_t(x1 - x0) << 16) | uint32_t(y1 - y0)).second)
@@ -2958,7 +3207,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                         depthSource ? UploadConstants(depthConstants) : UploadConstants(constants));
                     g.list->DrawInstanced(3, 1, 0, 0);
 
-                    if (TraceThisFrame() && source->format == DXGI_FORMAT_R8G8B8A8_UNORM && getenv("AR_DUMP_SOURCES"))
+                    if (TraceThisFrame() && source->format == DXGI_FORMAT_R8G8B8A8_UNORM && AR_ENV("AR_DUMP_SOURCES"))
                     {
                         static int sourceIndex;
                         SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
@@ -3106,14 +3355,14 @@ float4 main(float4 position : SV_Position) : SV_Target
                 else if (texture.format == DXGI_FORMAT_R32_FLOAT)
                 {
                     // Single floats: AR_DUMP_SCALE (default 100) maps to white; negative values are red.
-                    static const float scale = getenv("AR_DUMP_SCALE") ? float(atof(getenv("AR_DUMP_SCALE"))) : 100.0f;
+                    static const float scale = AR_ENV("AR_DUMP_SCALE") ? float(atof(AR_ENV("AR_DUMP_SCALE"))) : 100.0f;
                     float value;
                     memcpy(&value, row + x * 4, 4);
                     uint8_t gray = uint8_t(std::clamp(std::abs(value) / scale, 0.0f, 1.0f) * 255.0f);
                     out[0] = out[1] = gray;
                     out[2] = value < 0.0f || std::isnan(value) ? 255 : gray;
                 }
-                else if (getenv("AR_DUMP_ALPHA") && path.filename().string().rfind("resolve", 0) == 0)
+                else if (AR_ENV("AR_DUMP_ALPHA") && path.filename().string().rfind("resolve", 0) == 0)
                 {
                     out[0] = out[1] = out[2] = row[x * 4 + 3];
                 }
@@ -3165,16 +3414,17 @@ float4 main(float4 position : SV_Position) : SV_Target
         static auto lastReport = std::chrono::steady_clock::now();
         if (g.frameNumber % 300 == 150)
             SavePipelineCache();
-        if (g.frameNumber % 300 == 0 && g.frameNumber != 0 && getenv("AR_PROFILE"))
+        if (g.frameNumber % 300 == 0 && g.frameNumber != 0 && AR_ENV("AR_PROFILE"))
         {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double, std::milli>(now - lastReport).count();
             lastReport = now;
             LOGF_INFO("profile: {:.1f} fps; per frame {:.2f} ms draws ({:.0f} draws, textures {:.2f}, vertices {:.2f}, constants {:.2f}, "
-                "indices {:.2f}, pipeline {:.2f}, targets {:.2f}, setup {:.2f}, record {:.2f}, prepare {:.2f}, flushes {}, vertex MB {:.1f}), "
+                "indices {:.2f}, pipeline {:.2f}, targets {:.2f}, setup {:.2f}, record {:.2f}, prepare {:.2f}, flushes {}, vertex MB {:.1f}; texture lookups {} misses {} uploads {} hash {:.2f} decode {:.2f}), "
                 "pipelines created {} loaded {}, present {:.2f} (waiting {:.2f})",
                 300000.0 / elapsed, g_profile.draw / 300, g_profile.draws / 300.0, g_profile.textures / 300, g_profile.vertices / 300,
-                g_profile.constants / 300, g_profile.indices / 300, g_profile.pipeline / 300, g_profile.targets / 300, g_profile.setup / 300, g_profile.record / 300, g_profile.prepare / 300, g_profile.flushes, g_profile.vertexBytes / 300.0 / 1048576.0, g.pipelinesCreated, g.pipelinesLoaded,
+                g_profile.constants / 300, g_profile.indices / 300, g_profile.pipeline / 300, g_profile.targets / 300, g_profile.setup / 300, g_profile.record / 300, g_profile.prepare / 300, g_profile.flushes, g_profile.vertexBytes / 300.0 / 1048576.0, g_profile.textureLookups / 300,
+                g_profile.textureMisses / 300, g_profile.textureUploads, g_profile.textureHash / 300, g_profile.textureDecode / 300, g.pipelinesCreated, g.pipelinesLoaded,
                 g_profile.present / 300, g_profile.presentWait / 300);
             g_profile = {};
         }
@@ -3192,7 +3442,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             if (&it->second == frontBufferTexture)
                 resolved = it;
         }
-        if (getenv("AR_LOG_PRESENT") && (g.frameNumber % 150 == 0 || (g.frameNumber >= 300 && g.frameNumber < 303)))
+        if (AR_ENV("AR_LOG_PRESENT") && (g.frameNumber % 150 == 0 || (g.frameNumber >= 300 && g.frameNumber < 303)))
             LOGF_INFO("present {}: front buffer 0x{:08X} (packet 0x{:08X}, fetch {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}), {}", g.frameNumber, frontBuffer,
                 swap.frontBuffer, fetch.words[0], fetch.words[1], fetch.words[2], fetch.words[3], fetch.words[4], fetch.words[5], resolved != g.resolvedTextures.end() ? "found" : "not resolved");
 
@@ -3209,7 +3459,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         g.list->ClearRenderTargetView(rtv, black, 0, nullptr);
 
-        static const uint64_t screenshotInterval = getenv("AR_SCREENSHOT_INTERVAL") ? std::max(1, atoi(getenv("AR_SCREENSHOT_INTERVAL"))) : 300;
+        static const uint64_t screenshotInterval = AR_ENV("AR_SCREENSHOT_INTERVAL") ? std::max(1, atoi(AR_ENV("AR_SCREENSHOT_INTERVAL"))) : 300;
         if (resolved != g.resolvedTextures.end() && !g_screenshotFolder.empty() && g.frameNumber % screenshotInterval == 0 &&
             resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
         {

@@ -637,7 +637,7 @@ namespace imports
         }
 
         LOGF_WARNING("message box \"{}\": {} [{}] (focused {}, answered 0)", ReadWideString(title), ReadWideString(text), labels, activeButton);
-        if (getenv("AR_MESSAGE_BOX_STACK"))
+        if (AR_ENV("AR_MESSAGE_BOX_STACK"))
             PrintCurrentStack(16);
         return ShowSystemDialog(overlapped, [result] { *result = 0; return X_ERROR_SUCCESS; });
     }

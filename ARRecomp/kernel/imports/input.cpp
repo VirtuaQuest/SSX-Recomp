@@ -38,7 +38,7 @@ static void StartConnectionMonitor()
     static std::once_flag once;
     std::call_once(once, []
         {
-            g_connectedMask = QueryConnectedMask() | (getenv("AR_AUTO_PRESS") ? 1u : 0u);
+            g_connectedMask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") ? 1u : 0u);
             LOGF_INFO("controllers connected: mask 0x{:X}", g_connectedMask.load());
 
             std::thread([]
@@ -46,7 +46,7 @@ static void StartConnectionMonitor()
                     while (true)
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                        uint32_t mask = QueryConnectedMask() | (getenv("AR_AUTO_PRESS") ? 1u : 0u);
+                        uint32_t mask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") ? 1u : 0u);
                         uint32_t previous = g_connectedMask.exchange(mask);
                         if (mask != previous)
                         {
@@ -129,13 +129,13 @@ constexpr uint16_t AUTO_HOLD = 0x0800;
 static uint16_t AutoPressButtons(float& stickAngle)
 {
     stickAngle = -1.0f;
-    static const int period = getenv("AR_AUTO_PRESS") ? atoi(getenv("AR_AUTO_PRESS")) : 0;
+    static const int period = AR_ENV("AR_AUTO_PRESS") ? atoi(AR_ENV("AR_AUTO_PRESS")) : 0;
     static const auto start = std::chrono::steady_clock::now();
     if (period <= 0)
         return 0;
 
     // AR_AUTO_FRAMES: steps go by presented frames (period * 30 per step) instead of time, so slow runs stay in step.
-    static const bool byFrames = getenv("AR_AUTO_FRAMES") != nullptr;
+    static const bool byFrames = AR_ENV("AR_AUTO_FRAMES") != nullptr;
     auto elapsed = byFrames ? int64_t(gpu::d3d12::GetFrameNumber() * 1000 / 30) :
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     if (elapsed < period * 1000)
@@ -155,7 +155,7 @@ static uint16_t AutoPressButtons(float& stickAngle)
                 { "UP", XINPUT_GAMEPAD_DPAD_UP }, { "DOWN", XINPUT_GAMEPAD_DPAD_DOWN }, { "LEFT", XINPUT_GAMEPAD_DPAD_LEFT },
                 { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER },
                 { "LT", AUTO_LEFT_TRIGGER }, { "LTHOLD", AUTO_LEFT_TRIGGER | AUTO_HOLD } };
-            if (const char* text = getenv("AR_AUTO_SEQUENCE"))
+            if (const char* text = AR_ENV("AR_AUTO_SEQUENCE"))
             {
                 std::string list = text;
                 size_t start = 0;
@@ -203,7 +203,7 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
     if (!connected)
         memset(&state, 0, sizeof(state));
 
-    if (user == 0 && getenv("AR_AUTO_PRESS"))
+    if (user == 0 && AR_ENV("AR_AUTO_PRESS"))
     {
         // The packet number changes with the state, which is how titles notice input.
         static std::atomic<uint32_t> packet;
@@ -303,7 +303,7 @@ namespace imports
         XINPUT_CAPABILITIES host;
         if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(userIndex & 0xFF, XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
         {
-            if ((userIndex & 0xFF) != 0 || !getenv("AR_AUTO_PRESS"))
+            if ((userIndex & 0xFF) != 0 || !AR_ENV("AR_AUTO_PRESS"))
                 return X_ERROR_DEVICE_NOT_CONNECTED;
             host = {};
             host.Type = XINPUT_DEVTYPE_GAMEPAD;
@@ -365,7 +365,7 @@ namespace imports
         if (userIndex != nullptr)
             *userIndex = event.user;
 
-        if (getenv("AR_AUTO_PRESS"))
+        if (AR_ENV("AR_AUTO_PRESS"))
             LOGF_INFO("keystroke 0x{:04X} flags {} to user {} (requested 0x{:X})", event.virtualKey, event.flags, event.user, user);
         return X_ERROR_SUCCESS;
     }

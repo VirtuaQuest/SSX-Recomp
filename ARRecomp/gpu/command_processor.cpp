@@ -159,7 +159,7 @@ namespace gpu
 
             g_swapCounter++;
 
-            if (getenv("AR_LOG_GPU_WAITS"))
+            if (AR_ENV("AR_LOG_GPU_WAITS"))
             {
                 static int logged;
                 uint32_t value = *g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(0x0CCD7004));
@@ -340,7 +340,7 @@ namespace gpu
             uint32_t address = read() & ~3u;
             uint32_t length = read() & 0xFFFFF;
             LOGF_TRACE("indirect buffer 0x{:08X}, {} words", address, length);
-            if (getenv("AR_LOG_IBS") && g_frames >= 20 && g_frames < 24)
+            if (AR_ENV("AR_LOG_IBS") && g_frames >= 20 && g_frames < 24)
                 LOGF_INFO("frame {} depth {}: indirect buffer 0x{:08X}, {} words (ring position {})", g_frames.load(), g_indirectDepth,
                     address, length, reader.Position());
 
@@ -441,7 +441,7 @@ namespace gpu
         case PM4_MEM_WRITE:
         {
             uint32_t address = read();
-            if (getenv("AR_LOG_GPU_WAITS") && (address & ~3u) == 0x0CCD7004)
+            if (AR_ENV("AR_LOG_GPU_WAITS") && (address & ~3u) == 0x0CCD7004)
             {
                 static int logged;
                 if (logged++ < 20)
@@ -474,7 +474,7 @@ namespace gpu
                 }
             }
 
-            if (getenv("AR_LOG_GPU_WAITS"))
+            if (AR_ENV("AR_LOG_GPU_WAITS"))
             {
                 double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
                 static int logged;
@@ -529,9 +529,9 @@ namespace gpu
             WriteRegister(VGT_EVENT_INITIATOR, initiator & 0x3F);
             WriteMemory(address, (initiator >> 31) ? g_swapCounter.load() : value);
 
-            if (getenv("AR_LOG_IBS") && g_frames >= 20 && g_frames < 24)
+            if (AR_ENV("AR_LOG_IBS") && g_frames >= 20 && g_frames < 24)
                 LOGF_INFO("frame {}: fence write {} to 0x{:08X}", g_frames.load(), value, address);
-            if (getenv("AR_LOG_FENCES"))
+            if (AR_ENV("AR_LOG_FENCES"))
             {
                 static std::map<uint32_t, uint32_t> last;
                 static int logged;
@@ -615,7 +615,7 @@ namespace gpu
                 {
                     auto submitted = g_swapTimes.front();
                     g_swapTimes.pop_front();
-                    if (getenv("AR_LOG_SWAP_LATENCY") != nullptr && (frame % 30) == 0)
+                    if (AR_ENV("AR_LOG_SWAP_LATENCY") != nullptr && (frame % 30) == 0)
                         LOGF_INFO("frame {}: swap latency {:.1f} ms, {} swaps queued", frame,
                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submitted).count(), g_swapTimes.size());
                 }
@@ -730,7 +730,7 @@ namespace gpu
             }
 
             lastWork = std::chrono::steady_clock::now();
-            if (getenv("AR_LOG_FENCES") && writePointer < g_readPointer)
+            if (AR_ENV("AR_LOG_FENCES") && writePointer < g_readPointer)
             {
                 static int logged;
                 if (logged++ < 30)
