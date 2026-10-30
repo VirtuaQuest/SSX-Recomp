@@ -194,20 +194,24 @@ namespace gpu::d3d12
     static uint64_t SampleHash(const uint8_t* data, size_t size)
     {
         constexpr size_t SAMPLES = 64, CHUNK = 64;
-        uint64_t hash = size;
+        // Four independent lanes, so the multiplications overlap.
+        uint64_t lanes[4] = { size, 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull };
         size_t step = (size - CHUNK) / (SAMPLES - 1);
         for (size_t i = 0; i < SAMPLES; i++)
         {
             const uint8_t* chunk = data + std::min(i * step, size - CHUNK);
-            for (size_t j = 0; j < CHUNK; j += 8)
+            for (size_t j = 0; j < CHUNK; j += 32)
             {
-                uint64_t value;
-                memcpy(&value, chunk + j, 8);
-                hash = (hash ^ value) * 0x100000001B3ull;
-                hash ^= hash >> 29;
+                for (int lane = 0; lane < 4; lane++)
+                {
+                    uint64_t value;
+                    memcpy(&value, chunk + j + lane * 8, 8);
+                    lanes[lane] = (lanes[lane] ^ value) * 0x100000001B3ull;
+                    lanes[lane] ^= lanes[lane] >> 29;
+                }
             }
         }
-        return hash;
+        return lanes[0] ^ (lanes[1] * 3) ^ (lanes[2] * 5) ^ (lanes[3] * 7);
     }
 
     // Returns whether the contents changed since the last check (always true the first time).
@@ -392,11 +396,20 @@ namespace gpu::d3d12
     } static g_profile;
 
     // Adds the time since the last lap to a profile slot.
+    // Timing of the stages of a draw costs several clock reads per draw, so it is measured only with AR_PROFILE.
+    static bool DetailedProfile()
+    {
+        static const bool enabled = AR_ENV("AR_PROFILE") != nullptr;
+        return enabled;
+    }
+
     struct LapTimer
     {
-        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last = DetailedProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         void Lap(double& target)
         {
+            if (!DetailedProfile())
+                return;
             auto now = std::chrono::steady_clock::now();
             target += std::chrono::duration<double, std::milli>(now - last).count();
             last = now;
@@ -408,6 +421,17 @@ namespace gpu::d3d12
         double& target;
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         ~ScopedTimer() { target += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+    };
+    // A stage of a draw, timed only with AR_PROFILE.
+    struct DetailTimer
+    {
+        double& target;
+        std::chrono::steady_clock::time_point start = DetailedProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~DetailTimer()
+        {
+            if (DetailedProfile())
+                target += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
     };
 
     static D3D12_CPU_DESCRIPTOR_HANDLE CpuView(uint32_t index)
@@ -1578,7 +1602,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             hashLap.Lap(g_profile.textureHash);
             if (changed)
             {
-                ScopedTimer decodeTimer{ g_profile.textureDecode };
+                DetailTimer decodeTimer{ g_profile.textureDecode };
                 g_profile.textureUploads++;
                 DecodedTexture decoded;
                 if (!DecodeTexture(fetch, decoded))
@@ -1861,7 +1885,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
         }
 
-        std::vector<std::pair<uint64_t, std::pair<const RenderTargetKey*, Texture*>>> newer;
+        static thread_local std::vector<std::pair<uint64_t, std::pair<const RenderTargetKey*, Texture*>>> newer;
+        newer.clear();
         for (const RenderTargetKey& candidate : g.renderTargetOverlaps[key])
         {
             auto found = g.renderTargets.find(candidate);
@@ -2646,15 +2671,16 @@ float4 main(float4 position : SV_Position) : SV_Target
             };
         {
             setupLap.Lap(g_profile.setup);
-            ScopedTimer textureTimer{ g_profile.textures };
+            DetailTimer textureTimer{ g_profile.textures };
             bindTextures(vertexShader);
             if (pixelShader)
                 bindTextures(*pixelShader);
         }
-        auto textureEnd = std::chrono::steady_clock::now();
+        auto textureEnd = DetailedProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
-        // Index data.
-        std::vector<uint32_t> indices;
+        // Index data (buffers reused from draw to draw, to save allocations).
+        static thread_local std::vector<uint32_t> indices;
+        indices.clear();
         bool indexed = draw.initiator.Source() != SourceSelect::AutoIndex;
         bool primitiveReset = ((modeControl >> 21) & 1) && (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP || topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
         // Strips whose reset index is the host's cut value for the index size use the guest indices as they are.
@@ -2785,7 +2811,8 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         uint64_t frameBase = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
         uint64_t uploadSize = 3 * 4096 + indices.size() * 4 + size_t(count) * 4;
-        std::vector<std::pair<uint32_t, uint32_t>> vertexRanges;
+        static thread_local std::vector<std::pair<uint32_t, uint32_t>> vertexRanges;
+        vertexRanges.clear();
         for (const auto& binding : vertexShader.shader->vertex_bindings())
         {
             uint32_t index = binding.fetch_constant;
@@ -2813,7 +2840,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
 
         LapTimer lap;
-        g_profile.prepare += std::chrono::duration<double, std::milli>(lap.last - textureEnd).count();
+        if (DetailedProfile())
+            g_profile.prepare += std::chrono::duration<double, std::milli>(lap.last - textureEnd).count();
         for (auto [index, size] : vertexRanges)
         {
             if (size == 0)
