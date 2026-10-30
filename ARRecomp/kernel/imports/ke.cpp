@@ -94,7 +94,11 @@ namespace imports
         }
 
         if (auto thread = FindThreadByKThread(kthread))
+        {
             SetThreadPriority(thread->hostThread, HostPriority(increment));
+            if (AR_ENV("AR_LOG_PRIORITIES"))
+                LOGF_INFO("thread {} (start 0x{:08X}) priority {}", thread->threadId, thread->params.startAddress, increment);
+        }
 
         return previous;
     }

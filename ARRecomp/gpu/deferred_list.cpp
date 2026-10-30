@@ -34,7 +34,7 @@ namespace gpu::d3d12
             std::thread([this]
                 {
                     SetThreadDescription(GetCurrentThread(), L"GPU submission");
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
                     Run();
                 }).detach();
         }

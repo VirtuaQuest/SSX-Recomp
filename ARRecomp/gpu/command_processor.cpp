@@ -775,8 +775,9 @@ namespace gpu
     static void RunCommandProcessor()
     {
         // It does the work of a whole GPU front end (and the host renderer's recording) on one thread: keep it from
-        // being preempted by guest threads, and off efficiency cores where the CPU has them.
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        // being preempted by guest threads (the title's streaming threads ask for high priorities) or other programs,
+        // and off efficiency cores where the CPU has them. It sleeps when there is no work, so it can't hog a core.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         if (!AR_ENV("AR_NO_CPU_SETS"))
         {
             ULONG length = 0;

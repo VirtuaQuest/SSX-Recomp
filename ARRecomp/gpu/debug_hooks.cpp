@@ -1,14 +1,37 @@
 #include <stdafx.h>
 #include <kernel/memory.h>
 
-// Diagnostics for D3D occlusion queries (AR_LOG_QUERIES): how long IDirect3DQuery9::GetData keeps reporting a
+// IDirect3DQuery9::GetData. Diagnostics for D3D occlusion queries (AR_LOG_QUERIES): how long it keeps reporting a
 // query as pending, with the query's fence and the device's fence progress.
 PPC_FUNC_IMPL(__imp__sub_8223F950);
 PPC_FUNC(sub_8223F950)
 {
     static const bool enabled = AR_ENV("AR_LOG_QUERIES") != nullptr;
     uint32_t query = ctx.r3.u32;
+    uint32_t output = ctx.r4.u32, outputSize = ctx.r5.u32;
     __imp__sub_8223F950(ctx, base);
+
+    // Occlusion queries aren't measured: the command processor advances the sample counter by a fixed amount, so a
+    // completed query always returns 4096 samples. The title polls GetData until the GPU reaches the query (several
+    // milliseconds a frame), so pending occlusion queries are answered with that result right away instead
+    // (AR_WAIT_QUERIES=1 keeps the polling).
+    static const bool waitQueries = AR_ENV("AR_WAIT_QUERIES") != nullptr;
+    if (!waitQueries && ctx.r3.u32 == 1 && PPC_LOAD_U32(query + 4) == 9 && outputSize == 4)
+    {
+        PPC_STORE_U32(output, 4096);
+        ctx.r3.u64 = 0;
+    }
+
+    // AR_LOG_QUERY_RESULTS: what completed queries return.
+    static const bool logResults = AR_ENV("AR_LOG_QUERY_RESULTS") != nullptr;
+    if (logResults && ctx.r3.u32 == 0)
+    {
+        static int logged;
+        if (logged++ < 40)
+            LOGF_INFO("query 0x{:08X} type {} result {} size {}: {} {} {}", query, PPC_LOAD_U32(query + 4), PPC_LOAD_U32(output), outputSize,
+                outputSize >= 16 ? PPC_LOAD_U32(output + 4) : 0, outputSize >= 16 ? PPC_LOAD_U32(output + 8) : 0,
+                outputSize >= 16 ? PPC_LOAD_U32(output + 12) : 0);
+    }
     if (!enabled)
         return;
 
@@ -32,6 +55,25 @@ PPC_FUNC(sub_8223F950)
     if (pendingQuery == query)
     {
         double waited = std::chrono::duration<double, std::milli>(now - pendingSince).count();
+        // Summary every 5 seconds: how long the title spent waiting for query results.
+        static std::mutex mutex;
+        static double total, longest;
+        static uint32_t waits;
+        static auto lastSummary = now;
+        {
+            std::lock_guard lock(mutex);
+            total += waited;
+            longest = std::max(longest, waited);
+            waits++;
+            if (now - lastSummary > std::chrono::seconds(5))
+            {
+                LOGF_INFO("query waits: {} in {:.1f} s, {:.0f} ms total ({:.1f} ms average, {:.1f} ms longest)", waits,
+                    std::chrono::duration<double>(now - lastSummary).count(), total, total / waits, longest);
+                lastSummary = now;
+                total = longest = 0.0;
+                waits = 0;
+            }
+        }
         static int logged;
         if (waited > 5.0 && logged++ < 40)
         {
