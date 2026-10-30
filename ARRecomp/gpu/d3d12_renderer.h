@@ -25,6 +25,9 @@ namespace gpu::d3d12
     void Draw(const be<uint32_t>* registers, const DrawCall& draw, const HostShader& vertexShader, const HostShader* pixelShader);
     void Present(const be<uint32_t>* registers, const SwapInfo& swap);
 
+    // Diagnostics: whether the current frame is traced (AR_TRACE_FRAME / AR_TRACE_FRAMES).
+    bool TraceThisFrame();
+
     // Saves the front buffer every 300 frames (AR_SCREENSHOT_INTERVAL), for debugging.
     void EnableScreenshots(const std::filesystem::path& folder);
 

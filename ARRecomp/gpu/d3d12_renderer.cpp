@@ -1136,7 +1136,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         return true;
     }
 
-    static bool TraceThisFrame();
+    bool TraceThisFrame();
     static void SaveScreenshot(struct Texture& texture, uint32_t width, uint32_t height, const std::filesystem::path& path,
         bool swapRedBlue = false);
 
@@ -2343,8 +2343,10 @@ float4 main(float4 position : SV_Position) : SV_Target
     // Logs every draw of one frame, for debugging (frame number from AR_TRACE_FRAME).
     bool TraceThisFrame()
     {
+        // AR_TRACE_FRAMES traces that many frames from AR_TRACE_FRAME on.
         static int64_t frame = AR_ENV("AR_TRACE_FRAME") ? atoll(AR_ENV("AR_TRACE_FRAME")) : -1;
-        return int64_t(g.frameNumber) == frame;
+        static int64_t count = AR_ENV("AR_TRACE_FRAMES") ? std::max(1ll, atoll(AR_ENV("AR_TRACE_FRAMES"))) : 1;
+        return frame >= 0 && int64_t(g.frameNumber) >= frame && int64_t(g.frameNumber) < frame + count;
     }
 
     void Draw(const be<uint32_t>* registers, const DrawCall& draw, const HostShader& vertexShader, const HostShader* pixelShader)
@@ -2383,6 +2385,28 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             std::string hash = fmt::format("{:016X}", pixelShader->hash);
             for (const auto& prefix : skippedShaders)
+            {
+                if (hash.rfind(prefix, 0) == 0)
+                    return;
+            }
+        }
+        // AR_SKIP_VS: the same for vertex shaders.
+        static const std::vector<std::string> skippedVertexShaders = []
+            {
+                std::vector<std::string> list;
+                if (const char* text = AR_ENV("AR_SKIP_VS"))
+                {
+                    std::stringstream stream(text);
+                    std::string item;
+                    while (std::getline(stream, item, ','))
+                        list.push_back(item);
+                }
+                return list;
+            }();
+        if (!skippedVertexShaders.empty())
+        {
+            std::string hash = fmt::format("{:016X}", vertexShader.hash);
+            for (const auto& prefix : skippedVertexShaders)
             {
                 if (hash.rfind(prefix, 0) == 0)
                     return;
@@ -2808,7 +2832,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (shader)
                 {
                     const auto& map = shader->shader->constant_register_map();
-                    if (map.float_dynamic_addressing)
+                    static const bool fullConstants = AR_ENV("AR_FULL_CONSTANTS") != nullptr;
+                    if (map.float_dynamic_addressing || fullConstants)
                         count = 256;
                     for (uint32_t i = 0; i < 4; i++)
                     {
@@ -2832,6 +2857,52 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_GPU_VIRTUAL_ADDRESS systemConstants = UploadConstants(system);
 
         lap.Lap(g_profile.constants);
+
+        // Diagnostics (AR_SHADOW_LOG with AR_DUMP_FRAME/AR_DUMP_FRAMES): one short line per draw into the shadow map
+        // depth buffer (EDRAM base 128, pitch 1040), cheap enough to keep the game at full speed.
+        static const bool shadowLog = AR_ENV("AR_SHADOW_LOG") != nullptr;
+        if (shadowLog && depthTarget && SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch() == 1040 &&
+            DepthInfo{ registers[RB_DEPTH_INFO] }.Base() == 128)
+        {
+            static const int64_t first = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : 0;
+            static const int64_t frames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+            if (int64_t(g.frameNumber) >= first && int64_t(g.frameNumber) < first + frames)
+            {
+                uint32_t vsBase = std::min<uint32_t>(registers[0x2307] & 0x1FF, 256);
+                const auto* c = reinterpret_cast<const uint8_t*>(&registers[SHADER_CONSTANT_000_X + vsBase * 4]);
+                uint32_t address = vertexRanges.empty() ? 0 : registers[SHADER_CONSTANT_FETCH_00_0 + vertexRanges[0].first * 2] & 0x1FFFFFFC;
+                LOGF_INFO("S {} {:08X} {:08X} {} {} {:016X} {:016X}", g.frameNumber, uint32_t(vertexShader.hash >> 32), address,
+                    int32_t(uint32_t(registers[VGT_INDX_OFFSET])), count, HashMemory(c + 16 * 16, 4 * 16), HashMemory(c + 28 * 16, 4 * 16));
+                static uint64_t lastLight;
+                uint64_t light = HashMemory(c + 28 * 16, 4 * 16);
+                if (light != lastLight)
+                {
+                    lastLight = light;
+                    float m[16];
+                    for (uint32_t i = 0; i < 16; i++)
+                        m[i] = RegisterFloat(registers, SHADER_CONSTANT_000_X + (vsBase + 28) * 4 + i);
+                    LOGF_INFO("L {} {:016X} {} {} {} {} | {} {} {} {} | {} {} {} {} | {} {} {} {}", g.frameNumber, light, m[0], m[1], m[2], m[3],
+                        m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+                }
+            }
+        }
+
+        // Diagnostics (AR_TRACE_INPUTS with AR_TRACE_FRAME): hashes of what each draw reads, to compare frames.
+        static const bool traceInputs = AR_ENV("AR_TRACE_INPUTS") != nullptr;
+        if (traceInputs && TraceThisFrame())
+        {
+            uint64_t vertexHash = 0;
+            for (auto [index, size] : vertexRanges)
+            {
+                uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
+                vertexHash ^= HashMemory(g_memory.Translate<uint8_t>(PhysicalToVirtual(address)), size) + index;
+            }
+            uint32_t vsBase = std::min<uint32_t>(registers[0x2307] & 0x1FF, 256);
+            uint64_t constantHash = HashMemory(reinterpret_cast<const uint8_t*>(&registers[SHADER_CONSTANT_000_X + vsBase * 4]), 64 * 16);
+            LOGF_INFO("  inputs vertices {:016X} indices {:016X} vs constants {:016X} index offset {} max index {}", vertexHash,
+                indices.empty() ? 0 : HashMemory(reinterpret_cast<const uint8_t*>(indices.data()), indices.size() * 4), constantHash,
+                int32_t(uint32_t(registers[VGT_INDX_OFFSET])), vertexCount);
+        }
         D3D12_INDEX_BUFFER_VIEW indexView{};
         if (indexed && !indices.empty())
         {
@@ -2949,7 +3020,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     }
                 }
             }
-            LOGF_INFO("  colorcontrol {:08X}", uint32_t(registers[RB_COLORCONTROL]));
+            LOGF_INFO("  colorcontrol {:08X} clip {:08X}", uint32_t(registers[RB_COLORCONTROL]), uint32_t(registers[PA_CL_CLIP_CNTL]));
             LOGF_INFO("  line {:08X} point {:08X} {:08X}", uint32_t(registers[0x2282]), uint32_t(registers[PA_SU_POINT_SIZE]),
                 uint32_t(registers[PA_SU_POINT_MINMAX]));
             LOGF_INFO("  surface {:08X} color {:08X} depth {:08X} window {:08X} vport {} {} {} {}", uint32_t(registers[RB_SURFACE_INFO]),
@@ -3043,7 +3114,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             dsv = CpuDsv(depthTarget->dsv);
         }
         auto& state = g.drawState;
-        bool known = state.valid;
+        static const bool noStateCache = AR_ENV("AR_NO_STATE_CACHE") != nullptr;
+        bool known = state.valid && !noStateCache;
         if (!known || state.renderTargetCount != key.renderTargetCount || memcmp(state.rtvs, rtvs, sizeof(rtvs)) != 0 ||
             state.dsv.ptr != dsv.ptr)
         {
@@ -3330,10 +3402,30 @@ float4 main(float4 position : SV_Position) : SV_Target
                         static int sourceIndex;
                         SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
                     }
-                    if (TraceThisFrame() && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || destFormat == DXGI_FORMAT_R32_FLOAT))
+                    // AR_DUMP_ONLY limits the dumps to resolves to the listed addresses (hex, comma separated).
+                    static const std::vector<uint32_t> dumpOnly = []
+                        {
+                            std::vector<uint32_t> addresses;
+                            for (const char* text = AR_ENV("AR_DUMP_ONLY"); text && *text;)
+                            {
+                                char* end;
+                                addresses.push_back(uint32_t(strtoul(text, &end, 16)));
+                                text = *end == ',' ? end + 1 : end;
+                                if (end == text)
+                                    break;
+                            }
+                            return addresses;
+                        }();
+                    // AR_DUMP_FRAME / AR_DUMP_FRAMES dump resolves like a traced frame without logging every draw.
+                    static const int64_t dumpFrame = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : -1;
+                    static const int64_t dumpFrames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+                    bool dumpThisFrame = TraceThisFrame() ||
+                        (dumpFrame >= 0 && int64_t(g.frameNumber) >= dumpFrame && int64_t(g.frameNumber) < dumpFrame + dumpFrames);
+                    if (dumpThisFrame && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || destFormat == DXGI_FORMAT_R32_FLOAT) &&
+                        (dumpOnly.empty() || std::find(dumpOnly.begin(), dumpOnly.end(), destBase) != dumpOnly.end()))
                     {
                         static int resolveIndex;
-                        SaveScreenshot(resolved.texture, destWidth * g_scale, destHeight * g_scale, fmt::format("screenshots/resolve_{:02}_{:08X}.bmp", resolveIndex++, destBase));
+                        SaveScreenshot(resolved.texture, destWidth * g_scale, destHeight * g_scale, fmt::format("screenshots/resolve_{:06}_{:02}_{:08X}.bmp", g.frameNumber, resolveIndex++ % 100, destBase));
                     }
                 }
             }

@@ -6,6 +6,7 @@
 #include "registers.h"
 #include "video_settings.h"
 #include "renderer.h"
+#include "d3d12_renderer.h"
 
 namespace gpu
 {
@@ -271,6 +272,22 @@ namespace gpu
     }
 
     // SET_CONSTANT and LOAD_ALU_CONSTANT address one of the constant blocks, or the context registers.
+    struct ConstantLoad
+    {
+        uint32_t address, sizeWords;
+        uint64_t hash;
+    };
+    static const bool g_checkConstantLoads = AR_ENV("AR_CHECK_ALU") != nullptr;
+    static std::vector<ConstantLoad> g_constantLoads;
+
+    static uint64_t CheckHash(const be<uint32_t>* data, uint32_t words)
+    {
+        uint64_t hash = 0xCBF29CE484222325ull;
+        for (uint32_t i = 0; i < words; i++)
+            hash = (hash ^ data[i].get()) * 0x100000001B3ull;
+        return hash;
+    }
+
     static uint32_t ConstantRegister(uint32_t offsetType)
     {
         static constexpr uint32_t bases[] = { SHADER_CONSTANT_000_X, SHADER_CONSTANT_FETCH_00_0,
@@ -412,6 +429,10 @@ namespace gpu
             uint32_t base = ConstantRegister(read());
             uint32_t sizeWords = read() & 0xFFF;
             auto* source = g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(address));
+            if (d3d12::TraceThisFrame())
+                LOGF_INFO("load alu constant from 0x{:08X} to register 0x{:04X}, {} words", address, base, sizeWords);
+            if (g_checkConstantLoads)
+                g_constantLoads.push_back({ address, sizeWords, CheckHash(source, sizeWords) });
             for (uint32_t i = 0; i < sizeWords; i++)
                 WriteRegister(base + i, source[i]);
             break;
@@ -595,10 +616,17 @@ namespace gpu
         case PM4_XE_SWAP:
         {
             uint64_t frame = ++g_frames;
-            if (frame == 1 || frame % 600 == 0)
             {
+                // How many swaps the CPU has submitted beyond this one, counted over 300 frames.
                 std::lock_guard lock(g_swapTimesMutex);
-                LOGF_INFO("frame {} ({} swaps submitted but not reached)", frame, g_swapTimes.size());
+                static uint32_t ahead[4];
+                ahead[std::min<size_t>(g_swapTimes.size() > 0 ? g_swapTimes.size() - 1 : 0, 3)]++;
+                if (frame == 1 || frame % 300 == 0)
+                {
+                    LOGF_INFO("frame {} ({} swaps submitted but not reached; CPU ahead by 0/1/2/3+ frames: {} {} {} {})", frame,
+                        g_swapTimes.size(), ahead[0], ahead[1], ahead[2], ahead[3]);
+                    memset(ahead, 0, sizeof(ahead));
+                }
             }
 
             // Written by VdSwap: 'SWAP', the front buffer's physical address and size, then its fetch constant.
@@ -621,6 +649,41 @@ namespace gpu
                 }
             }
             Swap(Registers(), swap);
+
+            // Diagnostics (AR_CHECK_ALU): constant blocks whose memory changed between being loaded and the swap.
+            if (g_checkConstantLoads)
+            {
+                static uint64_t loads, changed;
+                for (const auto& load : g_constantLoads)
+                {
+                    loads++;
+                    if (CheckHash(g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(load.address)), load.sizeWords) != load.hash)
+                        changed++;
+                }
+                g_constantLoads.clear();
+                if (frame % 30 == 0)
+                {
+                    LOGF_INFO("constant loads: {} in 30 frames, {} changed before the swap", loads, changed);
+                    loads = changed = 0;
+                }
+            }
+
+            // Experiment (AR_GPU_LAG): start on the next frame's commands only once the CPU has submitted all of them
+            // (its swap), as a GPU running a frame behind would.
+            static const bool lag = AR_ENV("AR_GPU_LAG") != nullptr;
+            if (lag)
+            {
+                auto start = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100))
+                {
+                    {
+                        std::lock_guard lock(g_swapTimesMutex);
+                        if (!g_swapTimes.empty())
+                            break;
+                    }
+                    std::this_thread::yield();
+                }
+            }
             break;
         }
 

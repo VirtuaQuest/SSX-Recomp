@@ -101,6 +101,18 @@ constexpr auto WAIT_RECHECK = std::chrono::milliseconds(10);
 
 static void WakeWaiters(XDISPATCHER_HEADER* header)
 {
+    // Experiment (AR_WAKE_ALL): wake every waiter on every signal, as the single condition variable did.
+    static const bool wakeAll = getenv("AR_WAKE_ALL") != nullptr;
+    if (wakeAll)
+    {
+        for (auto& [other, waiters] : g_waiters)
+        {
+            for (Waiter* waiter : waiters)
+                waiter->condition.notify_one();
+        }
+        return;
+    }
+
     auto it = g_waiters.find(header);
     if (it == g_waiters.end())
         return;
