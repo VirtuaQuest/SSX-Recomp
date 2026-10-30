@@ -96,6 +96,9 @@ texture lookups. What mattered, roughly in order:
 4. Record D3D12 commands on the GPU thread but replay, submit and present on a second thread (`gpu/deferred_list.*`).
    Render target and depth views are read when commands are replayed, so free their descriptors only after the frame.
 5. Thread priorities: the GPU command processor runs at time critical priority and sleeps when idle.
+6. Compiler flags: RelWithDebInfo defaults to /Ob1 (only explicitly inline functions are inlined); /Ob2 made heavy
+   scenes 10-20% faster. Name pipeline library entries by state key and shader bytecode, or entries from older
+   builds collide with new ones and those pipelines get recompiled every run.
 
 Profile instead of guessing: `AR_HOST_PROFILE=command` (the GPU thread) and `AR_THREAD_PROFILE=1` (guest threads)
 show where time goes; idle time in the GPU thread means the title is the bottleneck.
@@ -136,14 +139,16 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 
 ## Open issues
 
-- Distant shadows occasionally flicker: on some frames the far cascade renders differently although the draws,
-  vertex/index data, world matrices and light matrix match the neighbouring frames. Ruled out: clears, constant load
-  races, CPU running ahead, upload ring reuse, thread wakeups, constant sizing, the state cache, change detection,
-  depth clipping, EDRAM overlaps. It disappears when logging slows the game. Not yet checked per draw: bool/loop
-  constants, cull mode (PA_SU_SC_MODE_CNTL), vertex fetch formats. Tools: `tools/test/shadow_flicker.sh`,
-  `AR_SHADOW_LOG`, `drawsets.py`, `worldcmp.py`.
+- Distant shadows occasionally flicker. Cause found, fix not yet: the title itself issues some large shadow casters
+  (whole buildings drawn with the instanced shaders 497B89DE/4631A8B4, e.g. vertex buffer 0x126320A0) into the far
+  cascade on some frames and not on others; the renderer draws exactly what it gets (inputs, upload memory, D3D12
+  state and GPU validation all check out, and the clears leave empty maps when casters are skipped). Next: hook the
+  title's draw call for that mesh, log the guest call stack and find the culling decision (a job system race or time
+  sliced culling behaving differently with recompiled timing are the main suspects; kernel waits don't time out).
+  Lesson: compare draws per instance (mesh plus world matrix), not per mesh, or extra instances stay invisible.
 - Short bursts (about 2 s) where the GPU thread is uniformly ~4x slower, mostly with other games running.
-- 120 fps setting: correct speed, but fights reach 50-64 fps.
+- 120 fps setting: correct speed; light scenes 110-120 fps, the heaviest fights 56-85 (the GPU command processor
+  thread is saturated, and the title's render thread is close behind).
 - Angular light patches around characters in tiled deferred lighting (pixel shader E9891C vs 57FBD2), possibly a
   translation bug; thin vertical ticks under ledge edges in the Foundry.
 - Anti-aliasing is a placeholder in the launcher.

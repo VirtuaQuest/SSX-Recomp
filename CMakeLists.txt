@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# RelWithDebInfo defaults to /Ob1 (only functions marked inline are inlined), which costs the recompiled code and
+# the renderer a lot; inline like Release does.
+foreach (flags CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+    string(REPLACE "/Ob1" "/Ob2" ${flags} "${${flags}}")
+endforeach()
+
 if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR "The recompiled code requires Clang (clang-cl on Windows).")
 endif()

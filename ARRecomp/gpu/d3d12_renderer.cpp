@@ -138,6 +138,13 @@ namespace gpu::d3d12
         std::vector<uint32_t> releasedDsvs;
         // Released textures, reusable (by CreateTexture) once the GPU is done with this frame.
         std::vector<Texture> pooledTextures;
+        // Diagnostics (AR_CHECK_UPLOADS): upload memory the frame's draws read, checked once the GPU is done.
+        struct UploadCheck
+        {
+            uint64_t offset, size, hash, frame;
+            const char* what;
+        };
+        std::vector<UploadCheck> uploadChecks;
     };
 
     struct RenderTargetKey
@@ -520,6 +527,25 @@ namespace gpu::d3d12
             WaitForFence(frame.fenceValue);
         }
         frame.releasedResources.clear();
+        if (!frame.uploadChecks.empty())
+        {
+            static uint64_t checked, changed;
+            for (const auto& check : frame.uploadChecks)
+            {
+                checked++;
+                if (HashMemory(g.uploadCpu + check.offset, check.size) != check.hash)
+                {
+                    static uint32_t logged;
+                    if (logged++ < 50)
+                        LOGF_WARNING("upload memory changed before the GPU was done: {} at offset 0x{:X}, {} bytes, recorded in frame {}",
+                            check.what, check.offset, check.size, check.frame);
+                    changed++;
+                }
+            }
+            frame.uploadChecks.clear();
+            if (g.frameNumber % 300 == 0)
+                LOGF_INFO("upload checks: {} checked, {} changed", checked, changed);
+        }
         for (Texture& pooled : frame.pooledTextures)
             g.texturePool[pooled.poolKey].emplace_back(std::move(pooled), g.frameNumber);
         frame.pooledTextures.clear();
@@ -578,6 +604,17 @@ namespace gpu::d3d12
         BindHeaps();
     }
 
+    static uint64_t HashMemory(const uint8_t* data, size_t size);
+
+    // Diagnostics (AR_CHECK_UPLOADS): remembers what a draw reads from the upload buffer, to check after the GPU has
+    // executed the frame that nothing overwrote it in the meantime.
+    static bool CheckUploads()
+    {
+        static const bool enabled = AR_ENV("AR_CHECK_UPLOADS") != nullptr;
+        return enabled;
+    }
+    static void NoteUpload(uint64_t offset, uint64_t size, const char* what);
+
     static UploadAllocation Upload(uint64_t size, uint64_t alignment)
     {
         uint64_t frameBase = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
@@ -594,6 +631,11 @@ namespace gpu::d3d12
 
         g.uploadOffset = offset + size;
         return { g.uploadCpu + offset, g.uploadGpu + offset, offset };
+    }
+
+    static void NoteUpload(uint64_t offset, uint64_t size, const char* what)
+    {
+        g.frames[g.frameIndex].uploadChecks.push_back({ offset, size, HashMemory(g.uploadCpu + offset, size), g.frameNumber, what });
     }
 
     template<typename T>
@@ -989,11 +1031,17 @@ float4 main(float4 position : SV_Position) : SV_Target
         HWND hwnd = window::Create("Anarchy Reigns");
         g_scale = std::clamp<uint32_t>(g_videoSettings.renderScale, 1, 4);
 
+        // AR_D3D12_DEBUG: the D3D12 debug layer, with its messages in the log (each message once);
+        // AR_D3D12_GBV also validates resource states as the GPU executes (much slower).
         if (AR_ENV("AR_D3D12_DEBUG"))
         {
-            ComPtr<ID3D12Debug> debug;
+            ComPtr<ID3D12Debug1> debug;
             if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+            {
                 debug->EnableDebugLayer();
+                if (AR_ENV("AR_D3D12_GBV"))
+                    debug->SetEnableGPUBasedValidation(TRUE);
+            }
         }
 
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&g.factory))))
@@ -1008,6 +1056,32 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             LOGF_ERROR("failed to create a Direct3D 12 device");
             return false;
+        }
+
+        if (AR_ENV("AR_D3D12_DEBUG"))
+        {
+            ComPtr<ID3D12InfoQueue1> infoQueue;
+            DWORD cookie;
+            if (SUCCEEDED(g.device.As(&infoQueue)))
+            {
+                infoQueue->RegisterMessageCallback([](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
+                    LPCSTR description, void*)
+                    {
+                        if (severity > D3D12_MESSAGE_SEVERITY_WARNING)
+                            return;
+                        static std::mutex mutex;
+                        static std::unordered_map<uint32_t, uint32_t> counts;
+                        std::lock_guard lock(mutex);
+                        uint32_t count = ++counts[uint32_t(id)];
+                        if (count == 1 || count == 100 || count == 10000)
+                            LOGF_WARNING("D3D12 {} {} (seen {} times): {}", severity <= D3D12_MESSAGE_SEVERITY_ERROR ? "error" : "warning",
+                                uint32_t(id), count, description);
+                    }, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+            }
+            else
+            {
+                LOGF_WARNING("the D3D12 debug layer's message callback isn't available; messages go to the debugger");
+            }
         }
 
         if (adapter)
@@ -2233,8 +2307,12 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.DSVFormat = key.depthFormat;
         desc.SampleDesc.Count = 1;
 
+        // Library names include the shaders' bytecode: the same key gives a different pipeline when the translator
+        // changes, and a stale entry under the name can't be replaced (it was recompiled on every run).
+        uint64_t libraryHash = hash ^ HashMemory(vertexShader.code->data(), vertexShader.code->size()) * 3 ^
+            (pixelShader ? HashMemory(pixelShader->code->data(), pixelShader->code->size()) * 5 : 0);
         wchar_t name[17];
-        swprintf(name, 17, L"%016llX", (unsigned long long)hash);
+        swprintf(name, 17, L"%016llX", (unsigned long long)libraryHash);
         if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->LoadGraphicsPipeline(name, &desc, IID_PPV_ARGS(&pipeline))))
         {
             g.pipelinesLoaded++;
@@ -2854,6 +2932,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             if (uploaded == 0)
                 uploaded = UploadVertexData(address, size) + 1;
             system.vertexDataOffsets[index] = int32_t(uploaded - 1) - int32_t(address);
+            if (CheckUploads() && ((vertexShader.hash >> 32) == 0x741845E2 || (vertexShader.hash >> 32) == 0xDC019066))
+                NoteUpload(uploaded - 1, size, "vertices");
         }
 
         lap.Lap(g_profile.vertices);
@@ -2954,6 +3034,11 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_GPU_VIRTUAL_ADDRESS vertexConstants = uploadFloatConstants(registers[0x2307], &vertexShader);
         D3D12_GPU_VIRTUAL_ADDRESS pixelConstants = uploadFloatConstants(registers[0x2308], pixelShader);
         D3D12_GPU_VIRTUAL_ADDRESS systemConstants = UploadConstants(system);
+        if (CheckUploads() && ((vertexShader.hash >> 32) == 0x741845E2 || (vertexShader.hash >> 32) == 0xDC019066))
+        {
+            NoteUpload(vertexConstants - g.uploadGpu, 32 * 16, "vertex constants");
+            NoteUpload(systemConstants - g.uploadGpu, sizeof(system), "system constants");
+        }
 
         lap.Lap(g_profile.constants);
 
@@ -2970,8 +3055,24 @@ float4 main(float4 position : SV_Position) : SV_Target
                 uint32_t vsBase = std::min<uint32_t>(registers[0x2307] & 0x1FF, 256);
                 const auto* c = reinterpret_cast<const uint8_t*>(&registers[SHADER_CONSTANT_000_X + vsBase * 4]);
                 uint32_t address = vertexRanges.empty() ? 0 : registers[SHADER_CONSTANT_FETCH_00_0 + vertexRanges[0].first * 2] & 0x1FFFFFFC;
-                LOGF_INFO("S {} {:08X} {:08X} {} {} {:016X} {:016X}", g.frameNumber, uint32_t(vertexShader.hash >> 32), address,
-                    int32_t(uint32_t(registers[VGT_INDX_OFFSET])), count, HashMemory(c + 16 * 16, 4 * 16), HashMemory(c + 28 * 16, 4 * 16));
+                // Then all context registers (render state, viewport, scissor...) and the constants derived for the
+                // host shaders, to find state that differs between frames although the draw is the same.
+                LOGF_INFO("S {} {:08X} {:08X} {} {} {:016X} {:016X} {:016X} {:016X}", g.frameNumber, uint32_t(vertexShader.hash >> 32), address,
+                    int32_t(uint32_t(registers[VGT_INDX_OFFSET])), count, HashMemory(c + 16 * 16, 4 * 16), HashMemory(c + 28 * 16, 4 * 16),
+                    HashMemory(reinterpret_cast<const uint8_t*>(&registers[0x2000]), 0x400 * 4),
+                    HashMemory(reinterpret_cast<const uint8_t*>(&system), sizeof(system)));
+
+                // The full context registers once a frame, at the first static geometry draw into the shadow map.
+                static uint64_t dumpedFrame = UINT64_MAX;
+                if (dumpedFrame != g.frameNumber && (vertexShader.hash >> 32) == 0x741845E2)
+                {
+                    dumpedFrame = g.frameNumber;
+                    std::string text;
+                    text.reserve(0x400 * 9);
+                    for (uint32_t i = 0; i < 0x400; i++)
+                        text += fmt::format("{:08X} ", uint32_t(registers[0x2000 + i]));
+                    LOGF_INFO("R {} {}", g.frameNumber, text);
+                }
                 static uint64_t lastLight;
                 uint64_t light = HashMemory(c + 28 * 16, 4 * 16);
                 if (light != lastLight)
@@ -3048,6 +3149,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 }
             }
             indexView = { allocation.gpu, size, index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
+            if (CheckUploads() && ((vertexShader.hash >> 32) == 0x741845E2 || (vertexShader.hash >> 32) == 0xDC019066))
+                NoteUpload(allocation.offset, size, "indices");
         }
 
         lap.Lap(g_profile.indices);

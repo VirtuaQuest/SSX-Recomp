@@ -18,6 +18,8 @@ things are the way they are) and `docs/DEBUGGING.md` for the switches and test s
 
 ## Build and run
 
+- The build uses the XenonRecomp fork checked out next to this folder (`../XenonRecomp`, branch `main` of the same
+  GitHub repository; `XENONRECOMP_ROOT` overrides the path).
 - `tools\build.bat [ARRecomp|ARLauncher|ARShaderTool]` — Ninja, clang-cl (portable LLVM 19 at
   `C:\Downloads\Repos\_tools\llvm`), VS 2022 Build Tools, RelWithDebInfo, into `out\build`. DXC comes from the
   Windows SDK and is copied next to the exe.

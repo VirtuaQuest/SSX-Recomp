@@ -22,8 +22,10 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 | `shadow_flicker.sh <name> ["ENV=1"]` | Far shadow cascade every frame, flicker scores |
 | `game_speed.sh <name> ["--fps 60"]` | World speed per real second, to check game speed at a frame rate |
 
-`AR_ISO` and `AR_EXE` override the disc image and executable. Analysis: `summ.py` (trace summary), `altscore.py` and
-`period.py` (flicker), `speed.py` (game speed), `drawsets.py` and `worldcmp.py` (`AR_SHADOW_LOG` logs).
+Arguments after the name can be mixed: `VAR=value` words become environment settings, the rest go to the game
+(`fight.sh run1 AR_SINGLE_THREAD=1 --fps 60`). `AR_ISO` and `AR_EXE` override the disc image and executable.
+Analysis: `summ.py` (trace summary), `altscore.py` and `period.py` (flicker), `speed.py` (game speed), `drawsets.py`,
+`worldcmp.py` and `regdiff.py` (`AR_SHADOW_LOG` logs: draws, constants, context registers per frame).
 
 ## Frames, dumps and traces
 
@@ -53,7 +55,9 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 | `AR_LOG_TIMEBASE`, `AR_LOG_QPC`, `AR_LOG_TIMESTEP` | Who reads the clock; the game's time step |
 | `AR_LOG_PRIORITIES`, `AR_LOG_DELAYS`, `AR_LOG_READS`, `AR_LOG_SHA`, `AR_LOG_SAVE_ERRORS` | Kernel calls |
 | `AR_CHECK_ALU` | Constant memory changing after LOAD_ALU_CONSTANT read it |
-| `AR_D3D12_DEBUG` | D3D12 debug layer |
+| `AR_D3D12_DEBUG`, `AR_D3D12_GBV` | D3D12 debug layer with its messages in the log; GPU-based validation (very slow) |
+| `AR_CHECK_UPLOADS` | Upload memory static shadow casters read, checked again once the GPU is done with the frame |
+| `AR_LOG_WAIT_TIMEOUTS` | Kernel waits with a timeout that time out, per thread and object (5 s summary) |
 
 ## Turning features off (bisecting)
 

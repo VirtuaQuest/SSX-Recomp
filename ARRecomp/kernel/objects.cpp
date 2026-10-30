@@ -202,9 +202,54 @@ static void Acquire(XDISPATCHER_HEADER* header, uint32_t thread)
     }
 }
 
+// Diagnostics (AR_LOG_WAIT_TIMEOUTS): waits with a timeout, per thread and object, and how often they time out.
+static void NoteTimedWait(XDISPATCHER_HEADER* object, std::chrono::steady_clock::duration timeout, bool timedOut)
+{
+    struct Entry
+    {
+        uint32_t waits = 0, timeouts = 0;
+        double timeoutMs = 0.0;
+    };
+    static std::mutex mutex;
+    static std::map<std::pair<uint32_t, uint32_t>, Entry> entries;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& entry = entries[{ GetCurrentGuestThreadId(), g_memory.MapVirtual(object) }];
+    entry.waits++;
+    entry.timeouts += timedOut ? 1 : 0;
+    entry.timeoutMs = std::chrono::duration<double, std::milli>(timeout).count();
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(5))
+        return;
+    lastReport = now;
+    std::string text;
+    for (const auto& [key, value] : entries)
+    {
+        if (value.timeouts != 0)
+            text += fmt::format("\n    thread {} object 0x{:08X}: {} waits, {} timed out ({:.2f} ms timeout)", key.first, key.second,
+                value.waits, value.timeouts, value.timeoutMs);
+    }
+    LOGF_INFO("timed waits in 5 s (0 ms = polls):{}", text);
+    entries.clear();
+}
+
 uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, bool waitAll,
     std::optional<std::chrono::steady_clock::time_point> deadline, bool alertable)
 {
+    static const bool logTimeouts = getenv("AR_LOG_WAIT_TIMEOUTS") != nullptr;
+    struct TimedWait
+    {
+        XDISPATCHER_HEADER* object;
+        std::chrono::steady_clock::duration timeout;
+        bool timedOut = false;
+        ~TimedWait()
+        {
+            if (object)
+                NoteTimedWait(object, timeout, timedOut);
+        }
+    } timedWait{ logTimeouts && deadline.has_value() && !objects.empty() ? objects[0] : nullptr,
+        deadline.has_value() ? *deadline - std::chrono::steady_clock::now() : std::chrono::steady_clock::duration{} };
+
     const uint32_t thread = GetCurrentKThread();
 
     // Record what is being waited on for diagnostics, cleared when the wait ends.
@@ -272,7 +317,10 @@ uint32_t WaitForDispatcherObjects(std::span<XDISPATCHER_HEADER* const> objects, 
         }
 
         if (deadline.has_value() && now >= *deadline)
+        {
+            timedWait.timedOut = true;
             return X_STATUS_TIMEOUT;
+        }
 
         // Wake up for the earliest timer that could satisfy the wait.
         auto wake = deadline;
