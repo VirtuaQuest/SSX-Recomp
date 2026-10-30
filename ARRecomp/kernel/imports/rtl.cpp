@@ -229,6 +229,13 @@ namespace imports
             {
                 SetThreadDescription(thread->hostThread, std::filesystem::path(name).wstring().c_str());
                 LOGF_INFO("thread {} is named \"{}\"", thread->threadId, name);
+
+                // Experiment (AR_BOOST_THREADS=<name part>): threads whose name contains it run at highest priority.
+                if (const char* boost = AR_ENV("AR_BOOST_THREADS"); boost && strstr(name, boost))
+                {
+                    SetThreadPriority(thread->hostThread, THREAD_PRIORITY_HIGHEST);
+                    LOGF_INFO("thread {} boosted", thread->threadId);
+                }
             }
 
             return;
