@@ -164,6 +164,15 @@ namespace gpu::d3d12
         uint32_t format;
         uint32_t rowBytes;
         bool rawDepth = false; // Holds depth buffer words (from depth resolves), 8 bit stencil in the low byte.
+        uint64_t version = 0;  // Changes with every resolve into it.
+    };
+
+    // Resolved textures that follow each other in memory, fetched as one texture (shadow map cascades resolved one
+    // below the other and sampled as one tall atlas), copied together. Rebuilt when a part is resolved again.
+    struct CompositeTexture
+    {
+        Texture texture;
+        std::vector<std::pair<uint32_t, uint64_t>> parts; // Address and version of each part copied in.
     };
 
     // Detects changes of guest memory a cached copy was made from. Small ranges are hashed whole every check. Large
@@ -360,6 +369,8 @@ namespace gpu::d3d12
         std::unordered_map<RenderTargetKey, std::vector<std::pair<uint64_t, D3D12_RECT>>, RenderTargetKeyHash> renderTargetWrites;
         uint64_t renderTargetClock = 0;
         std::unordered_map<uint32_t, ResolvedTexture> resolvedTextures;
+        std::unordered_map<uint64_t, CompositeTexture> compositeTextures;
+        uint64_t resolveVersion = 0;
         std::unordered_map<uint64_t, CachedTexture> textures;
         std::set<uint32_t> warnedFormats;
     } g;
@@ -1346,6 +1357,88 @@ float4 main(float4 position : SV_Position) : SV_Target
         return it->second.srv;
     }
 
+    // Fetches running past the end of a resolved texture into the resolved textures after it: copies the rows the
+    // fetch covers into one texture. Returns UINT32_MAX when the fetch doesn't continue into another resolve.
+    static uint32_t GetCompositeTexture(const TextureFetch& fetch, ResolvedTexture& first, uint32_t row, float* transform, uint32_t& rawDepth)
+    {
+        struct Part
+        {
+            uint32_t address;
+            ResolvedTexture* resolved;
+            uint32_t row, rows, destRow;
+        };
+        std::vector<Part> parts;
+        uint32_t address = fetch.BaseAddress(), remaining = fetch.Height(), destRow = 0;
+        ResolvedTexture* current = &first;
+        while (current && remaining != 0)
+        {
+            uint32_t rows = std::min(remaining, current->texture.height / g_scale - row);
+            parts.push_back({ address, current, row, rows, destRow });
+            remaining -= rows;
+            destRow += rows;
+            address += rows * current->rowBytes;
+            if (remaining == 0)
+                break;
+            uint32_t nextRow;
+            ResolvedTexture* next = FindResolved(address, current->rowBytes, nextRow);
+            if (!next || next->texture.format != first.texture.format || next->texture.width != first.texture.width ||
+                next->rawDepth != first.rawDepth)
+                break;
+            current = next;
+            row = nextRow;
+        }
+        if (parts.size() < 2)
+            return UINT32_MAX;
+
+        uint32_t keyWords[3] = { fetch.BaseAddress(), fetch.Height(), first.rowBytes };
+        auto& composite = g.compositeTextures[HashMemory(reinterpret_cast<const uint8_t*>(keyWords), sizeof(keyWords))];
+        uint32_t height = fetch.Height() * g_scale;
+        if (composite.texture.resource && (composite.texture.format != first.texture.format ||
+            composite.texture.width != first.texture.width || composite.texture.height != height))
+        {
+            ReleaseTexture(composite.texture);
+            composite.parts.clear();
+        }
+        if (!composite.texture.resource)
+        {
+            composite.texture = CreateTexture(first.texture.width, height, 1, false, first.texture.format, D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            if (!composite.texture.resource)
+                return UINT32_MAX;
+            composite.parts.clear();
+        }
+
+        // Copied again when a part has been resolved since (or the parts are different textures now).
+        std::vector<std::pair<uint32_t, uint64_t>> versions;
+        for (const Part& part : parts)
+            versions.emplace_back(part.address, part.resolved->version);
+        if (versions != composite.parts)
+        {
+            Transition(composite.texture, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (const Part& part : parts)
+            {
+                Transition(part.resolved->texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION source{ part.resolved->texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_TEXTURE_COPY_LOCATION dest{ composite.texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_BOX box{ 0, part.row * g_scale, 0, part.resolved->texture.width, (part.row + part.rows) * g_scale, 1 };
+                g.list->CopyTextureRegion(&dest, 0, part.destRow * g_scale, 0, &source, &box);
+            }
+            composite.parts = std::move(versions);
+            if (TraceThisFrame())
+                LOGF_INFO("composite texture 0x{:08X} {}x{} from {} resolves", fetch.BaseAddress(), fetch.Width(), fetch.Height(), parts.size());
+        }
+
+        auto& texture = composite.texture;
+        transform[0] = float(fetch.Width() * g_scale) / float(texture.width);
+        transform[1] = 1.0f;
+        transform[3] = 0.0f;
+        rawDepth |= 4;
+        if (first.rawDepth && (fetch.Format() == 22 || fetch.Format() == 23))
+            rawDepth = fetch.Format() == 23 ? 2 : 1;
+        Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        return texture.srv;
+    }
+
     static uint32_t GetTextureUncached(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth)
     {
         rawDepth = 0;
@@ -1361,6 +1454,12 @@ float4 main(float4 position : SV_Position) : SV_Target
         // Resolved render targets are used directly.
         uint32_t row;
         ResolvedTexture* resolved = dimension < 2 ? FindResolved(fetch.BaseAddress(), 0, row) : nullptr;
+        static const bool noComposite = AR_ENV("AR_NO_COMPOSITE") != nullptr;
+        if (resolved && !noComposite && row + fetch.Height() > resolved->texture.height / g_scale)
+        {
+            if (uint32_t srv = GetCompositeTexture(fetch, *resolved, row, transform, rawDepth); srv != UINT32_MAX)
+                return srv;
+        }
         if (resolved)
         {
             auto& texture = resolved->texture;
@@ -3184,6 +3283,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 {
                     auto& resolved = *target;
                     resolved.rawDepth = depthSource;
+                    resolved.version = ++g.resolveVersion;
                     struct BlitConstants
                     {
                         int32_t sourceOffset[2];
