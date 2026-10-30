@@ -31,20 +31,26 @@
 
 #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
 
+// Host address of a guest memory access. Defining it allows remapping parts of the guest address space, for
+// example to emulate the 4 KB offset of the Xbox 360's 0xE0000000 physical memory view.
+#ifndef PPC_MEMORY_ADDRESS
+#define PPC_MEMORY_ADDRESS(x) (base + (x))
+#endif
+
 #ifndef PPC_LOAD_U8
-#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
+#define PPC_LOAD_U8(x) *(volatile uint8_t*)PPC_MEMORY_ADDRESS(x)
 #endif
 
 #ifndef PPC_LOAD_U16
-#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
+#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)PPC_MEMORY_ADDRESS(x))
 #endif
 
 #ifndef PPC_LOAD_U32
-#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
+#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)PPC_MEMORY_ADDRESS(x))
 #endif
 
 #ifndef PPC_LOAD_U64
-#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
+#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)PPC_MEMORY_ADDRESS(x))
 #endif
 
 // TODO: Implement.
@@ -68,19 +74,19 @@
 #endif
 
 #ifndef PPC_STORE_U8
-#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
+#define PPC_STORE_U8(x, y) *(volatile uint8_t*)PPC_MEMORY_ADDRESS(x) = (y)
 #endif
 
 #ifndef PPC_STORE_U16
-#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
+#define PPC_STORE_U16(x, y) *(volatile uint16_t*)PPC_MEMORY_ADDRESS(x) = __builtin_bswap16(y)
 #endif
 
 #ifndef PPC_STORE_U32
-#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
+#define PPC_STORE_U32(x, y) *(volatile uint32_t*)PPC_MEMORY_ADDRESS(x) = __builtin_bswap32(y)
 #endif
 
 #ifndef PPC_STORE_U64
-#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
+#define PPC_STORE_U64(x, y) *(volatile uint64_t*)PPC_MEMORY_ADDRESS(x) = __builtin_bswap64(y)
 #endif
 
 // MMIO Store handling is completely reliant on being preeceded by eieio.
@@ -629,6 +635,11 @@ inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b)
     return simde_mm_add_epi32(a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
 }
 
+inline simde__m128i simde_mm_subs_epu32(simde__m128i a, simde__m128i b)
+{
+    return simde_mm_sub_epi32(a, simde_mm_min_epu32(a, b));
+}
+
 inline simde__m128i simde_mm_avg_epi8(simde__m128i a, simde__m128i b)
 {
     simde__m128i c = simde_mm_set1_epi8(char(128));
@@ -682,6 +693,22 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
     return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
 }
 
+inline simde__m128i simde_mm_vctuxs(simde__m128 src1)
+{
+    // NaN and negative values saturate to 0 (maxps returns the second operand for NaN).
+    simde__m128 clamped = simde_mm_max_ps(src1, simde_mm_setzero_ps());
+
+    // cvttps only handles signed values, so values >= 2^31 are converted with 2^31 subtracted and the top bit set afterwards.
+    simde__m128 bias = simde_mm_set1_ps(2147483648.0f);
+    simde__m128 high = simde_mm_cmpge_ps(clamped, bias);
+    simde__m128i result = simde_mm_cvttps_epi32(simde_mm_sub_ps(clamped, simde_mm_and_ps(high, bias)));
+    result = simde_mm_xor_si128(result, simde_mm_and_si128(simde_mm_castps_si128(high), simde_mm_set1_epi32(INT_MIN)));
+
+    // Values >= 2^32 saturate to UINT_MAX.
+    simde__m128 overflow = simde_mm_cmpge_ps(clamped, simde_mm_set1_ps(4294967296.0f));
+    return simde_mm_or_si128(result, simde_mm_castps_si128(overflow));
+}
+
 inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
 {
     b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
@@ -698,6 +725,11 @@ inline uint64_t __rdtsc()
 }
 #elif !defined(__x86_64__) && !defined(_M_X64)
 #   error "Missing implementation for __rdtsc()"
+#endif
+
+// mftb. Projects can define this to return ticks at the rate the title expects (50 MHz on the Xbox 360).
+#ifndef PPC_QUERY_TIMEBASE
+#define PPC_QUERY_TIMEBASE() __rdtsc()
 #endif
 
 #endif

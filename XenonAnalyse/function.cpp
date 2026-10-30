@@ -38,7 +38,7 @@ size_t Function::SearchBlock(size_t address) const
     return -1;
 }
 
-Function Function::Analyze(const void* code, size_t size, size_t base)
+Function Function::Analyze(const void* code, size_t size, size_t base, const SwitchTargets* switchTargets)
 {
     Function fn{ base, 0 };
 
@@ -117,7 +117,8 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
 
             if (lBlock == -1)
             {
-                blocks.emplace_back(lBase, 0).projectedSize = rBase - lBase;
+                // A branch to the next instruction has nothing to project, the false case simply continues.
+                blocks.emplace_back(lBase, 0).projectedSize = rBase != lBase ? rBase - lBase : -1;
                 lBlock = blocks.size() - 1;
 
                 // push this first, this gets overriden by the true case as it'd be further away
@@ -196,6 +197,35 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
                             blockStack.emplace_back(lBlock);
                             RESTORE_DATA();
                             continue;
+                        }
+                    }
+                    else if (xop == 528 && switchTargets != nullptr)
+                    {
+                        // Jump table: continue at every case label.
+                        auto targets = switchTargets->find(addr);
+                        if (targets != switchTargets->end())
+                        {
+                            const size_t end = base + size;
+                            size_t firstLabel = end;
+                            for (size_t label : targets->second)
+                            {
+                                if (label <= addr || label >= end)
+                                    continue;
+
+                                firstLabel = std::min(firstLabel, label);
+                                if (fn.SearchBlock(label) == -1)
+                                {
+                                    blocks.emplace_back(label - base, 0);
+                                    DEBUG(blocks.back().parent = blockBase);
+                                    blockStack.emplace_back(blocks.size() - 1);
+                                }
+                            }
+
+                            // Tables are often placed right after the bctr. Cover them with a block so the
+                            // function isn't cut off at the gap between the bctr and the case labels.
+                            const size_t gapBase = addr + 4;
+                            if (firstLabel != end && firstLabel > gapBase && fn.SearchBlock(gapBase) == -1)
+                                blocks.emplace_back(gapBase - base, firstLabel - gapBase);
                         }
                     }
                 }

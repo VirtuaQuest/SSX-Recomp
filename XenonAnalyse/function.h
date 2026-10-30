@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _DEBUG
@@ -46,6 +47,9 @@ struct Function
     {
     }
     
+    // Jump table targets, keyed by the address of the bctr that dispatches them.
+    using SwitchTargets = std::unordered_map<size_t, std::vector<size_t>>;
+
     size_t SearchBlock(size_t address) const;
-    static Function Analyze(const void* code, size_t size, size_t base);
+    static Function Analyze(const void* code, size_t size, size_t base, const SwitchTargets* switchTargets = nullptr);
 };

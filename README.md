@@ -32,7 +32,7 @@ Virtual function calls are resolved by creating a "perfect hash table" at runtim
 
 ### Jump Tables
 
-Jump tables, at least in older Xbox 360 binaries, often have predictable assembly patterns, making them easy to detect statically without needing a virtual machine. XenonAnalyse has logic for detecting jump tables in Sonic Unleashed, though variations in other games (likely due to updates in the Xbox 360 compiler) may require modifications to the detection logic. Currently, there is no fully generic solution for handling jump tables, so updates to the detection logic may be needed for other games.
+Jump tables often have predictable assembly patterns, making them easy to detect statically without needing a virtual machine. Instead of matching fixed instruction sequences, which vary between games due to instruction scheduling differences in the Xbox 360 compiler, XenonAnalyse traces the value moved into the count register backwards from every `bctr`. It recognizes absolute tables (`lwzx`), byte and halfword offset tables (`lbzx`/`lhzx` added to a base address, optionally shifted), and finds the `cmplwi` bounds check even when the index is copied to another register with `mr`. Tables whose targets lie outside the containing function (according to `.pdata`, or between the neighboring `.pdata` functions for leaf functions), and tables without a bounds check outside of code and `.rdata`, are function pointer tables and are skipped, as the recompiler handles those as indirect calls. When there is no bounds check, the table size is inferred from its contents, which is exact for tables placed directly after the `bctr`; these tables are marked in the output for manual verification. Jump sequences that could not be resolved are listed at the end of the output, and may require manual definitions or further extensions to the detection logic.
 
 The typical way to find jump tables is by searching for the `mtctr r0` instruction. It will almost always be followed with a `bctr`, with the previous instructions computing the jump address.
 
@@ -42,7 +42,7 @@ XenonAnalyse generates a TOML file containing detected jump tables, which can be
 
 XenonAnalyse includes a function boundary analyzer that works well in most cases. Functions with stack space have their boundaries defined in the `.pdata` segment of the XEX. For functions not found in this segment, the analyzer detects the start of functions by searching for branch link instructions, and determines their length via static analysis.
 
-However, the analyzer struggles with functions containing jump tables, since they look like tail calls without enough information. While there is currently no solution for this, it might be relatively simple to extend the function analyzer to account for jump tables defined in the TOML file. As a workaround, the recompiler TOML file allows users to manually define function boundaries.
+Functions containing jump tables look like tail calls without additional information, so the function analyzer uses the jump tables defined in the TOML file to continue the analysis at every case label. This includes tables placed directly after the `bctr` instruction. For functions that are still not analyzed correctly, the recompiler TOML file allows users to manually define function boundaries.
 
 ### Exceptions
 
@@ -92,7 +92,15 @@ XenonAnalyse, when used as a command-line application, allows an XEX file to be 
 XenonAnalyse [input XEX file path] [output jump table TOML file path]
 ```
 
-However, as explained in the earlier sections, due to variations between games, additional support may be needed to handle different patterns.
+Jump sequences that could not be resolved are printed and listed as comments at the end of the TOML file. Due to variations between games, additional support may be needed to handle different patterns.
+
+### Extracting the XEX
+
+The `scripts/extract_iso.py` script extracts `default.xex` (or any other file) from an Xbox 360 disc image:
+
+```
+python scripts/extract_iso.py [input ISO file path] [output directory] [--all] [--file path] [--list]
+```
 
 [An example jump table TOML file can be viewed in the Unleashed Recompiled repository.](https://github.com/hedge-dev/UnleashedRecomp/blob/main/UnleashedRecompLib/config/SWA_switch_tables.toml)
 
