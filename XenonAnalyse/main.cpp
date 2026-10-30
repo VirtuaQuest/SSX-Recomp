@@ -281,7 +281,8 @@ static std::optional<Candidate> MatchTarget(const Window& window, Candidate& can
 }
 
 // Walks backwards from the index use to find the bounds check ("cmplwi crN, rIndex, N" followed by a
-// conditional branch to the default case), following register copies made with "mr".
+// conditional branch to the default case), following register copies made with "mr" or "rotlwi rD, rS, 0" and,
+// in unoptimized code, an index reloaded from the stack slot whose value was compared.
 static bool FindBounds(const Window& window, uint32_t index, size_t indexPos, SwitchTable& table)
 {
     std::vector<uint32_t> aliases{ index };
@@ -302,6 +303,9 @@ static bool FindBounds(const Window& window, uint32_t index, size_t indexPos, Sw
         bool valid;
     };
     std::vector<DeferredCompare> deferred;
+
+    // Offset from r1 of the stack slot the index was reloaded from, until a store to that slot is seen.
+    std::optional<uint32_t> slot;
 
     auto accept = [&](size_t compare, size_t branchPos)
         {
@@ -341,6 +345,22 @@ static bool FindBounds(const Window& window, uint32_t index, size_t indexPos, Sw
             continue;
         }
 
+        if (slot.has_value() && insn.operands[2] == 1 && insn.operands[1] == *slot)
+        {
+            if (id == PPC_INST_LWZ)
+            {
+                for (const auto& compare : deferred)
+                {
+                    if (compare.valid && compare.reg == insn.operands[0])
+                        return accept(compare.compare, compare.branch);
+                }
+            }
+            else if (StartsWith(insn.opcode->name, "st"))
+            {
+                slot.reset();
+            }
+        }
+
         for (auto& compare : deferred)
             compare.valid &= !WritesGpr(insn, compare.reg);
 
@@ -353,7 +373,7 @@ static bool FindBounds(const Window& window, uint32_t index, size_t indexPos, Sw
             if (!WritesGpr(insn, aliases[a]))
                 continue;
 
-            if (id == PPC_INST_MR)
+            if (id == PPC_INST_MR || (id == PPC_INST_ROTLWI && insn.operands[2] == 0))
             {
                 aliases[a] = insn.operands[1];
 
@@ -368,12 +388,15 @@ static bool FindBounds(const Window& window, uint32_t index, size_t indexPos, Sw
                 if (id == PPC_INST_CLRLWI && !maskCount.has_value() && insn.operands[2] >= 24)
                     maskCount = size_t(1) << (32 - insn.operands[2]);
 
+                if (id == PPC_INST_LWZ && insn.operands[2] == 1 && !slot.has_value())
+                    slot = insn.operands[1];
+
                 aliases.erase(aliases.begin() + a);
             }
             break;
         }
 
-        if (aliases.empty())
+        if (aliases.empty() && !slot.has_value())
             break;
     }
 
@@ -467,9 +490,20 @@ int main(int argc, char** argv)
             if (insn.opcode == nullptr || insn.opcode->id != PPC_INST_BCTR)
                 continue;
 
+            // Older compilers can schedule a nop between mtctr and bctr.
+            size_t start = i - 1;
+            while (start > 0)
+            {
+                ppc_insn nop;
+                ppc::Disassemble(&code[start], section.base + start * 4, nop);
+                if (nop.opcode == nullptr || nop.opcode->id != PPC_INST_NOP)
+                    break;
+                start--;
+            }
+
             Window window;
-            window.address = section.base + (i - 1) * 4;
-            for (size_t k = i - 1; window.insns.size() < MAX_WINDOW; k--)
+            window.address = section.base + start * 4;
+            for (size_t k = start; window.insns.size() < MAX_WINDOW; k--)
             {
                 ppc_insn& prev = window.insns.emplace_back();
                 ppc::Disassemble(&code[k], section.base + k * 4, prev);
@@ -568,7 +602,9 @@ int main(int argc, char** argv)
                     continue;
                 }
 
-                if (!(fnKnown || inlineTable) || match->type != EntryType::Absolute)
+                // Offset tables are only sized this way inside a known function, which bounds their labels. Such a
+                // switch is usually nested in a case of another switch on the same index, which checked the bounds.
+                if (!(fnKnown || inlineTable) || (match->type != EntryType::Absolute && !fnKnown))
                 {
                     unresolved.emplace_back(bctrAddress, "bounds check not found");
                     continue;
