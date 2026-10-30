@@ -1,5 +1,6 @@
 // Threads, synchronization, TLS and time.
 #include <stdafx.h>
+#include <dbghelp.h>
 #include <kernel/imports.h>
 #include <cpu/guest_thread.h>
 
@@ -832,8 +833,45 @@ AR_IMPORT(KeAcquireSpinLockAtRaisedIrql);
 AR_IMPORT(KeReleaseSpinLockFromRaisedIrql);
 AR_IMPORT(KeQueryPerformanceFrequency);
 
+// Diagnostics (AR_LOG_TIMEBASE): which recompiled functions read the time base, and how often.
+static void NoteTimeBaseCaller(void* caller)
+{
+    static std::mutex mutex;
+    static std::unordered_map<void*, uint32_t> counts;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    counts[caller]++;
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(5))
+        return;
+    lastReport = now;
+
+    static bool symbols = (SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS), SymInitialize(GetCurrentProcess(), nullptr, TRUE), true);
+    std::vector<std::pair<uint32_t, void*>> top;
+    for (auto [address, count] : counts)
+        top.emplace_back(count, address);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::string text;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++)
+    {
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256]{};
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement;
+        bool found = SymFromAddr(GetCurrentProcess(), DWORD64(top[i].second), &displacement, symbol);
+        text += fmt::format(" {} {}/5s;", found ? symbol->Name : "?", top[i].first);
+    }
+    LOGF_INFO("time base readers:{}", text);
+    counts.clear();
+}
+
 uint64_t ArQueryTimeBase()
 {
+    static const bool logCallers = getenv("AR_LOG_TIMEBASE") != nullptr;
+    if (logCallers)
+        NoteTimeBaseCaller(__builtin_return_address(0));
+
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     uint64_t ticks = uint64_t(counter.QuadPart);

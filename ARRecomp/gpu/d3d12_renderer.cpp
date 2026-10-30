@@ -2881,8 +2881,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                     float m[16];
                     for (uint32_t i = 0; i < 16; i++)
                         m[i] = RegisterFloat(registers, SHADER_CONSTANT_000_X + (vsBase + 28) * 4 + i);
-                    LOGF_INFO("L {} {:016X} {} {} {} {} | {} {} {} {} | {} {} {} {} | {} {} {} {}", g.frameNumber, light, m[0], m[1], m[2], m[3],
-                        m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+                    LOGF_INFO("L {} {:016X} {} {} {} {} | {} {} {} {} | {} {} {} {} | {} {} {} {} t {}", g.frameNumber, light, m[0], m[1], m[2], m[3],
+                        m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15], uint32_t(GetTickCount() & 0x7FFFFFFF));
                 }
             }
         }
