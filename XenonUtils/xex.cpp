@@ -174,12 +174,14 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
             auto* blocks = reinterpret_cast<const Xex2FileBasicCompressionBlock*>(fileFormatInfo + 1);
             const size_t numBlocks = (fileFormatInfo->infoSize / sizeof(Xex2FileBasicCompressionInfo)) - 1;
 
-            imageSize = 0;
+            // The blocks can cover less than the image size, which callers use: the rest of the image is zero.
+            size_t blocksSize = 0;
             for (size_t i = 0; i < numBlocks; i++)
             {
-                imageSize += blocks[i].dataSize + blocks[i].zeroSize;
+                blocksSize += blocks[i].dataSize + blocks[i].zeroSize;
             }
 
+            imageSize = std::max<size_t>(imageSize, blocksSize);
             result = std::make_unique<uint8_t[]>(imageSize);
             auto* destData = result.get();
 
