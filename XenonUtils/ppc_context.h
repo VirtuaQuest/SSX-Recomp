@@ -635,6 +635,70 @@ inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b)
     return simde_mm_add_epi32(a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
 }
 
+// Half floats of vpkd3d128/vupkd3d128. Like the float16_4 pack, the Xbox 360 format has no infinity or NaN:
+// exponent 31 is a normal exponent and out of range values saturate to 0x7FFF.
+inline float ppc_half_to_float(uint16_t h)
+{
+    uint32_t sign = uint32_t(h & 0x8000) << 16;
+    uint32_t exponent = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+    float value;
+    if (exponent == 0)
+    {
+        value = float(mantissa) * 5.9604644775390625e-8f; // 2^-24
+    }
+    else
+    {
+        uint32_t bits = ((exponent + 112) << 23) | (mantissa << 13);
+        memcpy(&value, &bits, sizeof(value));
+    }
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits |= sign;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline uint16_t ppc_float_to_half(float f)
+{
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    uint16_t sign = uint16_t((bits & 0x80000000) >> 16);
+    uint32_t exponent = (bits & 0x7F800000) >> 23;
+    uint32_t mantissa = (bits & 0x7FE000) >> 13;
+    float magnitude = __builtin_fabsf(f);
+    if (magnitude != magnitude || magnitude > 131008.0f)
+        return sign | 0x7FFF;
+    if (exponent > 0x70)
+        return sign | uint16_t(((exponent - 0x70) << 10) + mantissa);
+    uint32_t shift = 0x71 - exponent;
+    return sign | uint16_t(shift > 31 ? 0 : (0x400 + mantissa) >> shift);
+}
+
+inline simde__m128i simde_mm_adds_epi32(simde__m128i a, simde__m128i b)
+{
+    // Overflow when both operands have the same sign and the sum's sign differs; saturate towards a's sign.
+    simde__m128i sum = simde_mm_add_epi32(a, b);
+    simde__m128i overflow = simde_mm_srai_epi32(simde_mm_and_si128(simde_mm_xor_si128(a, sum), simde_mm_xor_si128(b, sum)), 31);
+    simde__m128i saturated = simde_mm_xor_si128(simde_mm_srai_epi32(a, 31), simde_mm_set1_epi32(INT_MAX));
+    return simde_mm_blendv_epi8(sum, saturated, overflow);
+}
+
+inline simde__m128i simde_mm_avg_epi32(simde__m128i a, simde__m128i b)
+{
+    // (a + b + 1) >> 1 without overflowing.
+    simde__m128i rounding = simde_mm_and_si128(simde_mm_or_si128(a, b), simde_mm_set1_epi32(1));
+    return simde_mm_add_epi32(simde_mm_add_epi32(simde_mm_srai_epi32(a, 1), simde_mm_srai_epi32(b, 1)), rounding);
+}
+
+inline simde__m128i simde_mm_vcmpbfp(simde__m128 a, simde__m128 b)
+{
+    simde__m128 negativeB = simde_mm_xor_ps(b, simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MIN)));
+    simde__m128i le = simde_mm_castps_si128(simde_mm_cmple_ps(a, b));
+    simde__m128i ge = simde_mm_castps_si128(simde_mm_cmpge_ps(a, negativeB));
+    return simde_mm_or_si128(simde_mm_andnot_si128(le, simde_mm_set1_epi32(INT_MIN)), simde_mm_andnot_si128(ge, simde_mm_set1_epi32(0x40000000)));
+}
+
 inline simde__m128i simde_mm_subs_epu32(simde__m128i a, simde__m128i b)
 {
     return simde_mm_sub_epi32(a, simde_mm_min_epu32(a, b));
