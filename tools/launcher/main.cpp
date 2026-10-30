@@ -34,6 +34,7 @@ namespace
     constexpr const wchar_t* FRAME_RATE_LABELS[] = { L"30 FPS (original)", L"60 FPS (experimental)", L"120 FPS (experimental)" };
     constexpr const wchar_t* SCALE_LABELS[] = { L"1x (1280 x 720, original)", L"2x (2560 x 1440)", L"3x (3840 x 2160)" };
     constexpr const wchar_t* AA_LABELS[] = { L"Off", L"2x MSAA (not implemented yet)", L"4x MSAA (not implemented yet)" };
+    constexpr const wchar_t* SHADOW_LABELS[] = { L"On", L"Off (avoids distant shadow flicker)" };
 
     enum Control
     {
@@ -42,12 +43,13 @@ namespace
         ID_FPS,
         ID_AA,
         ID_SCALE,
+        ID_SHADOWS,
         ID_GAME_PATH,
         ID_BROWSE,
         ID_LAUNCH,
     };
 
-    HWND g_resolution, g_display, g_fps, g_aa, g_scale, g_gamePath;
+    HWND g_resolution, g_display, g_fps, g_aa, g_scale, g_shadows, g_gamePath;
     HFONT g_font;
     std::wstring g_folder, g_iniPath;
 
@@ -116,6 +118,7 @@ namespace
         int fps = int(SendMessageW(g_fps, CB_GETCURSEL, 0, 0));
         int aa = int(SendMessageW(g_aa, CB_GETCURSEL, 0, 0));
         int scale = int(SendMessageW(g_scale, CB_GETCURSEL, 0, 0));
+        int shadows = int(SendMessageW(g_shadows, CB_GETCURSEL, 0, 0));
         std::wstring gamePath = GetText(g_gamePath);
 
         if (GetFileAttributesW(gamePath.c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -129,13 +132,15 @@ namespace
         WriteSetting(L"FrameRate", std::to_wstring(fps));
         WriteSetting(L"AntiAliasing", std::to_wstring(aa));
         WriteSetting(L"RenderScale", std::to_wstring(scale));
+        WriteSetting(L"Shadows", std::to_wstring(shadows));
         WriteSetting(L"Game", gamePath);
 
         const Resolution& r = RESOLUTIONS[resolution];
         std::wstring exe = g_folder + L"\\ARRecomp.exe";
         std::wstring command = L"\"" + exe + L"\" --game \"" + gamePath + L"\" --resolution " + std::to_wstring(r.width) + L"x" +
             std::to_wstring(r.height) + L" --display " + DISPLAY_ARGS[display] + L" --fps " + std::to_wstring(FRAME_RATES[fps]) +
-            L" --antialiasing " + std::to_wstring(aa == 0 ? 0 : 1 << aa) + L" --render-scale " + std::to_wstring(scale + 1);
+            L" --antialiasing " + std::to_wstring(aa == 0 ? 0 : 1 << aa) + L" --render-scale " + std::to_wstring(scale + 1) +
+            L" --shadows " + (shadows == 0 ? L"on" : L"off");
 
         // The game keeps its saves and caches in "user" next to where it runs: the folder set in launcher.ini
         // (WorkingFolder), or the launcher's own.
@@ -180,6 +185,10 @@ namespace
             AddLabel(window, L"Internal resolution", labelX, y, 125);
             g_scale = AddCombo(window, ID_SCALE, controlX, y, width, SCALE_LABELS, std::size(SCALE_LABELS),
                 ReadIndex(L"RenderScale", int(std::size(SCALE_LABELS))));
+            y += 40;
+            AddLabel(window, L"Shadows", labelX, y, 120);
+            g_shadows = AddCombo(window, ID_SHADOWS, controlX, y, width, SHADOW_LABELS, std::size(SHADOW_LABELS),
+                ReadIndex(L"Shadows", int(std::size(SHADOW_LABELS))));
             y += 40;
             AddLabel(window, L"Anti-aliasing", labelX, y, 120);
             g_aa = AddCombo(window, ID_AA, controlX, y, width, AA_LABELS, std::size(AA_LABELS), 0);
@@ -240,7 +249,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.lpszClassName = L"ARLauncher";
     RegisterClassExW(&windowClass);
 
-    RECT rect{ 0, 0, 480, 370 };
+    RECT rect{ 0, 0, 480, 410 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,

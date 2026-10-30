@@ -58,13 +58,15 @@ namespace gpu::d3d12
         void Execute(uint64_t fenceValue);
         void ResetAllocator(ID3D12CommandAllocator* allocator);
         void Present(UINT syncInterval, UINT flags);
+        void EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index);
+        void ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT count, ID3D12Resource* destination, UINT64 offset);
 
     private:
         enum class Type : uint32_t
         {
             ClearDepth, ClearColor, Close, CopyResource, CopyTexture, DrawIndexed, Draw, IndexBuffer, Topology,
             BlendFactor, RenderTargets, StencilRef, Scissors, Viewports, Reset, Barriers, Heaps, RootCbv, RootTable,
-            RootSrv, RootSignature, Pipeline, Execute, ResetAllocator, Present,
+            RootSrv, RootSignature, Pipeline, Execute, ResetAllocator, Present, EndQuery, ResolveQueryData,
         };
 
         // Fixed size command slot: large enough for a texture copy (two copy locations and a box).

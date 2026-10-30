@@ -31,7 +31,8 @@ static void PrintUsage()
         "  --display MODE         windowed, borderless or fullscreen (default windowed).\n"
         "  --fps N                Frame rate: 30 (default), 60 or 120.\n"
         "  --antialiasing N       Anti-aliasing samples (not implemented yet).\n"
-        "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n");
+        "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n"
+        "  --shadows on|off       Dynamic shadows (default on).\n");
 }
 
 int main(int argc, char* argv[])
@@ -86,6 +87,8 @@ int main(int argc, char* argv[])
             gpu::g_videoSettings.renderScale = std::clamp(atoi(argv[++i]), 1, 4);
         else if (arg == "--antialiasing" && i + 1 < argc)
             gpu::g_videoSettings.antiAliasing = atoi(argv[++i]);
+        else if (arg == "--shadows" && i + 1 < argc)
+            gpu::g_videoSettings.shadows = std::string_view(argv[++i]) != "off";
         else if (arg == "--dump-threads" && i + 1 < argc)
             dumpThreadsAfter = atoi(argv[++i]);
         else

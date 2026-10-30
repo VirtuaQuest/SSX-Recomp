@@ -383,6 +383,16 @@ namespace gpu::d3d12
         std::unordered_map<RenderTargetKey, std::vector<std::pair<uint64_t, D3D12_RECT>>, RenderTargetKeyHash> renderTargetWrites;
         uint64_t renderTargetClock = 0;
         std::unordered_map<uint32_t, ResolvedTexture> resolvedTextures;
+        // AR_GPU_TIMING: timestamps at the start and end of each frame slot, read back once the frame is done.
+        ComPtr<ID3D12QueryHeap> timestampHeap;
+        ComPtr<ID3D12Resource> timestampReadback;
+        uint64_t timestampFrequency = 0;
+        bool timestampsPending[FRAME_COUNT] = {};
+        // Per frame slot: [0] frame start, [1] frame end, then begin/end pairs of the scopes (GpuScope).
+        static constexpr uint32_t TIMESTAMPS_PER_FRAME = 2 + 2 * 4096;
+        uint32_t timestampsUsed[FRAME_COUNT] = {};
+        std::vector<uint8_t> scopeCategories[FRAME_COUNT];
+        uint32_t scopeDepth = 0;
         // Released textures by description with the frame they were released in. Creating and destroying resources
         // is slow (games resolve different sizes to the same address every frame), so they are reused.
         std::unordered_map<uint64_t, std::vector<std::pair<Texture, uint64_t>>> texturePool;
@@ -395,7 +405,7 @@ namespace gpu::d3d12
     // Time spent on the command processor thread, logged every 300 frames.
     struct Profile
     {
-        double draw, textures, vertices, present, presentWait;
+        double draw, textures, vertices, present, presentWait, gpu, gpuScopes[4];
         double constants, indices, pipeline, record, targets, setup, prepare;
         uint32_t draws, flushes, textureLookups, textureMisses, textureUploads;
         double textureHash, textureDecode;
@@ -527,6 +537,29 @@ namespace gpu::d3d12
             WaitForFence(frame.fenceValue);
         }
         frame.releasedResources.clear();
+        if (g.timestampHeap && g.timestampsPending[g.frameIndex])
+        {
+            uint64_t* times;
+            uint64_t base = uint64_t(g.frameIndex) * State::TIMESTAMPS_PER_FRAME;
+            D3D12_RANGE range{ base * 8, (base + g.timestampsUsed[g.frameIndex]) * 8 };
+            if (SUCCEEDED(g.timestampReadback->Map(0, &range, reinterpret_cast<void**>(&times))))
+            {
+                times += base;
+                uint64_t start = times[0], end = times[1];
+                if (end > start)
+                    g_profile.gpu += double(end - start) * 1000.0 / double(g.timestampFrequency);
+                const auto& categories = g.scopeCategories[g.frameIndex];
+                for (size_t i = 0; i < categories.size(); i++)
+                {
+                    uint64_t scopeStart = times[2 + i * 2], scopeEnd = times[3 + i * 2];
+                    if (scopeEnd > scopeStart)
+                        g_profile.gpuScopes[categories[i]] += double(scopeEnd - scopeStart) * 1000.0 / double(g.timestampFrequency);
+                }
+                D3D12_RANGE written{ 0, 0 };
+                g.timestampReadback->Unmap(0, &written);
+            }
+            g.timestampsPending[g.frameIndex] = false;
+        }
         if (!frame.uploadChecks.empty())
         {
             static uint64_t checked, changed;
@@ -582,7 +615,38 @@ namespace gpu::d3d12
         g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
         g.vertexUploads.clear();
         BindHeaps();
+        if (g.timestampHeap)
+        {
+            g.timestampsUsed[g.frameIndex] = 2;
+            g.scopeCategories[g.frameIndex].clear();
+            g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME);
+        }
     }
+
+    // AR_GPU_TIMING: GPU time of a kind of work (0 layout conversions, 1 render target syncs, 2 resolves, 3 composite
+    // textures); nested scopes count for the outermost one.
+    struct GpuScope
+    {
+        uint8_t category;
+        uint32_t index = UINT32_MAX;
+        explicit GpuScope(uint8_t category) : category(category)
+        {
+            if (!g.timestampHeap || g.scopeDepth++ != 0 || g.timestampsUsed[g.frameIndex] + 2 > State::TIMESTAMPS_PER_FRAME)
+                return;
+            index = g.timestampsUsed[g.frameIndex];
+            g.timestampsUsed[g.frameIndex] += 2;
+            g.scopeCategories[g.frameIndex].push_back(category);
+            g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME + index);
+        }
+        ~GpuScope()
+        {
+            if (!g.timestampHeap)
+                return;
+            g.scopeDepth--;
+            if (index != UINT32_MAX)
+                g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME + index + 1);
+        }
+    };
 
     static void Submit()
     {
@@ -1258,6 +1322,25 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.list.fence = g.fence.Get();
         g.list.swapChain = g.swapChain.Get();
         // AR_SINGLE_THREAD records straight into the command list on the GPU thread.
+        if (AR_ENV("AR_GPU_TIMING"))
+        {
+            D3D12_QUERY_HEAP_DESC queryDesc{ D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FRAME_COUNT * State::TIMESTAMPS_PER_FRAME, 0 };
+            D3D12_HEAP_PROPERTIES readbackHeap{ D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC readbackDesc{};
+            readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            readbackDesc.Width = uint64_t(FRAME_COUNT) * State::TIMESTAMPS_PER_FRAME * 8;
+            readbackDesc.Height = 1;
+            readbackDesc.DepthOrArraySize = 1;
+            readbackDesc.MipLevels = 1;
+            readbackDesc.SampleDesc.Count = 1;
+            readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(g.device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&g.timestampHeap))) ||
+                FAILED(g.device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&g.timestampReadback))) || FAILED(g.queue->GetTimestampFrequency(&g.timestampFrequency)))
+            {
+                g.timestampHeap.Reset();
+            }
+        }
         g.list.Start(!AR_ENV("AR_SINGLE_THREAD"));
         if (!AR_ENV("AR_SINGLE_THREAD"))
             LOGF_INFO("command submission runs on its own thread");
@@ -1571,6 +1654,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             versions.emplace_back(part.address, part.resolved->version);
         if (versions != composite.parts)
         {
+            GpuScope scope{ 3 };
             Transition(composite.texture, D3D12_RESOURCE_STATE_COPY_DEST);
             for (const Part& part : parts)
             {
@@ -1862,6 +1946,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         static const bool disabled = AR_ENV("AR_NO_LAYOUT") != nullptr;
         if (disabled || texture.layout == layout || !texture.resource)
             return;
+        GpuScope scope{ 0 };
 
         bool depth = texture.dsv != UINT32_MAX;
         auto& scratch = g.layoutScratch[{ uint32_t(texture.format), texture.width, texture.height }];
@@ -1989,6 +2074,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
         }
         std::sort(newer.begin(), newer.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        GpuScope scope{ 1 };
 
         for (auto& [otherStamp, entry] : newer)
         {
@@ -2552,6 +2638,15 @@ float4 main(float4 position : SV_Position) : SV_Target
                     return;
             }
         }
+        // Shadows off (--shadows off): draws into the title's shadow map depth buffer (EDRAM base 128, pitch 1040, where
+        // its three cascades are rendered) are skipped, except the rectangles that clear it, so the maps stay empty and
+        // nothing is in shadow. This also hides the far cascade's flicker (the title adds some casters only on some
+        // frames).
+        if (!g_videoSettings.shadows && draw.initiator.PrimType() != PrimitiveType::RectangleList &&
+            SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch() == 1040 && DepthInfo{ registers[RB_DEPTH_INFO] }.Base() == 128 &&
+            (registers[RB_DEPTHCONTROL] & 6) != 0)
+            return;
+
         // AR_SKIP_VS: the same for vertex shaders.
         static const std::vector<std::string> skippedVertexShaders = []
             {
@@ -3392,6 +3487,7 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static void Resolve(const be<uint32_t>* registers)
     {
+        GpuScope scope{ 2 };
         g.textureLookups.clear();
         CopyControl control{ registers[RB_COPY_CONTROL] };
         SampleScale sampleScale = GetSampleScale(registers);
@@ -3826,7 +3922,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         static auto lastReport = std::chrono::steady_clock::now();
         if (g.frameNumber % 300 == 150)
             SavePipelineCache();
-        if (g.frameNumber % 300 == 0 && g.frameNumber != 0 && AR_ENV("AR_PROFILE"))
+        if (g.frameNumber % 300 == 0 && g.frameNumber != 0 && (AR_ENV("AR_PROFILE") || AR_ENV("AR_LOG_FPS")))
         {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double, std::milli>(now - lastReport).count();
@@ -3838,6 +3934,13 @@ float4 main(float4 position : SV_Position) : SV_Target
                 g_profile.constants / 300, g_profile.indices / 300, g_profile.pipeline / 300, g_profile.targets / 300, g_profile.setup / 300, g_profile.record / 300, g_profile.prepare / 300, g_profile.flushes, g_profile.vertexBytes / 300.0 / 1048576.0, g_profile.textureLookups / 300,
                 g_profile.textureMisses / 300, g_profile.textureUploads, g_profile.textureHash / 300, g_profile.textureDecode / 300, g.pipelinesCreated, g.pipelinesLoaded,
                 g_profile.present / 300, g_profile.presentWait / 300);
+            if (g.timestampHeap)
+            {
+                const double* scopes = g_profile.gpuScopes;
+                LOGF_INFO("GPU time per frame: {:.2f} ms (layout conversions {:.2f}, render target syncs {:.2f}, resolves {:.2f}, "
+                    "composite textures {:.2f}, draws and the rest {:.2f})", g_profile.gpu / 300, scopes[0] / 300, scopes[1] / 300,
+                    scopes[2] / 300, scopes[3] / 300, (g_profile.gpu - scopes[0] - scopes[1] - scopes[2] - scopes[3]) / 300);
+            }
             g_profile = {};
         }
 
@@ -3914,6 +4017,14 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         g.list->ResourceBarrier(1, &barrier);
+        if (g.timestampHeap)
+        {
+            uint32_t base = g.frameIndex * State::TIMESTAMPS_PER_FRAME;
+            g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 1);
+            g.list->ResolveQueryData(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base, g.timestampsUsed[g.frameIndex],
+                g.timestampReadback.Get(), uint64_t(base) * 8);
+            g.timestampsPending[g.frameIndex] = true;
+        }
         Submit();
         g.list->Present(0, g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
         // Flip model swap chains go through their buffers in order.

@@ -23,6 +23,7 @@ namespace gpu::d3d12
         struct RootAddressData { UINT index; D3D12_GPU_VIRTUAL_ADDRESS address; };
         struct RootTableData { UINT index; D3D12_GPU_DESCRIPTOR_HANDLE handle; };
         struct PresentData { UINT syncInterval, flags; };
+        struct QueryData { ID3D12QueryHeap* heap; D3D12_QUERY_TYPE type; UINT start, count; ID3D12Resource* destination; UINT64 offset; };
     }
 
     void DeferredList::Start(bool threaded)
@@ -231,6 +232,18 @@ namespace gpu::d3d12
         case Type::ResetAllocator:
             (*reinterpret_cast<ID3D12CommandAllocator* const*>(data))->Reset();
             break;
+        case Type::EndQuery:
+        {
+            auto& d = *reinterpret_cast<const QueryData*>(data);
+            list->EndQuery(d.heap, d.type, d.start);
+            break;
+        }
+        case Type::ResolveQueryData:
+        {
+            auto& d = *reinterpret_cast<const QueryData*>(data);
+            list->ResolveQueryData(d.heap, d.type, d.start, d.count, d.destination, d.offset);
+            break;
+        }
         case Type::Present:
         {
             auto& d = *reinterpret_cast<const PresentData*>(data);
@@ -420,6 +433,19 @@ namespace gpu::d3d12
             m_recording = {};
             m_recording.reserve(BATCH_SIZE);
         }
+    }
+
+    void DeferredList::EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index)
+    {
+        Add<QueryData>(Type::EndQuery) = { heap, type, index, 1, nullptr, 0 };
+        Recorded();
+    }
+
+    void DeferredList::ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT count, ID3D12Resource* destination,
+        UINT64 offset)
+    {
+        Add<QueryData>(Type::ResolveQueryData) = { heap, type, start, count, destination, offset };
+        Recorded();
     }
 
     void DeferredList::ResetAllocator(ID3D12CommandAllocator* allocator)

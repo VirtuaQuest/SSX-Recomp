@@ -229,6 +229,23 @@ namespace gpu
         if (type > 1)
             return;
 
+        // Titles load the same shaders from the same addresses again and again: when the words there are the same as
+        // last time, the shader is too (a compare is much cheaper than copying and hashing them).
+        struct RecentLoad
+        {
+            std::vector<be<uint32_t>> words;
+            ShaderMicrocode* shader = nullptr;
+        };
+        static std::unordered_map<uint64_t, RecentLoad> recentLoads;
+        uint64_t loadKey = (uint64_t(reinterpret_cast<uintptr_t>(code)) << 1) ^ (uint64_t(sizeWords) << 48) ^ type;
+        auto& recent = recentLoads[loadKey];
+        if (recent.shader && recent.words.size() == sizeWords && memcmp(recent.words.data(), code, sizeWords * 4) == 0)
+        {
+            g_activeShaders[type] = recent.shader;
+            return;
+        }
+        recent.words.assign(code, code + sizeWords);
+
         std::vector<uint32_t> words(sizeWords);
         for (uint32_t i = 0; i < sizeWords; i++)
             words[i] = code[i];
@@ -255,6 +272,7 @@ namespace gpu
         }
 
         g_activeShaders[type] = shader.get();
+        recent.shader = shader.get();
     }
 
     void IssueDraw(const be<uint32_t>* registers, const DrawCall& draw)

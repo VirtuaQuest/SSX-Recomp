@@ -203,6 +203,17 @@ namespace gpu
         }
     }
 
+    // Whether registers [first, first + count) can be written as a block: none of them has side effects in
+    // WriteRegister (scratch registers mirrored to memory, coherency requests).
+    static bool PlainRegisters(uint32_t first, uint32_t count)
+    {
+        uint32_t end = first + count;
+        auto overlaps = [&](uint32_t start, uint32_t length) { return first < start + length && start < end; };
+        static const bool disabled = AR_ENV("AR_NO_BULK_REGISTERS") != nullptr;
+        return !disabled && end <= REGISTER_COUNT && !overlaps(SCRATCH_UMSK, 1) && !overlaps(SCRATCH_ADDR, 1) &&
+            !overlaps(SCRATCH_REG0, 8) && !overlaps(COHER_STATUS_HOST, 1);
+    }
+
     // Reads packet words from the ring buffer (wrapping) or from an indirect buffer.
     class PacketReader
     {
@@ -220,6 +231,22 @@ namespace gpu
                 m_position = 0;
 
             return value;
+        }
+
+        // Copies count words as they are in memory (big endian, like the register file).
+        void ReadRaw(be<uint32_t>* out, uint32_t count)
+        {
+            const auto* words = g_memory.Translate<be<uint32_t>>(m_base);
+            while (count != 0)
+            {
+                uint32_t run = m_wraps ? std::min(count, m_size - m_position) : count;
+                memcpy(out, words + m_position, run * 4);
+                out += run;
+                count -= run;
+                m_position += run;
+                if (m_wraps && m_position == m_size)
+                    m_position = 0;
+            }
         }
 
         void Skip(uint32_t count)
@@ -409,6 +436,12 @@ namespace gpu
         case PM4_SET_CONSTANT:
         {
             uint32_t base = ConstantRegister(read());
+            if (count > 1 && PlainRegisters(base, count - 1))
+            {
+                reader.ReadRaw(&Registers()[base], count - 1);
+                consumed += count - 1;
+                break;
+            }
             for (uint32_t i = 1; i < count; i++)
                 WriteRegister(base + i - 1, read());
             break;
@@ -418,6 +451,12 @@ namespace gpu
         case PM4_SET_SHADER_CONSTANTS:
         {
             uint32_t base = read() & 0xFFFF;
+            if (count > 1 && PlainRegisters(base, count - 1))
+            {
+                reader.ReadRaw(&Registers()[base], count - 1);
+                consumed += count - 1;
+                break;
+            }
             for (uint32_t i = 1; i < count; i++)
                 WriteRegister(base + i - 1, read());
             break;
@@ -433,8 +472,13 @@ namespace gpu
                 LOGF_INFO("load alu constant from 0x{:08X} to register 0x{:04X}, {} words", address, base, sizeWords);
             if (g_checkConstantLoads)
                 g_constantLoads.push_back({ address, sizeWords, CheckHash(source, sizeWords) });
-            for (uint32_t i = 0; i < sizeWords; i++)
-                WriteRegister(base + i, source[i]);
+            if (PlainRegisters(base, sizeWords))
+                memcpy(&Registers()[base], source, sizeWords * 4);
+            else
+            {
+                for (uint32_t i = 0; i < sizeWords; i++)
+                    WriteRegister(base + i, source[i]);
+            }
             break;
         }
 
@@ -721,6 +765,11 @@ namespace gpu
             uint32_t base = header & 0x7FFF;
             uint32_t count = ((header >> 16) & 0x3FFF) + 1;
             bool single = (header >> 15) & 1;
+            if (!single && PlainRegisters(base, count))
+            {
+                reader.ReadRaw(&Registers()[base], count);
+                break;
+            }
             for (uint32_t i = 0; i < count; i++)
                 WriteRegister(single ? base : base + i, reader.Read());
             break;
@@ -837,8 +886,30 @@ namespace gpu
             }
 
             PacketReader reader(base, size, g_readPointer, true);
+            auto busyStart = std::chrono::steady_clock::now();
             ExecuteBuffer(reader, writePointer);
             PublishReadPointer(writePointer);
+
+            // How busy this thread is (AR_LOG_FPS): the frame rate can't exceed what it manages.
+            static const bool logBusy = AR_ENV("AR_LOG_FPS") != nullptr;
+            if (logBusy)
+            {
+                static double busy;
+                static uint64_t lastFrames;
+                static auto lastReport = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                busy += std::chrono::duration<double, std::milli>(now - busyStart).count();
+                if (now - lastReport > std::chrono::seconds(5))
+                {
+                    double elapsed = std::chrono::duration<double, std::milli>(now - lastReport).count();
+                    uint64_t frames = g_frames - lastFrames;
+                    LOGF_INFO("command processor busy {:.0f}% ({:.2f} ms per frame over {} frames)", busy * 100.0 / elapsed,
+                        frames ? busy / frames : 0.0, frames);
+                    busy = 0.0;
+                    lastFrames = g_frames;
+                    lastReport = now;
+                }
+            }
         }
     }
 

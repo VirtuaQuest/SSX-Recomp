@@ -100,6 +100,12 @@ texture lookups. What mattered, roughly in order:
    scenes 10-20% faster. Name pipeline library entries by state key and shader bytecode, or entries from older
    builds collide with new ones and those pipelines get recompiled every run.
 
+7. Where the time really goes at high frame rates: the title's render thread spent ~40% spinning in D3D's block on
+   fence (frame pacing waits for the GPU to finish the previous frame), so its own work was ~6 ms a frame; the GPU
+   (RTX 3080 Ti, AR_GPU_TIMING) ~5-8 ms; the bottleneck is the GPU command processor thread (~10 ms in heavy fights).
+   Constant and register blocks without side effects are copied in one piece, and shader loads compare the
+   microcode at the same address with the last load instead of hashing it.
+
 Profile instead of guessing: `AR_HOST_PROFILE=command` (the GPU thread) and `AR_THREAD_PROFILE=1` (guest threads)
 show where time goes; idle time in the GPU thread means the title is the bottleneck.
 
@@ -139,7 +145,7 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 
 ## Open issues
 
-- Distant shadows occasionally flicker. Cause found, fix not yet: the title itself issues some large shadow casters
+- Distant shadows occasionally flicker (the launcher's Shadows Off setting avoids it). Cause found, fix not yet: the title itself issues some large shadow casters
   (whole buildings drawn with the instanced shaders 497B89DE/4631A8B4, e.g. vertex buffer 0x126320A0) into the far
   cascade on some frames and not on others; the renderer draws exactly what it gets (inputs, upload memory, D3D12
   state and GPU validation all check out, and the clears leave empty maps when casters are skipped). Next: hook the

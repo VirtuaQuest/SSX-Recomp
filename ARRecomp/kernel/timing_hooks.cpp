@@ -2,6 +2,56 @@
 #include <kernel/memory.h>
 #include <gpu/video_settings.h>
 
+// D3D's block on fence (device r3, fence r4): kicks the command buffer when the fence is the newest one, then spins
+// until the GPU's completed fence (*(device + 11024)) reaches it (the device's newest fence is at device + 11036).
+//
+// Diagnostics (AR_LOG_FENCE_WAITS): time spent waiting per caller and how far behind the newest fence the target was.
+PPC_FUNC_IMPL(__imp__sub_82238EC8);
+PPC_FUNC(sub_82238EC8)
+{
+    static const bool logWaits = AR_ENV("AR_LOG_FENCE_WAITS") != nullptr;
+    if (!logWaits)
+    {
+        __imp__sub_82238EC8(ctx, base);
+        return;
+    }
+
+    uint32_t caller = uint32_t(ctx.lr), device = ctx.r3.u32, fence = ctx.r4.u32;
+    uint32_t behind = PPC_LOAD_U32(device + 11036) - fence;
+    auto start = std::chrono::steady_clock::now();
+    __imp__sub_82238EC8(ctx, base);
+    double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+    struct Entry
+    {
+        uint32_t calls = 0;
+        double total = 0.0;
+        std::map<uint32_t, uint32_t> behind;
+    };
+    static std::mutex mutex;
+    static std::map<uint32_t, Entry> entries;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& entry = entries[caller];
+    entry.calls++;
+    entry.total += waited;
+    entry.behind[std::min(behind, 9u)]++;
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(5))
+        return;
+    lastReport = now;
+    std::string text;
+    for (const auto& [address, value] : entries)
+    {
+        std::string distances;
+        for (auto [distance, count] : value.behind)
+            distances += fmt::format(" {}:{}", distance, count);
+        text += fmt::format("\n    caller {:08X}: {} waits, {:.0f} ms (fences behind newest:{})", address, value.calls, value.total, distances);
+    }
+    LOGF_INFO("D3D fence waits in 5 s:{}", text);
+    entries.clear();
+}
+
 // The title's QueryPerformanceCounter: stores the 64-bit time base at r3 and returns 1.
 //
 // Diagnostics (AR_LOG_QPC): calls per guest return address, every 5 seconds.

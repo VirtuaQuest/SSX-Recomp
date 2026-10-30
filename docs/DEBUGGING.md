@@ -9,7 +9,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 |---|---|
 | `--game <iso or folder>` | Game files |
 | `--xex`, `--user` | Executable and user data folder overrides |
-| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing N` | Video settings (what the launcher passes) |
+| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing N`, `--shadows on\|off` | Video settings (what the launcher passes) |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
 
@@ -24,7 +24,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 
 Arguments after the name can be mixed: `VAR=value` words become environment settings, the rest go to the game
 (`fight.sh run1 AR_SINGLE_THREAD=1 --fps 60`). `AR_ISO` and `AR_EXE` override the disc image and executable.
-Analysis: `summ.py` (trace summary), `altscore.py` and `period.py` (flicker), `speed.py` (game speed), `drawsets.py`,
+Analysis: `perdraw.py` (fight logs: GPU thread time per draw, the yardstick for renderer speed), `summ.py` (trace summary), `altscore.py` and `period.py` (flicker), `speed.py` (game speed), `drawsets.py`,
 `worldcmp.py` and `regdiff.py` (`AR_SHADOW_LOG` logs: draws, constants, context registers per frame).
 
 ## Frames, dumps and traces
@@ -48,6 +48,9 @@ Analysis: `summ.py` (trace summary), `altscore.py` and `period.py` (flicker), `s
 | Switch | |
 |---|---|
 | `AR_PROFILE` | Per-stage draw timing every 300 frames (adds clock reads per draw) |
+| `AR_LOG_FPS` | Frame rate every 300 frames and the GPU thread's busy time every 5 s, without the per-stage cost |
+| `AR_GPU_TIMING` | GPU time per frame, split into layout conversions, render target syncs, resolves, composites and draws |
+| `AR_LOG_FENCE_WAITS` | Time the title's D3D spends waiting for GPU fences, per caller (82245630 is its frame pacing) |
 | `AR_HOST_PROFILE=<thread name part>` | Samples host threads, e.g. `command` for the GPU thread (no spaces) |
 | `AR_THREAD_PROFILE` | Samples guest threads (slows the game; don't judge frame rates with it) |
 | `AR_LOG_SWAP_LATENCY`, `AR_LOG_FENCES`, `AR_LOG_GPU_WAITS`, `AR_LOG_IBS` | Swap latency, fences, waits, indirect buffers |
@@ -73,6 +76,7 @@ Analysis: `summ.py` (trace summary), `altscore.py` and `period.py` (flicker), `s
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
 | `AR_NO_DEPTH_CLIP`, `AR_NO_DEPTH_TEST` | Depth clipping (clamps instead), depth testing |
 | `AR_NO_STATE_CACHE`, `AR_FULL_HASH`, `AR_FULL_CONSTANTS`, `AR_FULL_VERTEX_BUFFERS` | Skipping redundant state, sampled hashes, constant and vertex range trimming |
+| `AR_NO_BULK_REGISTERS` | Copying constant and register blocks without side effects in one piece |
 | `AR_NO_CPU_SETS`, `AR_NULL_CUBE`, `AR_WAKE_ALL`, `AR_GPU_LAG` | Performance core selection; cube textures; experiments |
 
 ## Driving the game without a controller
