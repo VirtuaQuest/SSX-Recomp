@@ -1955,7 +1955,8 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_SYNC:
-        // no op
+        // Unlike lwsync and eieio, sync orders stores before later loads, which x86 doesn't do without a fence.
+        println("\tPPC_SYNC();");
         break;
 
     case PPC_INST_TDLGEI:

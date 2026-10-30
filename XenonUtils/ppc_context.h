@@ -31,6 +31,12 @@
 
 #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
 
+// sync: a full barrier. x86 keeps the order of loads and of stores, but lets a load pass an earlier store; guest code
+// relying on sync for that (a thread publishing a flag and then checking another thread's) needs a fence.
+#ifndef PPC_SYNC
+#define PPC_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
+
 // Host address of a guest memory access. Defining it allows remapping parts of the guest address space, for
 // example to emulate the 4 KB offset of the Xbox 360's 0xE0000000 physical memory view.
 #ifndef PPC_MEMORY_ADDRESS
