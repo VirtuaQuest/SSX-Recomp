@@ -5519,6 +5519,13 @@ again:
             || (opcode->flags & dialect) == 0)
             continue;
 
+        /* Primary opcode 4 is VMX and VMX128 on the Xenon: the PPC405/440 multiply-accumulate instructions sharing
+           it would shadow VMX128 instructions (vsldoi128 decoded as mullhwu.).  */
+        if (op == 4 && (dialect & PPC_OPCODE_VMX_128) != 0
+            && (opcode->flags & (PPC_OPCODE_403 | PPC_OPCODE_440)) != 0
+            && (opcode->flags & (PPC_OPCODE_ALTIVEC | PPC_OPCODE_VMX_128)) == 0)
+            continue;
+
         /* Make two passes over the operands.  First see if any of them
        have extraction functions, and, if they do, make sure the
        instruction is valid.  */
@@ -5692,6 +5699,13 @@ again:
 
         if ((insn & opcode->mask) != opcode->opcode
             || (opcode->flags & dialect) == 0)
+            continue;
+
+        /* Primary opcode 4 is VMX and VMX128 on the Xenon: the PPC405/440 multiply-accumulate instructions sharing
+           it would shadow VMX128 instructions (vsldoi128 decoded as mullhwu.).  */
+        if (op == 4 && (dialect & PPC_OPCODE_VMX_128) != 0
+            && (opcode->flags & (PPC_OPCODE_403 | PPC_OPCODE_440)) != 0
+            && (opcode->flags & (PPC_OPCODE_ALTIVEC | PPC_OPCODE_VMX_128)) == 0)
             continue;
 
         /* Make two passes over the operands.  First see if any of them
