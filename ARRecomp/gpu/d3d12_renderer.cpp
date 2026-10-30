@@ -93,6 +93,7 @@ namespace gpu::d3d12
         // Render targets: the sample layout their texels are in. 0 is EDRAM order (as single sampled surfaces see
         // it); 1 and 2 are as rasterized with 2x and 4x MSAA (a sample per texel, samples of a pixel adjacent).
         uint32_t layout = 0;
+        uint64_t poolKey = 0; // Its description, for reuse once released (0: not pooled).
     };
 
     struct DescriptorAllocator
@@ -135,6 +136,8 @@ namespace gpu::d3d12
         // Render target and depth views are read when commands are replayed, so they are reused after the frame too.
         std::vector<uint32_t> releasedRtvs;
         std::vector<uint32_t> releasedDsvs;
+        // Released textures, reusable (by CreateTexture) once the GPU is done with this frame.
+        std::vector<Texture> pooledTextures;
     };
 
     struct RenderTargetKey
@@ -369,6 +372,9 @@ namespace gpu::d3d12
         std::unordered_map<RenderTargetKey, std::vector<std::pair<uint64_t, D3D12_RECT>>, RenderTargetKeyHash> renderTargetWrites;
         uint64_t renderTargetClock = 0;
         std::unordered_map<uint32_t, ResolvedTexture> resolvedTextures;
+        // Released textures by description with the frame they were released in. Creating and destroying resources
+        // is slow (games resolve different sizes to the same address every frame), so they are reused.
+        std::unordered_map<uint64_t, std::vector<std::pair<Texture, uint64_t>>> texturePool;
         std::unordered_map<uint64_t, CompositeTexture> compositeTextures;
         uint64_t resolveVersion = 0;
         std::unordered_map<uint64_t, CachedTexture> textures;
@@ -437,6 +443,12 @@ namespace gpu::d3d12
     static void ReleaseTexture(Texture& texture)
     {
         auto& frame = g.frames[g.frameIndex];
+        if (texture.poolKey != 0 && texture.resource)
+        {
+            frame.pooledTextures.push_back(std::move(texture));
+            texture = {};
+            return;
+        }
         if (texture.resource)
             frame.releasedResources.push_back(std::move(texture.resource));
         if (texture.srv != UINT32_MAX)
@@ -484,6 +496,27 @@ namespace gpu::d3d12
             WaitForFence(frame.fenceValue);
         }
         frame.releasedResources.clear();
+        for (Texture& pooled : frame.pooledTextures)
+            g.texturePool[pooled.poolKey].emplace_back(std::move(pooled), g.frameNumber);
+        frame.pooledTextures.clear();
+        if (g.frameNumber % 300 == 0)
+        {
+            // Unused for 10 seconds: the GPU is long done with them.
+            for (auto& [key, list] : g.texturePool)
+            {
+                std::erase_if(list, [](auto& entry)
+                    {
+                        if (g.frameNumber - entry.second < 300)
+                            return false;
+                        Texture& texture = entry.first;
+                        g.views.Free(texture.srv);
+                        g.views.Free(texture.stencilSrv);
+                        g.rtvs.Free(texture.rtv);
+                        g.dsvs.Free(texture.dsv);
+                        return true;
+                    });
+            }
+        }
         for (uint32_t srv : frame.releasedSrvs)
             g.views.Free(srv);
         frame.releasedSrvs.clear();
@@ -1145,10 +1178,36 @@ float4 main(float4 position : SV_Position) : SV_Target
     static Texture CreateTexture(uint32_t width, uint32_t height, uint32_t depth, bool cube, DXGI_FORMAT format,
         D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state)
     {
+        uint64_t poolWords[4] = { (uint64_t(width) << 32) | height, (uint64_t(depth) << 1) | (cube ? 1 : 0), uint64_t(format), uint64_t(flags) };
+        uint64_t poolKey = HashMemory(reinterpret_cast<const uint8_t*>(poolWords), sizeof(poolWords)) | 1;
+        static const bool noPool = AR_ENV("AR_NO_TEXTURE_POOL") != nullptr;
+        if (!noPool)
+        {
+            auto pooled = g.texturePool.find(poolKey);
+            if (pooled != g.texturePool.end() && !pooled->second.empty())
+            {
+                Texture texture = std::move(pooled->second.back().first);
+                pooled->second.pop_back();
+                texture.layout = 0;
+                Transition(texture, state);
+                return texture;
+            }
+        }
+
+        // Diagnostics (AR_LOG_CREATES=<from frame>): textures created during play.
+        static const int64_t logCreatesFrom = AR_ENV("AR_LOG_CREATES") ? atoll(AR_ENV("AR_LOG_CREATES")) : -1;
+        if (logCreatesFrom >= 0 && int64_t(g.frameNumber) >= logCreatesFrom)
+        {
+            static uint32_t logged;
+            if (logged++ < 300)
+                LOGF_INFO("create texture frame {}: {}x{}x{} format {} flags {}", g.frameNumber, width, height, depth, uint32_t(format), uint32_t(flags));
+        }
+
         Texture texture;
         texture.format = format;
         texture.width = width;
         texture.height = height;
+        texture.poolKey = noPool ? 0 : poolKey;
 
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = (!cube && depth > 1) ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2598,7 +2657,19 @@ float4 main(float4 position : SV_Position) : SV_Target
         std::vector<uint32_t> indices;
         bool indexed = draw.initiator.Source() != SourceSelect::AutoIndex;
         bool primitiveReset = ((modeControl >> 21) & 1) && (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP || topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
-        if (conversion != Conversion::None || (indexed && (primitiveReset || draw.initiator.Source() == SourceSelect::Immediate)))
+        // Strips whose reset index is the host's cut value for the index size use the guest indices as they are.
+        bool nativeReset = false;
+        if (primitiveReset && conversion == Conversion::None && draw.initiator.Source() == SourceSelect::DMA && !AR_ENV("AR_NO_NATIVE_RESET"))
+        {
+            uint32_t reset = registers[VGT_MULTI_PRIM_IB_RESET_INDX];
+            bool index32 = draw.initiator.Index32();
+            if ((!index32 && (reset & 0xFFFF) == 0xFFFF) || (index32 && reset == 0xFFFFFFFF))
+            {
+                nativeReset = true;
+                key.stripCut = index32 ? 2 : 1;
+            }
+        }
+        if (conversion != Conversion::None || (indexed && ((primitiveReset && !nativeReset) || draw.initiator.Source() == SourceSelect::Immediate)))
         {
             std::vector<uint32_t> source = ReadIndices(draw, count);
             if (primitiveReset)

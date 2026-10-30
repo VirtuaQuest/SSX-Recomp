@@ -107,6 +107,7 @@ int main(int argc, char* argv[])
     gpu::PrecompileShaders(userPath / "shader_cache" / "microcode");
     gpu::d3d12::SetPipelineCacheFile(userPath / "shader_cache" / "pipelines.bin");
     StartThreadProfiler();
+    StartHostProfiler();
 
     if (g_memory.base == nullptr)
     {

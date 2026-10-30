@@ -90,3 +90,6 @@ void DumpGuestThreads();
 
 // Diagnostics: with AR_THREAD_PROFILE set, logs where busy guest threads spend their time.
 void StartThreadProfiler();
+
+// Diagnostics: with AR_HOST_PROFILE=<thread name>, logs where those host threads spend their time.
+void StartHostProfiler();
