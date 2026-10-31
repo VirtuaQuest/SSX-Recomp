@@ -3019,6 +3019,9 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
 {
     out.reserve(10 * 1024 * 1024);
 
+    // Writing into a missing directory fails every fopen, and fwrite to a null file aborts without a message.
+    std::filesystem::create_directories(std::filesystem::path(config.directoryPath) / config.outDirectoryPath);
+
     {
         println("#pragma once");
 
