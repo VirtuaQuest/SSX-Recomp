@@ -129,6 +129,20 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 - Watch out for the machine: other games and emulators running in the background slow everything uniformly. Check
   CPU use before benchmarking.
 - Dumps are big: always limit them (`AR_DUMP_ONLY`, `AR_DUMP_FRAME/FRAMES`) and clear old ones. They filled a disk once.
+- To find what runs too fast at high frame rates, scan memory for values that change by exactly 1 per update at
+  120 fps (`AR_SCAN_TIMERS=@<seconds>`): anything following the time step changes by 0.25-0.5 there, and the scan's
+  own slow first frame weeds out the rest. `AR_SCAN_TIMERS_WATCH` then logs the code writing a sample of them. That
+  led from a UI element's derived counter to its time, to the manager adding a fixed step.
+- For draws that come and go, measure them on the GPU instead of comparing images: an occlusion query around each
+  draw (`AR_SHADOW_PIXELS`) gives the samples it wrote, and drawing it again without depth testing gives its
+  rasterized area. That separates "not issued" from "failed the depth test" from "rasterized nothing".
+- Segment per-frame comparisons by pass (here by cascade, using the resolves between them): totals over a whole frame
+  hid a draw moving between cascades. And compare per instance (mesh plus world matrix), not per vertex buffer.
+- To tie GPU-side draws to guest code, put NOP packets with an ID into the title's command buffer from a hook on its
+  draw functions (`AR_MARK_DRAWS`): the D3D device's write pointer is at device + 48 (pre-increment), limit at + 56.
+- Checking upload memory after the GPU is done is only meaningful before the space is reused: mid-frame flushes
+  reuse the frame's slice, so check at the flush (`CheckOcclusionInputs`), not at the end of the frame. Reading
+  upload heap memory from the CPU is extremely slow (write combined): hash at upload time instead.
 
 ## Anarchy Reigns specifics
 
@@ -136,6 +150,17 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 - Timing: `sub_82BD7EC8` sets the game's time step (float at 0x830778C8, in 30 Hz frames) from constants at
   0x820A4130 (+16 default 1, +68 maximum 2, +716 ms scale 0.03, +2176 minimum 1.01). `kernel/timing_hooks.cpp` lowers
   the minimum to 0.2 when the frame rate setting is above 30.
+  `sub_82BC6DE8` spreads it into per-category steps at 0x8312124C (read through `sub_82BC9B28(category)`; some
+  categories are in 60 Hz units). A flag (bit 0x2000 at 0x83074D14) forces the default step of 1.
+- The UI does not use the time step: its updates pass their elements a fixed 1/30 s per update (the constant at
+  0x820A4130 + 192), so above 30 fps the HUD, radar pulses, dialogue and result screens ran 2-4x fast. The UI
+  manager `sub_827BA3B0` (walks its elements, calling each one's update, vtable slot 3, with that step; an element's
+  time is the float at +116), its twin `sub_82789708`, `sub_827B5BC8`/`827B6690`/`827B6E40` and `sub_827F7828`
+  get mid-function hooks (`AR.toml`, `UiTimeStepHook*` in `kernel/timing_hooks.cpp`) that scale the step by the
+  time step. In gameplay the first, second and last run every frame; the other three were not seen running (menus or
+  screens not reached by the tests). Other code that keeps the 1/30 constant in a register and passes it on, not
+  hooked yet: `sub_829F9750`, `sub_829F9DD0`, `sub_82BB0F48`, `sub_8281A2A8`. If something else still runs fast
+  above 30 fps, look there first, then use `AR_SCAN_TIMERS`.
 - D3D's `IDirect3DQuery9::GetData` is `sub_8223F950` (device fence progress at device + 11036, completed value at
   *(device + 11024)); the title's QueryPerformanceCounter is `sub_8245B458`.
 - Effects pass depth is restored by drawing saved depth words as colour at EDRAM 0x5B7; the shadow map depth buffer is
@@ -145,13 +170,44 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 
 ## Open issues
 
-- Distant shadows occasionally flicker (the launcher's Shadows Off setting avoids it). Cause found, fix not yet: the title itself issues some large shadow casters
-  (whole buildings drawn with the instanced shaders 497B89DE/4631A8B4, e.g. vertex buffer 0x126320A0) into the far
-  cascade on some frames and not on others; the renderer draws exactly what it gets (inputs, upload memory, D3D12
-  state and GPU validation all check out, and the clears leave empty maps when casters are skipped). Next: hook the
-  title's draw call for that mesh, log the guest call stack and find the culling decision (a job system race or time
-  sliced culling behaving differently with recompiled timing are the main suspects; kernel waits don't time out).
-  Lesson: compare draws per instance (mesh plus world matrix), not per mesh, or extra instances stay invisible.
+- Distant shadows occasionally flicker (the launcher's Shadows Off setting avoids it). Not fixed. What is known
+  (October 2026, `AR_SHADOW_PIXELS` occlusion queries per shadow map draw):
+  - The flicker is whole buildings vanishing from (or, when they occlude others, appearing in) the far cascade for
+    one frame, 10-70 times in a `shadow_flicker.sh` run (`pxdrop.py`).
+  - The title issues those draws every frame: same draw set per cascade, same order, same call chains. The earlier
+    note blaming the title for skipping casters was wrong; it compared all cascades together.
+  - In the bad frame the draw rasterizes nothing at all: drawn again without depth testing it still covers 0
+    pixels, where neighbouring frames cover 20,000-120,000. So the vertices land outside the view or are degenerate.
+  - Yet everything the draw reads is identical to the neighbouring frames and intact until the GPU is done: vertex
+    data (same upload offset and hash), indices, the constants the shader reads (c16-c19 world, constant; c28-c31
+    light matrix, smooth), system constants, context registers, pipeline object, topology and count.
+  - Ruled out by switches, with drops still present: the state cache (`AR_NO_STATE_CACHE`), the submission thread
+    (`AR_SINGLE_THREAD`), MSAA layout conversion (`AR_NO_LAYOUT`), native strip restart (`AR_NO_NATIVE_RESET`), depth
+    clipping (`AR_NO_DEPTH_CLIP`), a full clear of the shadow map (`AR_FORCE_SHADOW_CLEAR`), EDRAM syncs (none into
+    the shadow map), stale vertex upload reuse (`AR_CHECK_VERTEX_MEMO`: none), mid-frame upload flushes (they happen
+    in the middle cascade, after the far one).
+  - Proven GPU side (31 October): running the far cascade's shader (741845E2, a plain float3 fetch and two matrix
+    transforms) on the CPU for a dropped draw puts its vertices inside the map at normal depths, exactly like the
+    neighbouring frames (`AR_SHADOW_CPU_VS`), and a GPU copy of every input the draw reads matches what the CPU
+    wrote (`AR_SHADOW_GPUCHECK`). Yet on the GPU, even as points with the viewport transform shrunk 64x, no vertex
+    lands anywhere: the outputs are invalid.
+  - Also ruled out, drops still present: a full rebind of everything before redrawing (`AR_SHADOW_REBIND`), redrawing
+    the far cascade just before its resolve (`AR_SHADOW_LATE`; so not a stretch of GPU time), fresh copies of
+    constants, vertex data and indices (`AR_SHADOW_FRESH`), the depth descriptor (unchanged), serialized frames
+    (`AR_SERIALIZE_FRAMES`), no vertex cache (`AR_NO_VERTEX_CACHE`), whole vertex buffers (`AR_FULL_VERTEX_BUFFERS`),
+    strips as triangle lists (`AR_STRIPS_AS_LISTS`), upload addresses not reused for frames (`AR_UPLOAD_RING`,
+    `AR_ROTATE_UPLOADS`), cache coherent upload memory (`AR_UPLOAD_WRITE_BACK`), a store fence before submitting
+    (`AR_UPLOAD_FENCE`), and all uploads read from a video memory mirror (`AR_VRAM_UPLOADS`, 20-40 MB copied per
+    frame). Redraws reading video memory copies rendered for about half the dropped draws once, but the mirror for
+    the real draws did not remove drops, so that was most likely noise.
+  - The same few objects drop most (vertex buffers 09E150A0, 09E330A0, 0B2CF0A0, 09E590A0, 09E200A0: small strips
+    drawn at an index offset; 0AE870A0, 0AD0F0A0), often several of them in one frame, in a run of consecutive draws.
+    Run to run counts vary from 0 to 70, so compare several runs (`pxdrop.py`, without dumps: `AR_DUMP_ONLY=1`).
+  - Next: a PIX (or NVIDIA Nsight) capture of a frame with a drop, to see the vertex shader's real outputs and the
+    draw's state as the driver has it; trying another GPU or driver version (RTX 3080 Ti, driver 32.0.15.9597) would
+    show whether it is a driver problem. `AR_SHADOW_SO` (stream output capture) is wired up but captured nothing.
+  - Test artifact found on the way: each dumped resolve (`AR_DUMP_FRAME`) waits for the GPU (`SaveScreenshot`), so
+    dumping runs have a mid-frame flush per dump; normal play has none.
 - Short bursts (about 2 s) where the GPU thread is uniformly ~4x slower, mostly with other games running.
 - 120 fps setting: correct speed; light scenes 110-120 fps, the heaviest fights 56-85 (the GPU command processor
   thread is saturated, and the title's render thread is close behind).

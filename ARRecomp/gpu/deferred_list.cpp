@@ -23,6 +23,8 @@ namespace gpu::d3d12
         struct RootAddressData { UINT index; D3D12_GPU_VIRTUAL_ADDRESS address; };
         struct RootTableData { UINT index; D3D12_GPU_DESCRIPTOR_HANDLE handle; };
         struct PresentData { UINT syncInterval, flags; };
+        struct StreamOutputData { D3D12_STREAM_OUTPUT_BUFFER_VIEW view; bool set; };
+        struct CopyBufferData { ID3D12Resource* dest; UINT64 destOffset; ID3D12Resource* source; UINT64 sourceOffset, size; };
         struct QueryData { ID3D12QueryHeap* heap; D3D12_QUERY_TYPE type; UINT start, count; ID3D12Resource* destination; UINT64 offset; };
     }
 
@@ -222,6 +224,12 @@ namespace gpu::d3d12
         case Type::Pipeline:
             list->SetPipelineState(*reinterpret_cast<ID3D12PipelineState* const*>(data));
             break;
+        case Type::ExecuteOther:
+        {
+            ID3D12CommandList* lists[] = { *reinterpret_cast<ID3D12CommandList* const*>(data) };
+            queue->ExecuteCommandLists(1, lists);
+            break;
+        }
         case Type::Execute:
         {
             ID3D12CommandList* lists[] = { list };
@@ -232,6 +240,24 @@ namespace gpu::d3d12
         case Type::ResetAllocator:
             (*reinterpret_cast<ID3D12CommandAllocator* const*>(data))->Reset();
             break;
+        case Type::StreamOutput:
+        {
+            auto& d = *reinterpret_cast<const StreamOutputData*>(data);
+            list->SOSetTargets(0, 1, d.set ? &d.view : nullptr);
+            break;
+        }
+        case Type::CopyBuffer:
+        {
+            auto& d = *reinterpret_cast<const CopyBufferData*>(data);
+            list->CopyBufferRegion(d.dest, d.destOffset, d.source, d.sourceOffset, d.size);
+            break;
+        }
+        case Type::BeginQuery:
+        {
+            auto& d = *reinterpret_cast<const QueryData*>(data);
+            list->BeginQuery(d.heap, d.type, d.start);
+            break;
+        }
         case Type::EndQuery:
         {
             auto& d = *reinterpret_cast<const QueryData*>(data);
@@ -435,6 +461,28 @@ namespace gpu::d3d12
         }
     }
 
+    void DeferredList::SOSetTargets(const D3D12_STREAM_OUTPUT_BUFFER_VIEW* view)
+    {
+        auto& d = Add<StreamOutputData>(Type::StreamOutput);
+        d.set = view != nullptr;
+        if (view)
+            d.view = *view;
+        Recorded();
+    }
+
+    void DeferredList::CopyBufferRegion(ID3D12Resource* dest, UINT64 destOffset, ID3D12Resource* source, UINT64 sourceOffset,
+        UINT64 size)
+    {
+        Add<CopyBufferData>(Type::CopyBuffer) = { dest, destOffset, source, sourceOffset, size };
+        Recorded();
+    }
+
+    void DeferredList::BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index)
+    {
+        Add<QueryData>(Type::BeginQuery) = { heap, type, index, 1, nullptr, 0 };
+        Recorded();
+    }
+
     void DeferredList::EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index)
     {
         Add<QueryData>(Type::EndQuery) = { heap, type, index, 1, nullptr, 0 };
@@ -445,6 +493,12 @@ namespace gpu::d3d12
         UINT64 offset)
     {
         Add<QueryData>(Type::ResolveQueryData) = { heap, type, start, count, destination, offset };
+        Recorded();
+    }
+
+    void DeferredList::ExecuteOther(ID3D12CommandList* other)
+    {
+        Add<ID3D12CommandList*>(Type::ExecuteOther) = other;
         Recorded();
     }
 

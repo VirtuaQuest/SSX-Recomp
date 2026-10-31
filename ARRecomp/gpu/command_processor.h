@@ -24,6 +24,17 @@ namespace gpu
     // Called by VdSwap, to measure the GPU's latency behind the CPU.
     void NoteSwapSubmitted();
 
+    // Frames the title has submitted (VdSwap calls): the CPU side frame number.
+    uint32_t SubmittedSwaps();
+
+    // Diagnostics: the ID of the last draw marker the CPU side inserted into the command stream (AR_MARK_DRAWS).
+    uint32_t CurrentDrawMarker();
+    uint32_t CurrentDrawMarkerObject();
+
     // Prints the command processor state, for diagnosing hangs.
     void DumpState();
+
+    // Diagnostics: the indirect buffers (guest physical address and size in words) the packet being executed was
+    // reached through, outermost first. Returns how many.
+    uint32_t GetIndirectBufferChain(uint32_t* addresses, uint32_t* sizes, uint32_t capacity);
 }

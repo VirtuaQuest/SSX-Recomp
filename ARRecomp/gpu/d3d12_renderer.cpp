@@ -1,10 +1,12 @@
 #include <stdafx.h>
+#include <array>
 #include "d3d12_renderer.h"
 #include "shader_compiler.h"
 #include "texture_decode.h"
 #include "window.h"
 #include "video_settings.h"
 #include "deferred_list.h"
+#include "command_processor.h"
 #include <kernel/memory.h>
 #include "xenia/gpu/shader.h"
 
@@ -19,9 +21,12 @@ namespace gpu::d3d12
     using namespace reg;
 
     constexpr uint32_t FRAME_COUNT = 2;
-    constexpr uint64_t UPLOAD_SIZE = 256ull << 20;
+    // Experiment (AR_UPLOAD_RING): 1 GB of upload space, each frame continuing where its slot's last frame stopped,
+    // so upload addresses come back only every few frames.
+    static const bool g_uploadRing = getenv("AR_UPLOAD_RING") != nullptr;
+    static const uint64_t UPLOAD_SIZE = g_uploadRing ? 1024ull << 20 : 256ull << 20;
     // Vertex buffers that don't change are kept past the per-frame upload space, in the same buffer.
-    constexpr uint64_t VERTEX_CACHE_BASE = UPLOAD_SIZE + 4096;
+    static const uint64_t VERTEX_CACHE_BASE = UPLOAD_SIZE + 4096;
     constexpr uint64_t VERTEX_CACHE_SIZE = 384ull << 20;
     constexpr uint32_t VIEW_HEAP_SIZE = 65536;
     constexpr uint32_t SAMPLER_HEAP_SIZE = 2048;
@@ -391,6 +396,64 @@ namespace gpu::d3d12
         // Per frame slot: [0] frame start, [1] frame end, then begin/end pairs of the scopes (GpuScope).
         static constexpr uint32_t TIMESTAMPS_PER_FRAME = 2 + 2 * 4096;
         uint32_t timestampsUsed[FRAME_COUNT] = {};
+        // Diagnostics (AR_SHADOW_PIXELS with AR_SHADOW_LOG): samples each logged shadow map draw wrote (occlusion
+        // queries), read back once the frame is done and logged as PX lines.
+        // The first half for the draws, the second for the draws again without depth testing (AR_SHADOW_PIXELS=3: their
+        // rasterized area).
+        static constexpr uint32_t OCCLUSIONS_PER_FRAME = 4096;
+        static constexpr uint32_t PROBE_OFFSET = OCCLUSIONS_PER_FRAME / 2;
+        ComPtr<ID3D12QueryHeap> occlusionHeap;
+        ComPtr<ID3D12Resource> occlusionReadback;
+        std::vector<std::string> occlusionLabels[FRAME_COUNT];
+        // Upload ranges each queried draw reads (offset, size, hash when recorded), checked again once the GPU is done.
+        std::vector<std::array<uint64_t, 3>> occlusionInputs[FRAME_COUNT];
+        std::vector<std::string> occlusionChanged[FRAME_COUNT]; // Per draw: the inputs found changed ("icsv").
+        // AR_SHADOW_GPUCHECK: the GPU copies the inputs of each queried draw to gpuCheckReadback right after the draw,
+        // to compare with what the CPU wrote (where each input went, per draw and input).
+        static constexpr uint64_t GPU_CHECK_SIZE = 64ull << 20; // Per frame slot.
+        ComPtr<ID3D12Resource> gpuCheckReadback;
+        std::vector<uint64_t> gpuCheckOffsets[FRAME_COUNT];
+        uint64_t gpuCheckUsed[FRAME_COUNT] = {};
+        size_t occlusionChecked[FRAME_COUNT] = {}; // Draws whose inputs were checked.
+        std::string occlusionLabel; // Set by Draw for the draw being recorded.
+        uint32_t shadowResolves = 0; // Shadow map resolves so far in the frame (0 = far cascade draws).
+        // Diagnostics (AR_SHADOW_SO=<vertex buffers>): the clip space positions some far cascade draws produce,
+        // captured with stream output into slots of soBuffer and read back once the frame is done (SO lines).
+        static constexpr uint32_t SO_SLOTS = 16, SO_SLOT_SIZE = 256 * 1024;
+        static constexpr uint64_t SO_FILLED_BASE = uint64_t(FRAME_COUNT) * SO_SLOTS * SO_SLOT_SIZE;
+        ComPtr<ID3D12Resource> soBuffer, soReadback;
+        std::vector<std::string> soLabels[FRAME_COUNT];
+        std::string soLabel; // Set by Draw for the draw being recorded.
+        // AR_SHADOW_LATE: the probes of the far cascade's draws, drawn just before its resolve instead of right after
+        // each draw (whether a draw that rasterized nothing does later in the frame).
+        struct LateProbe
+        {
+            ID3D12PipelineState* pipeline;
+            D3D12_GPU_VIRTUAL_ADDRESS systemConstants, vertexConstants, pixelConstants;
+            D3D12_INDEX_BUFFER_VIEW indexView;
+            bool indexed;
+            uint32_t count;
+            D3D12_PRIMITIVE_TOPOLOGY topology;
+            uint32_t query;
+            D3D12_RECT scissor;
+            uint32_t viewportWidth, viewportHeight;
+        };
+        std::vector<LateProbe> lateProbes;
+        // AR_SHADOW_DEFAULT_COPY: a video memory buffer as large as the upload buffer; the probe's inputs are copied
+        // there by the GPU (same offsets) and the probe reads them from it instead of from upload memory.
+        ComPtr<ID3D12Resource> defaultCopy;
+        // Experiment (AR_VRAM_UPLOADS): the GPU reads uploads from a video memory mirror of the upload buffer, which a
+        // copy command list executed before each submission brings up to date (the ranges written since the last one).
+        ComPtr<ID3D12Resource> mirror;
+        struct MirrorCopy
+        {
+            ComPtr<ID3D12CommandAllocator> allocator;
+            ComPtr<ID3D12GraphicsCommandList> list;
+            uint64_t fenceValue = 0;
+        };
+        std::vector<MirrorCopy> mirrorCopies;
+        uint64_t mirrorUploadStart = 0, mirrorCacheStart = 0; // Where this submission's writes started.
+        uint64_t mirrorBytes = 0;
         std::vector<uint8_t> scopeCategories[FRAME_COUNT];
         uint32_t scopeDepth = 0;
         // Released textures by description with the frame they were released in. Creating and destroying resources
@@ -401,6 +464,21 @@ namespace gpu::d3d12
         std::unordered_map<uint64_t, CachedTexture> textures;
         std::set<uint32_t> warnedFormats;
     } g;
+
+    // Diagnostics (AR_SHADOW_LOG): renderer work other than draws, logged between the shadow map draws (EV lines) of the
+    // AR_DUMP_FRAME frames, to see what runs in between.
+    static std::unordered_map<uint32_t, std::vector<uint8_t>> g_dsvSnapshots; // Descriptor index -> bytes when created.
+
+    static bool ShadowEventsOn()
+    {
+        static const bool shadowLog = AR_ENV("AR_SHADOW_LOG") != nullptr;
+        if (!shadowLog)
+            return false;
+        static const int64_t first = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : 0;
+        static const int64_t frames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+        return int64_t(g.frameNumber) >= first && int64_t(g.frameNumber) < first + frames;
+    }
+#define SHADOW_EVENT(...) do { if (ShadowEventsOn()) LOGF_INFO("EV {} {}", g.frameNumber, fmt::format(__VA_ARGS__)); } while (0)
 
     // Time spent on the command processor thread, logged every 300 frames.
     struct Profile
@@ -514,8 +592,31 @@ namespace gpu::d3d12
         }
     }
 
+    // Where the frame's upload space starts. Experiment (AR_ROTATE_UPLOADS): 8 MB further on each frame (of 8), so the
+    // same addresses don't come back two frames later.
+    static uint64_t g_slotCursor[FRAME_COUNT]; // AR_UPLOAD_RING: where each slot's last frame stopped.
+    static bool g_slotWrap; // AR_UPLOAD_RING: the slot is full, start it over (the GPU is idle).
+
+    static uint64_t UploadStart()
+    {
+        uint64_t start = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
+        if (g_uploadRing)
+        {
+            uint64_t cursor = g_slotCursor[g.frameIndex];
+            if (!g_slotWrap && cursor > start && cursor < start + UPLOAD_SIZE / FRAME_COUNT - (32ull << 20))
+                start = cursor;
+            g_slotWrap = false;
+            return start;
+        }
+        static const bool rotate = AR_ENV("AR_ROTATE_UPLOADS") != nullptr;
+        if (rotate)
+            start += ((g.frameNumber / FRAME_COUNT) % 8) * (8ull << 20);
+        return start;
+    }
+
     static void BindHeaps()
     {
+        SHADOW_EVENT("bind heaps");
         g.drawState.valid = false;
         g.textureLookups.clear();
         ID3D12DescriptorHeap* heaps[] = { g.viewHeap.Get(), g.samplerHeap.Get() };
@@ -528,6 +629,9 @@ namespace gpu::d3d12
         g.list->SetGraphicsRootDescriptorTable(ROOT_SAMPLERS, g.samplerHeap->GetGPUDescriptorHandleForHeapStart());
         g.list->SetGraphicsRootDescriptorTable(ROOT_TEXTURES_UINT, views);
     }
+
+    static void CheckOcclusionInputs(uint32_t slot);
+    static uint64_t HashMemory(const uint8_t* data, size_t size);
 
     static void BeginFrame()
     {
@@ -559,6 +663,96 @@ namespace gpu::d3d12
                 g.timestampReadback->Unmap(0, &written);
             }
             g.timestampsPending[g.frameIndex] = false;
+        }
+        if (g.soBuffer && !g.soLabels[g.frameIndex].empty())
+        {
+            auto& labels = g.soLabels[g.frameIndex];
+            uint8_t* data;
+            D3D12_RANGE range{ 0, SIZE_T(State::SO_FILLED_BASE + uint64_t(FRAME_COUNT) * State::SO_SLOTS * 16) };
+            if (SUCCEEDED(g.soReadback->Map(0, &range, reinterpret_cast<void**>(&data))))
+            {
+                for (size_t i = 0; i < labels.size(); i++)
+                {
+                    uint64_t slot = uint64_t(g.frameIndex) * State::SO_SLOTS + i;
+                    uint64_t filled;
+                    memcpy(&filled, data + State::SO_FILLED_BASE + slot * 16, 8);
+                    uint64_t vertices = std::min<uint64_t>(filled / 16, State::SO_SLOT_SIZE / 16);
+                    const float* p = reinterpret_cast<const float*>(data + slot * State::SO_SLOT_SIZE);
+                    uint32_t inside = 0, nearOut = 0, farOut = 0, sideOut = 0, bad = 0;
+                    float lo[4] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX }, hi[4] = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                    for (uint64_t v = 0; v < vertices; v++)
+                    {
+                        const float* q = p + v * 4;
+                        if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2]) || !std::isfinite(q[3]) || q[3] == 0.0f)
+                        {
+                            bad++;
+                            continue;
+                        }
+                        float n[4] = { q[0] / q[3], q[1] / q[3], q[2] / q[3], q[3] };
+                        for (int c = 0; c < 4; c++)
+                        {
+                            lo[c] = std::min(lo[c], n[c]);
+                            hi[c] = std::max(hi[c], n[c]);
+                        }
+                        bool side = std::abs(n[0]) > 1.0f || std::abs(n[1]) > 1.0f;
+                        sideOut += side;
+                        nearOut += n[2] < 0.0f;
+                        farOut += n[2] > 1.0f;
+                        inside += !side && n[2] >= 0.0f && n[2] <= 1.0f;
+                    }
+                    LOGF_INFO("SO {} vertices {} inside {} z<0 {} z>1 {} xy out {} bad {} x {:.3f}..{:.3f} y {:.3f}..{:.3f} z {:.4f}..{:.4f} w {:.3f}..{:.3f} first {} {} {} {}",
+                        labels[i], vertices, inside, nearOut, farOut, sideOut, bad, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3],
+                        vertices ? p[0] : 0.0f, vertices ? p[1] : 0.0f, vertices ? p[2] : 0.0f, vertices ? p[3] : 0.0f);
+                }
+                D3D12_RANGE written{ 0, 0 };
+                g.soReadback->Unmap(0, &written);
+            }
+            labels.clear();
+        }
+        if (g.occlusionHeap && !g.occlusionLabels[g.frameIndex].empty())
+        {
+            auto& labels = g.occlusionLabels[g.frameIndex];
+            uint64_t* samples;
+            uint64_t base = uint64_t(g.frameIndex) * State::OCCLUSIONS_PER_FRAME;
+            D3D12_RANGE range{ base * 8, (base + State::OCCLUSIONS_PER_FRAME) * 8 };
+            if (SUCCEEDED(g.occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&samples))))
+            {
+                samples += base;
+                CheckOcclusionInputs(g.frameIndex);
+                auto& inputs = g.occlusionInputs[g.frameIndex];
+                for (size_t i = 0; i < labels.size(); i++)
+                {
+                    std::string changed = i < g.occlusionChanged[g.frameIndex].size() ? g.occlusionChanged[g.frameIndex][i] : "";
+                    if (g.gpuCheckReadback && i * 4 + 3 < g.gpuCheckOffsets[g.frameIndex].size())
+                    {
+                        static uint8_t* checkData = [] { uint8_t* data = nullptr; g.gpuCheckReadback->Map(0, nullptr, reinterpret_cast<void**>(&data)); return data; }();
+                        std::string differs;
+                        for (uint32_t j = 0; j < 4; j++)
+                        {
+                            uint64_t offset = g.gpuCheckOffsets[g.frameIndex][i * 4 + j];
+                            const auto& input = inputs[i * 4 + j];
+                            if (offset != UINT64_MAX && checkData && HashMemory(checkData + offset, input[1]) != input[2])
+                                differs += "icsv"[j];
+                        }
+                        if (!differs.empty())
+                            changed += " GPU sees different " + differs;
+                    }
+                    static const bool probe = atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 3;
+                    if (probe)
+                        LOGF_INFO("PX {}{}{} area {} {}", labels[i], changed.empty() ? "" : " changed ", changed,
+                            samples[State::PROBE_OFFSET + i], samples[i]);
+                    else
+                        LOGF_INFO("PX {}{}{} {}", labels[i], changed.empty() ? "" : " changed ", changed, samples[i]);
+                }
+                inputs.clear();
+                g.gpuCheckOffsets[g.frameIndex].clear();
+                g.gpuCheckUsed[g.frameIndex] = 0;
+                g.occlusionChanged[g.frameIndex].clear();
+                g.occlusionChecked[g.frameIndex] = 0;
+                D3D12_RANGE written{ 0, 0 };
+                g.occlusionReadback->Unmap(0, &written);
+            }
+            labels.clear();
         }
         if (!frame.uploadChecks.empty())
         {
@@ -612,7 +806,8 @@ namespace gpu::d3d12
 
         g.list->ResetAllocator(frame.allocator.Get());
         g.list->Reset(frame.allocator.Get(), nullptr);
-        g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
+        g.uploadOffset = UploadStart();
+        g.mirrorUploadStart = g.uploadOffset;
         g.vertexUploads.clear();
         BindHeaps();
         if (g.timestampHeap)
@@ -648,8 +843,78 @@ namespace gpu::d3d12
         }
     };
 
+    // Diagnostics (AR_SHADOW_PIXELS=2): once the GPU is done with them (and before upload space is reused), whether the
+    // inputs of the queried draws changed since they were recorded.
+    static void CheckOcclusionInputs(uint32_t slot)
+    {
+        auto& inputs = g.occlusionInputs[slot];
+        auto& changed = g.occlusionChanged[slot];
+        size_t draws = inputs.size() / 4;
+        changed.resize(draws);
+        for (size_t i = g.occlusionChecked[slot]; i < draws; i++)
+        {
+            for (uint32_t j = 0; j < 4; j++)
+            {
+                const auto& input = inputs[i * 4 + j];
+                if (input[1] != 0 && HashMemory(g.uploadCpu + input[0], input[1]) != input[2])
+                    changed[i] += "icsv"[j];
+            }
+        }
+        g.occlusionChecked[slot] = draws;
+    }
+
     static void Submit()
     {
+        // Experiment (AR_UPLOAD_FENCE): upload memory writes (write combined, possibly non-temporal) made visible
+        // before the GPU may start on them.
+        static const bool fence = AR_ENV("AR_UPLOAD_FENCE") != nullptr;
+        if (fence)
+            _mm_mfence();
+        if (g.mirror)
+        {
+            uint64_t completed = g.fence->GetCompletedValue();
+            State::MirrorCopy* copy = nullptr;
+            for (auto& candidate : g.mirrorCopies)
+            {
+                if (candidate.fenceValue <= completed)
+                {
+                    copy = &candidate;
+                    break;
+                }
+            }
+            if (!copy)
+            {
+                copy = &g.mirrorCopies.emplace_back();
+                g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&copy->allocator));
+                g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, copy->allocator.Get(), nullptr, IID_PPV_ARGS(&copy->list));
+                copy->list->Close();
+            }
+            copy->allocator->Reset();
+            copy->list->Reset(copy->allocator.Get(), nullptr);
+            if (g.uploadOffset > g.mirrorUploadStart)
+            {
+                copy->list->CopyBufferRegion(g.mirror.Get(), g.mirrorUploadStart, g.uploadBuffer.Get(), g.mirrorUploadStart,
+                    g.uploadOffset - g.mirrorUploadStart);
+                g.mirrorBytes += g.uploadOffset - g.mirrorUploadStart;
+            }
+            uint64_t cacheEnd = (g.vertexCacheOffset + 15) & ~15ull;
+            if (cacheEnd > g.mirrorCacheStart)
+            {
+                copy->list->CopyBufferRegion(g.mirror.Get(), g.mirrorCacheStart, g.uploadBuffer.Get(), g.mirrorCacheStart,
+                    cacheEnd - g.mirrorCacheStart);
+                g.mirrorBytes += cacheEnd - g.mirrorCacheStart;
+            }
+            copy->list->Close();
+            copy->fenceValue = g.fenceValue + 1;
+            g.list->ExecuteOther(copy->list.Get());
+            g.mirrorUploadStart = g.uploadOffset;
+            g.mirrorCacheStart = cacheEnd;
+            if (g.frameNumber % 300 == 0 && g.frameIndex == 0)
+            {
+                LOGF_INFO("video memory mirror: {:.1f} MB copied per frame", double(g.mirrorBytes) / 300.0 / (1 << 20));
+                g.mirrorBytes = 0;
+            }
+        }
         g.list->Close();
         g.list->Execute(++g.fenceValue);
         g.frames[g.frameIndex].fenceValue = g.fenceValue;
@@ -658,12 +923,20 @@ namespace gpu::d3d12
     // Submits the work so far and waits for it, so the frame's upload space can be reused.
     static void FlushAndWait()
     {
+        g_slotWrap = true;
+        if (AR_ENV("AR_SHADOW_LOG"))
+            LOGF_INFO("FW {} flush: upload offset {:X} (slice {:X}-{:X}), vertex cache {:X} full {}", g.frameNumber, g.uploadOffset,
+                g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT), (g.frameIndex + 1) * (UPLOAD_SIZE / FRAME_COUNT), g.vertexCacheOffset,
+                g.vertexCacheFull);
         Submit();
         WaitForFence(g.fenceValue);
+        if (g.occlusionHeap)
+            CheckOcclusionInputs(g.frameIndex);
         auto& frame = g.frames[g.frameIndex];
         g.list->ResetAllocator(frame.allocator.Get());
         g.list->Reset(frame.allocator.Get(), nullptr);
-        g.uploadOffset = g.frameIndex * (UPLOAD_SIZE / FRAME_COUNT);
+        g.uploadOffset = UploadStart();
+        g.mirrorUploadStart = g.uploadOffset;
         g.vertexUploads.clear();
         BindHeaps();
     }
@@ -1066,6 +1339,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_ROOT_SIGNATURE_DESC desc{};
         desc.NumParameters = ROOT_PARAMETER_COUNT;
         desc.pParameters = parameters;
+        if (AR_ENV("AR_SHADOW_SO"))
+            desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
 
         ComPtr<ID3DBlob> blob, error;
         if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -1232,6 +1507,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.device->CreateRenderTargetView(nullptr, &nullRtvDesc, CpuRtv(g.nullRtv));
 
         D3D12_HEAP_PROPERTIES uploadHeap{ D3D12_HEAP_TYPE_UPLOAD };
+        // Experiment (AR_UPLOAD_WRITE_BACK): cache coherent system memory (CPU write-back pages the GPU snoops) instead
+        // of the write-combined upload heap.
+        if (AR_ENV("AR_UPLOAD_WRITE_BACK"))
+            uploadHeap = { D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0 };
         D3D12_RESOURCE_DESC bufferDesc{};
         bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         bufferDesc.Width = VERTEX_CACHE_BASE + VERTEX_CACHE_SIZE; // 4 KB padding: constants are read as 4 KB.
@@ -1248,6 +1527,25 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         g.uploadBuffer->Map(0, nullptr, reinterpret_cast<void**>(&g.uploadCpu));
         g.uploadGpu = g.uploadBuffer->GetGPUVirtualAddress();
+        LOGF_INFO("upload buffer: GPU address {:X}-{:X}", g.uploadGpu, g.uploadGpu + VERTEX_CACHE_BASE + VERTEX_CACHE_SIZE);
+        if (AR_ENV("AR_VRAM_UPLOADS"))
+        {
+            D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT };
+            if (SUCCEEDED(g.device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, IID_PPV_ARGS(&g.mirror))))
+            {
+                g.uploadGpu = g.mirror->GetGPUVirtualAddress();
+                g.mirrorCacheStart = VERTEX_CACHE_BASE;
+                LOGF_INFO("uploads are read from a video memory mirror");
+            }
+        }
+        if (AR_ENV("AR_SHADOW_DEFAULT_COPY"))
+        {
+            D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT };
+            if (FAILED(g.device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&g.defaultCopy))))
+                LOGF_ERROR("failed to create the default copy buffer");
+        }
 
         if (!CreateRootSignature())
             return false;
@@ -1339,6 +1637,51 @@ float4 main(float4 position : SV_Position) : SV_Target
                     nullptr, IID_PPV_ARGS(&g.timestampReadback))) || FAILED(g.queue->GetTimestampFrequency(&g.timestampFrequency)))
             {
                 g.timestampHeap.Reset();
+            }
+        }
+        if (AR_ENV("AR_SHADOW_SO"))
+        {
+            D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT }, readbackHeap{ D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC bufferDesc{};
+            bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bufferDesc.Width = State::SO_FILLED_BASE + uint64_t(FRAME_COUNT) * State::SO_SLOTS * 16;
+            bufferDesc.Height = 1;
+            bufferDesc.DepthOrArraySize = 1;
+            bufferDesc.MipLevels = 1;
+            bufferDesc.SampleDesc.Count = 1;
+            bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(g.device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&g.soBuffer))) ||
+                FAILED(g.device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&g.soReadback))))
+            {
+                g.soBuffer.Reset();
+            }
+        }
+        if (AR_ENV("AR_SHADOW_PIXELS"))
+        {
+            D3D12_QUERY_HEAP_DESC queryDesc{ D3D12_QUERY_HEAP_TYPE_OCCLUSION, FRAME_COUNT * State::OCCLUSIONS_PER_FRAME, 0 };
+            D3D12_HEAP_PROPERTIES readbackHeap{ D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC readbackDesc{};
+            readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            readbackDesc.Width = uint64_t(FRAME_COUNT) * State::OCCLUSIONS_PER_FRAME * 8;
+            readbackDesc.Height = 1;
+            readbackDesc.DepthOrArraySize = 1;
+            readbackDesc.MipLevels = 1;
+            readbackDesc.SampleDesc.Count = 1;
+            readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (AR_ENV("AR_SHADOW_GPUCHECK"))
+            {
+                D3D12_RESOURCE_DESC checkDesc = readbackDesc;
+                checkDesc.Width = State::GPU_CHECK_SIZE * FRAME_COUNT;
+                g.device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &checkDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&g.gpuCheckReadback));
+            }
+            if (FAILED(g.device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&g.occlusionHeap))) ||
+                FAILED(g.device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&g.occlusionReadback))))
+            {
+                g.occlusionHeap.Reset();
             }
         }
         g.list.Start(!AR_ENV("AR_SINGLE_THREAD"));
@@ -1467,6 +1810,13 @@ float4 main(float4 position : SV_Position) : SV_Target
             dsv.Format = format;
             dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
             g.device->CreateDepthStencilView(texture.resource.Get(), &dsv, CpuDsv(texture.dsv));
+            // Diagnostics (AR_SHADOW_LOG): the descriptor as written, to notice it being overwritten later.
+            if (AR_ENV("AR_SHADOW_LOG"))
+            {
+                auto& snapshot = g_dsvSnapshots[texture.dsv];
+                snapshot.assign(reinterpret_cast<const uint8_t*>(CpuDsv(texture.dsv).ptr),
+                    reinterpret_cast<const uint8_t*>(CpuDsv(texture.dsv).ptr) + g.dsvSize);
+            }
         }
 
         return texture;
@@ -1497,6 +1847,7 @@ float4 main(float4 position : SV_Position) : SV_Target
     {
         uint64_t sliceSize = uint64_t(decoded.rowPitch) * decoded.rowCount;
         auto allocation = Upload(sliceSize * decoded.depth, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        SHADOW_EVENT("texture upload {} bytes", sliceSize * decoded.depth);
         if (allocation.cpu == nullptr)
             return;
 
@@ -1654,6 +2005,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             versions.emplace_back(part.address, part.resolved->version);
         if (versions != composite.parts)
         {
+            SHADOW_EVENT("composite {:08X}", fetch.BaseAddress());
             GpuScope scope{ 3 };
             Transition(composite.texture, D3D12_RESOURCE_STATE_COPY_DEST);
             for (const Part& part : parts)
@@ -1946,6 +2298,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         static const bool disabled = AR_ENV("AR_NO_LAYOUT") != nullptr;
         if (disabled || texture.layout == layout || !texture.resource)
             return;
+        SHADOW_EVENT("layout {} -> {} ({}x{})", texture.layout, layout, texture.width, texture.height);
         GpuScope scope{ 0 };
 
         bool depth = texture.dsv != UINT32_MAX;
@@ -1995,6 +2348,17 @@ float4 main(float4 position : SV_Position) : SV_Target
     static D3D12_RECT UnionRect(const D3D12_RECT& a, const D3D12_RECT& b)
     {
         return { std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right), std::max(a.bottom, b.bottom) };
+    }
+
+    // Diagnostics (AR_SHADOW_LOG): EDRAM syncs into the shadow map depth buffer (base 128, pitch 1040), in the logged frames.
+    static bool ShadowSyncLog(const RenderTargetKey& key)
+    {
+        static const bool shadowLog = AR_ENV("AR_SHADOW_LOG") != nullptr;
+        if (!shadowLog || !key.depth || key.base != 128 || key.pitch != 1040)
+            return false;
+        static const int64_t first = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : 0;
+        static const int64_t frames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+        return int64_t(g.frameNumber) >= first && int64_t(g.frameNumber) < first + frames;
     }
 
     // Notes a region written in a render target, under its current stamp.
@@ -2079,6 +2443,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         for (auto& [otherStamp, entry] : newer)
         {
             auto& [otherKey, other] = entry;
+            SHADOW_EVENT("sync base {} pitch {} <- base {}", key.base, key.pitch, otherKey->base);
+            if (ShadowSyncLog(key) && key.depth == otherKey->depth)
+                LOGF_INFO("SY {} base {:X} pitch {} format {} <- base {:X} format {} (whole rows)", g.frameNumber, key.base, key.pitch,
+                    key.format, otherKey->base, otherKey->format);
             ConvertLayout(texture, 0);
             ConvertLayout(*other, 0);
             // The other target's row 0 is at this one's row `rows` (in samples).
@@ -2108,10 +2476,10 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (written.top >= written.bottom || written.left >= written.right)
                     continue;
 
-                if (TraceThisFrame())
-                    LOGF_INFO("  {} base {:X} format {} <- {} base {:X} format {}: rows {} rect {},{}-{},{}", key.depth ? "depth" : "color",
+                if (TraceThisFrame() || ShadowSyncLog(key))
+                    LOGF_INFO("  {} base {:X} format {} <- {} base {:X} format {}: rows {} rect {},{}-{},{} frame {}", key.depth ? "depth" : "color",
                         key.base, key.format, otherKey->depth ? "depth" : "color", otherKey->base, otherKey->format, rows,
-                        written.left, written.top, written.right, written.bottom);
+                        written.left, written.top, written.right, written.bottom, g.frameNumber);
                 if (key.depth)
                 {
                     Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2325,11 +2693,14 @@ float4 main(float4 position : SV_Position) : SV_Target
         return { code.data(), code.size() };
     }
 
-    static ID3D12PipelineState* GetPipeline(const PipelineKey& key, const HostShader& vertexShader, const HostShader* pixelShader)
+    static ID3D12PipelineState* GetPipeline(const PipelineKey& key, const HostShader& vertexShader, const HostShader* pixelShader,
+        bool streamOutput = false)
     {
         uint64_t hash = 0xCBF29CE484222325ull;
         for (size_t i = 0; i < sizeof(key); i++)
             hash = (hash ^ reinterpret_cast<const uint8_t*>(&key)[i]) * 0x100000001B3ull;
+        if (streamOutput)
+            hash ^= 0x50534F5354524D31ull;
 
         auto& pipeline = g.pipelines[hash];
         if (pipeline)
@@ -2392,6 +2763,20 @@ float4 main(float4 position : SV_Position) : SV_Target
             desc.RTVFormats[i] = key.renderTargetFormats[i];
         desc.DSVFormat = key.depthFormat;
         desc.SampleDesc.Count = 1;
+
+        // Diagnostics: the position output also streamed out (AR_SHADOW_SO); not kept in the library.
+        static const D3D12_SO_DECLARATION_ENTRY soEntry{ 0, "SV_Position", 0, 0, 4, 0 };
+        static const UINT soStride = 16;
+        if (streamOutput)
+        {
+            desc.StreamOutput = { &soEntry, 1, &soStride, 1, 0 };
+            if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline))))
+            {
+                LOGF_ERROR("failed to create a stream output pipeline for {:016X}", vertexShader.hash);
+                return nullptr;
+            }
+            return pipeline.Get();
+        }
 
         // Library names include the shaders' bytecode: the same key gives a different pipeline when the translator
         // changes, and a stale entry under the name can't be replaced (it was recompiled on every run).
@@ -2552,7 +2937,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         const uint8_t* source = g_memory.Translate<uint8_t>(PhysicalToVirtual(address));
         uint64_t key = (uint64_t(address) << 32) | size;
         auto* entry = &g.vertexCache[key];
-        if (entry->changes < 3 && size <= VERTEX_CACHE_SIZE / 16)
+        // AR_NO_VERTEX_CACHE: always copied into the frame's upload space.
+        static const bool noCache = AR_ENV("AR_NO_VERTEX_CACHE") != nullptr;
+        if (!noCache && entry->changes < 3 && size <= VERTEX_CACHE_SIZE / 16)
         {
             if (entry->content.phase == 0)
                 entry->content.phase = uint32_t(key % 30) + 1;
@@ -2604,6 +2991,8 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         ScopedTimer timer{ g_profile.draw };
         g_profile.draws++;
+        g.occlusionLabel.clear();
+        g.soLabel.clear();
         LapTimer setupLap;
 
         auto mode = EdramMode(registers[RB_MODECONTROL] & 7);
@@ -2868,7 +3257,35 @@ float4 main(float4 position : SV_Position) : SV_Target
                 key.stripCut = index32 ? 2 : 1;
             }
         }
-        if (conversion != Conversion::None || (indexed && ((primitiveReset && !nativeReset) || draw.initiator.Source() == SourceSelect::Immediate)))
+        // Experiment (AR_STRIPS_AS_LISTS): indexed triangle strips drawn as triangle lists, without restarts.
+        static const bool stripsAsLists = AR_ENV("AR_STRIPS_AS_LISTS") != nullptr;
+        if (stripsAsLists && indexed && topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && conversion == Conversion::None)
+        {
+            std::vector<uint32_t> source = ReadIndices(draw, count);
+            uint32_t reset = primitiveReset ? uint32_t(registers[VGT_MULTI_PRIM_IB_RESET_INDX]) : UINT32_MAX;
+            if (primitiveReset && !draw.initiator.Index32())
+                reset &= 0xFFFF;
+            uint32_t start = 0;
+            for (uint32_t i = 0; i <= count; i++)
+            {
+                if (i < count && !(primitiveReset && source[i] == reset))
+                    continue;
+                // The strip from start to i: triangle k is (k, k+1, k+2), the first two swapped for odd k.
+                for (uint32_t k = start; k + 2 < i; k++)
+                {
+                    if ((k - start) & 1)
+                        indices.insert(indices.end(), { source[k + 1], source[k], source[k + 2] });
+                    else
+                        indices.insert(indices.end(), { source[k], source[k + 1], source[k + 2] });
+                }
+                start = i + 1;
+            }
+            topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            key.stripCut = 0;
+            if (indices.empty())
+                return;
+        }
+        else if (conversion != Conversion::None || (indexed && ((primitiveReset && !nativeReset) || draw.initiator.Source() == SourceSelect::Immediate)))
         {
             std::vector<uint32_t> source = ReadIndices(draw, count);
             if (primitiveReset)
@@ -3001,6 +3418,14 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         if (g.uploadOffset + uploadSize > frameBase + UPLOAD_SIZE / FRAME_COUNT || g.vertexCacheFull)
         {
+            if (AR_ENV("AR_SHADOW_LOG"))
+            {
+                std::string ranges;
+                for (auto [index, size] : vertexRanges)
+                    ranges += fmt::format(" vf{} {:X}", index, size);
+                LOGF_INFO("FW {} draw needs {:X} bytes: vs {:016X} prim {} count {} indexed {} vertex count {:X}{}", g.frameNumber, uploadSize,
+                    vertexShader.hash, uint32_t(draw.initiator.PrimType()), count, indexed, vertexCount, ranges);
+            }
             g_profile.flushes++;
             FlushAndWait();
             if (g.vertexCacheFull)
@@ -3008,6 +3433,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 // The GPU is done with everything: the vertex cache starts over.
                 g.vertexCache.clear();
                 g.vertexCacheOffset = VERTEX_CACHE_BASE;
+                g.mirrorCacheStart = VERTEX_CACHE_BASE;
                 g.vertexCacheFull = false;
             }
         }
@@ -3024,8 +3450,24 @@ float4 main(float4 position : SV_Position) : SV_Target
                 LOGF_INFO("  vertex fetch {} at 0x{:08X}: {} bytes, {} indices, {} vertices", index, address, size, count,
                     draw.initiator.Source() == SourceSelect::AutoIndex ? "auto" : "indexed");
             uint64_t& uploaded = g.vertexUploads[(uint64_t(address) << 32) | size];
+            // Diagnostics (AR_CHECK_VERTEX_MEMO): uploads reused in the command list whose guest memory has changed.
+            static const bool checkMemo = AR_ENV("AR_CHECK_VERTEX_MEMO") != nullptr;
+            static std::unordered_map<uint64_t, uint64_t> memoHashes; // Upload offset + 1 -> guest data hash then.
+            uint64_t guestHash = checkMemo && size <= 4096 ? HashMemory(g_memory.Translate<uint8_t>(PhysicalToVirtual(address)), size) : 0;
+            if (checkMemo && uploaded != 0 && size <= 4096 && memoHashes[uploaded] != guestHash)
+            {
+                static uint64_t stale;
+                bool shadow = depthTarget && DepthInfo{ registers[RB_DEPTH_INFO] }.Base() == 128;
+                if (stale++ < 200 || shadow)
+                    LOGF_INFO("VM {} stale vertex upload: {:08X} {} bytes, vs {:08X}, depth base {}{}", g.frameNumber, address, size,
+                        uint32_t(vertexShader.hash >> 32), depthTarget ? DepthInfo{ registers[RB_DEPTH_INFO] }.Base() : 0, shadow ? " SHADOW" : "");
+            }
             if (uploaded == 0)
+            {
                 uploaded = UploadVertexData(address, size) + 1;
+                if (checkMemo)
+                    memoHashes[uploaded] = guestHash;
+            }
             system.vertexDataOffsets[index] = int32_t(uploaded - 1) - int32_t(address);
             if (CheckUploads() && ((vertexShader.hash >> 32) == 0x741845E2 || (vertexShader.hash >> 32) == 0xDC019066))
                 NoteUpload(uploaded - 1, size, "vertices");
@@ -3156,6 +3598,105 @@ float4 main(float4 position : SV_Position) : SV_Target
                     int32_t(uint32_t(registers[VGT_INDX_OFFSET])), count, HashMemory(c + 16 * 16, 4 * 16), HashMemory(c + 28 * 16, 4 * 16),
                     HashMemory(reinterpret_cast<const uint8_t*>(&registers[0x2000]), 0x400 * 4),
                     HashMemory(reinterpret_cast<const uint8_t*>(&system), sizeof(system)));
+                uint32_t ibAddresses[4], ibSizes[4];
+                uint32_t ibCount = GetIndirectBufferChain(ibAddresses, ibSizes, 4);
+                std::string chain;
+                for (uint32_t i = 0; i < ibCount; i++)
+                    chain += fmt::format(" {:08X}:{}", ibAddresses[i], ibSizes[i]);
+                LOGF_INFO("IB {} {:08X}{} marker {:08X} {:08X}", g.frameNumber, address, chain, CurrentDrawMarker(),
+                    CurrentDrawMarkerObject());
+                if (g.occlusionHeap)
+                {
+                    // Then the vertex data: size, where the GPU reads it, and hashes of guest memory and of that copy.
+                    // AR_SHADOW_PIXELS=2: with hashes of what the draws read (slow).
+                    static const bool detailed = atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 2 && atoi(AR_ENV("AR_SHADOW_PIXELS")) <= 4;
+                    std::string vertexText;
+                    if (detailed && !vertexRanges.empty() && g.shadowResolves == 0)
+                    {
+                        auto [index, fullSize] = vertexRanges[0];
+                        uint32_t size = std::min<uint32_t>(fullSize, 65536);
+                        uint32_t uploaded = address + uint32_t(system.vertexDataOffsets[index]);
+                        vertexText = fmt::format(" v {} {:X} {:016X} {:016X}", size, uploaded,
+                            HashMemory(g_memory.Translate<uint8_t>(PhysicalToVirtual(address)), size), HashMemory(g.uploadCpu + uploaded, size));
+                    }
+                    g.occlusionLabel = fmt::format("{} {} {:08X} {:08X} {} {}{}", g.frameNumber, g.shadowResolves,
+                        uint32_t(vertexShader.hash >> 32), address, int32_t(uint32_t(registers[VGT_INDX_OFFSET])), count, vertexText);
+
+                    // AR_SHADOW_CPU_VS: the far cascade's static caster shader (741845E2) run on the CPU for the draw's
+                    // indices: vertices inside the shadow map, out of all, and the depth range.
+                    static const bool cpuVs = AR_ENV("AR_SHADOW_CPU_VS") != nullptr;
+                    if (cpuVs && g.shadowResolves == 0 && (vertexShader.hash >> 32) == 0x741845E2 && indexed &&
+                        !draw.initiator.Index32() && draw.indexEndian == 1)
+                    {
+                        auto constant = [&](uint32_t c, uint32_t component) { return RegisterFloat(registers, SHADER_CONSTANT_000_X + (vsBase + c) * 4 + component); };
+                        auto dot = [&](const float* v, uint32_t c) { return v[0] * constant(c, 0) + v[1] * constant(c, 1) + v[2] * constant(c, 2) + v[3] * constant(c, 3); };
+                        const uint8_t* indexData = g_memory.Translate<uint8_t>(PhysicalToVirtual(draw.indexBase));
+                        const uint8_t* vertexData = g_memory.Translate<uint8_t>(PhysicalToVirtual(address));
+                        int32_t indexOffset = int32_t(uint32_t(registers[VGT_INDX_OFFSET]));
+                        uint32_t inside = 0, total = 0, bad = 0;
+                        float zLow = FLT_MAX, zHigh = -FLT_MAX;
+                        for (uint32_t i = 0; i < count; i++)
+                        {
+                            uint16_t value;
+                            memcpy(&value, indexData + i * 2, 2);
+                            value = ByteSwap(value);
+                            if (value == 0xFFFF)
+                                continue;
+                            uint32_t vertex = uint32_t(int32_t(value) + indexOffset);
+                            float p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                            for (int c = 0; c < 3; c++)
+                            {
+                                uint32_t bits;
+                                memcpy(&bits, vertexData + vertex * 32 + c * 4, 4);
+                                bits = ByteSwap(bits);
+                                memcpy(&p[c], &bits, 4);
+                            }
+                            float r0[4] = { dot(p, 19), dot(p, 18), dot(p, 16), dot(p, 17) };
+                            // dp4 with .wzxy on both sides of the light matrix rows.
+                            auto row = [&](uint32_t c) { return r0[0] * constant(c, 3) + r0[1] * constant(c, 2) + r0[2] * constant(c, 0) + r0[3] * constant(c, 1); };
+                            float x = row(28), y = row(29), z = row(30), w = row(31);
+                            total++;
+                            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(w) || w == 0.0f)
+                            {
+                                bad++;
+                                continue;
+                            }
+                            x /= w;
+                            y /= w;
+                            z /= w;
+                            zLow = std::min(zLow, z);
+                            zHigh = std::max(zHigh, z);
+                            inside += std::abs(x) <= 1.0f && std::abs(y) <= 1.0f && z >= 0.0f && z <= 1.0f;
+                        }
+                        g.occlusionLabel += fmt::format(" cpu {}/{} bad {} z {:.3f}..{:.3f}", inside, total, bad, zLow, zHigh);
+                    }
+
+                    static const std::string soOf = AR_ENV("AR_SHADOW_SO") ? AR_ENV("AR_SHADOW_SO") : "";
+                    if (g.soBuffer && g.shadowResolves == 0 && soOf.find(fmt::format("{:08X}", address)) != std::string::npos)
+                        g.soLabel = g.occlusionLabel;
+
+                    // AR_SHADOW_CONSTANTS=<vertex buffers>: the float constants of those buffers' first draws (PC lines).
+                    static const std::string constantsOf = AR_ENV("AR_SHADOW_CONSTANTS") ? AR_ENV("AR_SHADOW_CONSTANTS") : "";
+                    if (!constantsOf.empty() && g.shadowResolves == 0 &&
+                        constantsOf.find(fmt::format("{:08X}", address)) != std::string::npos)
+                    {
+                        std::string text;
+                        for (uint32_t i = 0; i < 64 * 4; i++)
+                            text += fmt::format(" {}", RegisterFloat(registers, SHADER_CONSTANT_000_X + vsBase * 4 + i));
+                        const auto& map = vertexShader.shader->constant_register_map();
+                        LOGF_INFO("PC {} {:08X} base {} reads {:016X} {:016X} {:016X} {:016X}{}:{}", g.frameNumber, address, vsBase,
+                            map.float_bitmap[0], map.float_bitmap[1], map.float_bitmap[2], map.float_bitmap[3],
+                            map.float_dynamic_addressing ? " dynamic" : "", text);
+                        std::string registerText;
+                        for (uint32_t i = 0; i < 0x400; i++)
+                            registerText += fmt::format("{:08X} ", uint32_t(registers[0x2000 + i]));
+                        LOGF_INFO("PR {} {:08X} {} {}", g.frameNumber, address, int32_t(uint32_t(registers[VGT_INDX_OFFSET])), registerText);
+                        std::string systemText;
+                        for (uint32_t i = 0; i < sizeof(system) / 4; i++)
+                            systemText += fmt::format("{:08X} ", reinterpret_cast<const uint32_t*>(&system)[i]);
+                        LOGF_INFO("PY {} {:08X} {} {}", g.frameNumber, address, int32_t(uint32_t(registers[VGT_INDX_OFFSET])), systemText);
+                    }
+                }
 
                 // The full context registers once a frame, at the first static geometry draw into the shadow map.
                 static uint64_t dumpedFrame = UINT64_MAX;
@@ -3294,6 +3835,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 colorMask, depthControl, pitch, scissor.left, scissor.top, scissor.right, scissor.bottom,
                 system.ndcScale[0], system.ndcScale[1], system.ndcScale[2], system.ndcOffset[0], system.ndcOffset[1], system.ndcOffset[2],
                 vte, key.blend[0], textures);
+            if (CurrentDrawMarker() != 0)
+                LOGF_INFO("  marker {:08X} model {:08X}", CurrentDrawMarker(), CurrentDrawMarkerObject());
             // AR_TRACE_PS=<hash prefix>: the float constants that draw's shaders read.
             if (const char* tracePs = AR_ENV("AR_TRACE_PS"); tracePs && pixelShader &&
                 fmt::format("{:016X}", pixelShader->hash).rfind(tracePs, 0) == 0)
@@ -3371,6 +3914,16 @@ float4 main(float4 position : SV_Position) : SV_Target
                 }
                 if (TraceThisFrame())
                     LOGF_INFO("  clear rectangle {},{}-{},{}", minX, minY, maxX, maxY);
+                static const bool shadowLog = AR_ENV("AR_SHADOW_LOG") != nullptr;
+                if (shadowLog && depthTarget && DepthInfo{ registers[RB_DEPTH_INFO] }.Base() == 128)
+                {
+                    static const int64_t first = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : 0;
+                    static const int64_t frames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+                    if (int64_t(g.frameNumber) >= first && int64_t(g.frameNumber) < first + frames)
+                        LOGF_INFO("SC {} {},{}-{},{} surface {:08X} depth {:08X} control {:08X} written {},{}-{},{} layout {}", g.frameNumber,
+                            minX, minY, maxX, maxY, uint32_t(registers[RB_SURFACE_INFO]), uint32_t(registers[RB_DEPTH_INFO]),
+                            depthControl, written.left, written.top, written.right, written.bottom, depthTarget->layout);
+                }
             }
 
             for (uint32_t i = 0; i < key.renderTargetCount; i++)
@@ -3471,6 +4024,67 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         state.valid = true;
 
+        // Experiment (AR_FORCE_SHADOW_CLEAR): the whole shadow map depth buffer cleared at the first clear of the far
+        // cascade (the strip 960,0-1024,1024 at EDRAM base 128, pitch 1040).
+        static const bool forceShadowClear = AR_ENV("AR_FORCE_SHADOW_CLEAR") != nullptr;
+        if (forceShadowClear && depthTarget && draw.initiator.PrimType() == PrimitiveType::RectangleList &&
+            DepthInfo{ registers[RB_DEPTH_INFO] }.Base() == 128 && SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch() == 1040 &&
+            SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples() == 0)
+        {
+            g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
+        }
+
+        bool queried = false;
+        if (!g.occlusionLabel.empty())
+        {
+            auto& labels = g.occlusionLabels[g.frameIndex];
+            if (labels.size() < State::PROBE_OFFSET)
+            {
+                g.list->BeginQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                    g.frameIndex * State::OCCLUSIONS_PER_FRAME + uint32_t(labels.size()));
+                // What the GPU reads for the draw: indices, vertex constants (the first 64), system constants, and the
+                // first vertex buffer when it is in the vertex cache (which mid-frame flushes don't reuse).
+                auto& inputs = g.occlusionInputs[g.frameIndex];
+                static const bool gpuCheck = g.gpuCheckReadback != nullptr;
+                static const bool detailed = gpuCheck || (atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 2 && atoi(AR_ENV("AR_SHADOW_PIXELS")) <= 4);
+                uint64_t vertexOffset = 0, vertexSize = 0;
+                if (detailed && !vertexRanges.empty())
+                {
+                    auto [index, size] = vertexRanges[0];
+                    uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
+                    vertexOffset = uint32_t(address + uint32_t(system.vertexDataOffsets[index]));
+                    vertexSize = vertexOffset >= VERTEX_CACHE_BASE || gpuCheck ? std::min<uint32_t>(size, 65536) : 0;
+                }
+                uint64_t ranges[4][2] = { { indexed ? indexView.BufferLocation - g.uploadGpu : 0, indexed ? indexView.SizeInBytes : 0 },
+                    { vertexConstants - g.uploadGpu, 32 * 16 }, { systemConstants - g.uploadGpu, sizeof(system) }, { vertexOffset, vertexSize } };
+                for (auto& [offset, size] : ranges)
+                {
+                    if (!detailed)
+                        size = 0;
+                    uint64_t hash = size ? HashMemory(g.uploadCpu + offset, size) : 0;
+                    inputs.push_back({ offset, size, hash });
+                    g.occlusionLabel += fmt::format(" {:04X}", uint32_t(hash & 0xFFFF));
+                }
+                g.occlusionLabel += fmt::format(" p {:X} t {} n {} d {:X} {:X} {}x{} sc {},{}-{},{} vp {}x{}", uintptr_t(pipeline) & 0xFFFFFF,
+                    uint32_t(topology), count, dsv.ptr & 0xFFFFFF, uintptr_t(depthTarget ? depthTarget->resource.Get() : nullptr) & 0xFFFFFF,
+                    depthTarget ? depthTarget->width : 0, depthTarget ? depthTarget->height : 0, scissor.left, scissor.top, scissor.right,
+                    scissor.bottom, viewportWidth, viewportHeight);
+                // Whether the depth target's descriptor still holds what was written when it was created.
+                if (depthTarget)
+                {
+                    auto found = g_dsvSnapshots.find(depthTarget->dsv);
+                    bool same = found != g_dsvSnapshots.end() && memcmp(found->second.data(),
+                        reinterpret_cast<const void*>(CpuDsv(depthTarget->dsv).ptr), found->second.size()) == 0;
+                    g.occlusionLabel += same ? " dsv-ok" : " DSV-CHANGED";
+                }
+                // Where the constants and indices are (upload buffer offsets).
+                g.occlusionLabel += fmt::format(" up {:X} {:X} {:X}", vertexConstants - g.uploadGpu, systemConstants - g.uploadGpu,
+                    indexed ? indexView.BufferLocation - g.uploadGpu : 0);
+                labels.push_back(std::move(g.occlusionLabel));
+                queried = true;
+            }
+            g.occlusionLabel.clear();
+        }
         if (indexed)
         {
             g.list->IASetIndexBuffer(&indexView);
@@ -3479,6 +4093,248 @@ float4 main(float4 position : SV_Position) : SV_Target
         else
         {
             g.list->DrawInstanced(count, 1, 0, 0);
+        }
+        if (queried)
+        {
+            uint32_t query = g.frameIndex * State::OCCLUSIONS_PER_FRAME + uint32_t(g.occlusionLabels[g.frameIndex].size()) - 1;
+            g.list->EndQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, query);
+
+            // AR_SHADOW_GPUCHECK: what the GPU sees of the draw's inputs, copied for comparison.
+            if (g.gpuCheckReadback)
+            {
+                auto& inputs = g.occlusionInputs[g.frameIndex];
+                auto& offsets = g.gpuCheckOffsets[g.frameIndex];
+                uint64_t& used = g.gpuCheckUsed[g.frameIndex];
+                for (size_t j = inputs.size() - 4; j < inputs.size(); j++)
+                {
+                    uint64_t size = inputs[j][1];
+                    if (size == 0 || used + size > State::GPU_CHECK_SIZE)
+                    {
+                        offsets.push_back(UINT64_MAX);
+                        continue;
+                    }
+                    uint64_t destination = uint64_t(g.frameIndex) * State::GPU_CHECK_SIZE + used;
+                    g.list->CopyBufferRegion(g.gpuCheckReadback.Get(), destination, g.uploadBuffer.Get(), inputs[j][0], size);
+                    offsets.push_back(destination);
+                    used = (used + size + 255) & ~255ull;
+                }
+            }
+
+            // The same draw again without depth testing or writes, for the area it rasterizes.
+            static const bool probe = atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 3;
+            PipelineKey probeKey = key;
+            probeKey.depthControl = 0;
+            // AR_SHADOW_PIXELS=6: as points (vertices that are finite still count when every triangle collapsed).
+            static const bool points = atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 6;
+            if (points)
+            {
+                probeKey.topologyType = uint8_t(D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+                probeKey.stripCut = 0;
+            }
+            ID3D12PipelineState* probePipeline = probe ? GetPipeline(probeKey, vertexShader, pixelShader) : nullptr;
+            // AR_SHADOW_PIXELS=5: with the viewport transform shrunk 64 times, so what lands within 64 screens of the
+            // target still counts (geometry moved away versus geometry gone).
+            static const bool shrink = atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 5;
+            D3D12_GPU_VIRTUAL_ADDRESS shrunk = 0;
+            // AR_SHADOW_FRESH=<letters>: the probe reads fresh copies of the vertex constants (c, from the registers),
+            // the vertex data (v, from guest memory) or the indices (i), to find which one the GPU reads wrongly.
+            static const std::string fresh = AR_ENV("AR_SHADOW_FRESH") ? AR_ENV("AR_SHADOW_FRESH") : "";
+            D3D12_GPU_VIRTUAL_ADDRESS freshConstants = 0;
+            D3D12_INDEX_BUFFER_VIEW freshIndices{};
+            if (probePipeline && shrink)
+            {
+                SystemConstants shrunkSystem = system;
+                // Shrunk about the guest viewport's centre, which stays where it was.
+                for (int c = 0; c < 2; c++)
+                    shrunkSystem.ndcScale[c] /= 64.0f;
+                if (fresh.find('v') != std::string::npos)
+                {
+                    for (auto [index, size] : vertexRanges)
+                    {
+                        uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
+                        auto copy = Upload(size, 16);
+                        memcpy(copy.cpu, g_memory.Translate<uint8_t>(PhysicalToVirtual(address)), size);
+                        shrunkSystem.vertexDataOffsets[index] = int32_t(copy.offset) - int32_t(address);
+                    }
+                }
+                shrunk = UploadConstants(shrunkSystem);
+                if (fresh.find('c') != std::string::npos)
+                {
+                    uint32_t base = std::min<uint32_t>(registers[0x2307] & 0x1FF, 192);
+                    auto copy = Upload(64 * 16, 256);
+                    auto* out = reinterpret_cast<uint32_t*>(copy.cpu);
+                    const auto* in = reinterpret_cast<const uint32_t*>(&registers[SHADER_CONSTANT_000_X + base * 4]);
+                    for (uint32_t i = 0; i < 64 * 4; i++)
+                        out[i] = __builtin_bswap32(in[i]);
+                    freshConstants = copy.gpu;
+                }
+                if (fresh.find('i') != std::string::npos && indexed)
+                {
+                    auto copy = Upload((indexView.SizeInBytes + 3) & ~3u, 16);
+                    std::vector<uint8_t> bytes(indexView.SizeInBytes);
+                    memcpy(bytes.data(), g.uploadCpu + (indexView.BufferLocation - g.uploadGpu), bytes.size());
+                    memcpy(copy.cpu, bytes.data(), bytes.size());
+                    freshIndices = { copy.gpu, indexView.SizeInBytes, indexView.Format };
+                }
+            }
+            // AR_SHADOW_REBIND: everything the draw uses bound again from scratch before the probe.
+            static const bool rebind = AR_ENV("AR_SHADOW_REBIND") != nullptr;
+            if (probePipeline && rebind)
+            {
+                BindHeaps();
+                g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, systemConstants);
+                g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, vertexConstants);
+                g.list->SetGraphicsRootConstantBufferView(ROOT_PIXEL_FLOAT_CONSTANTS, pixelConstants);
+                g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu);
+                g.list->OMSetRenderTargets(key.renderTargetCount, rtvs, FALSE, depthTarget ? &dsv : nullptr);
+                D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(viewportWidth), float(viewportHeight), 0.0f, 1.0f };
+                g.list->RSSetViewports(1, &viewport);
+                g.list->RSSetScissorRects(1, &scissor);
+                g.list->IASetPrimitiveTopology(topology);
+                if (indexed)
+                    g.list->IASetIndexBuffer(&indexView);
+            }
+            static const bool late = AR_ENV("AR_SHADOW_LATE") != nullptr;
+            if (late && probePipeline && g.shadowResolves == 0)
+            {
+                g.lateProbes.push_back({ probePipeline, systemConstants, vertexConstants, pixelConstants, indexView, indexed, count, topology,
+                    query + State::PROBE_OFFSET, scissor, viewportWidth, viewportHeight });
+                probePipeline = nullptr;
+            }
+            else if (late)
+            {
+                probePipeline = nullptr;
+            }
+            bool fromDefault = probePipeline && g.defaultCopy;
+            if (fromDefault)
+            {
+                auto copy = [&](uint64_t offset, uint64_t size)
+                    {
+                        if (size)
+                            g.list->CopyBufferRegion(g.defaultCopy.Get(), offset, g.uploadBuffer.Get(), offset, size);
+                    };
+                copy(systemConstants - g.uploadGpu, 2560);
+                copy(vertexConstants - g.uploadGpu, 4096);
+                copy(pixelConstants - g.uploadGpu, 256);
+                if (indexed)
+                    copy(indexView.BufferLocation - g.uploadGpu, (indexView.SizeInBytes + 3) & ~3u);
+                for (auto [index, size] : vertexRanges)
+                {
+                    uint32_t address = registers[SHADER_CONSTANT_FETCH_00_0 + index * 2] & 0x1FFFFFFC;
+                    copy(uint32_t(address + uint32_t(system.vertexDataOffsets[index])), (size + 15) & ~15u);
+                }
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = g.defaultCopy.Get();
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                g.list->ResourceBarrier(1, &barrier);
+                // AR_SHADOW_DEFAULT_COPY=2: the copies and barrier only, still reading upload memory.
+                static const bool copyOnly = atoi(AR_ENV("AR_SHADOW_DEFAULT_COPY")) == 2;
+                D3D12_GPU_VIRTUAL_ADDRESS defaultGpu = copyOnly ? g.uploadGpu : g.defaultCopy->GetGPUVirtualAddress();
+                // AR_SHADOW_DEFAULT_ONLY=<letters>: only these from video memory: c constants, v vertex data, i indices.
+                static const std::string only = AR_ENV("AR_SHADOW_DEFAULT_ONLY") ? AR_ENV("AR_SHADOW_DEFAULT_ONLY") : "cvi";
+                auto pick = [&](char what) { return only.find(what) != std::string::npos ? defaultGpu : g.uploadGpu; };
+                g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, pick('c') + (systemConstants - g.uploadGpu));
+                g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, pick('c') + (vertexConstants - g.uploadGpu));
+                g.list->SetGraphicsRootConstantBufferView(ROOT_PIXEL_FLOAT_CONSTANTS, pick('c') + (pixelConstants - g.uploadGpu));
+                g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, pick('v'));
+                if (indexed)
+                {
+                    D3D12_INDEX_BUFFER_VIEW view = indexView;
+                    view.BufferLocation = pick('i') + (indexView.BufferLocation - g.uploadGpu);
+                    g.list->IASetIndexBuffer(&view);
+                }
+            }
+            if (!late)
+                g.list->BeginQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, query + State::PROBE_OFFSET);
+            if (probePipeline)
+            {
+                g.list->SetPipelineState(probePipeline);
+                if (shrunk)
+                    g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, shrunk);
+                if (freshConstants)
+                    g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, freshConstants);
+                if (freshIndices.BufferLocation)
+                    g.list->IASetIndexBuffer(&freshIndices);
+                if (points)
+                    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+                if (indexed)
+                    g.list->DrawIndexedInstanced(count, 1, 0, 0, 0);
+                else
+                    g.list->DrawInstanced(count, 1, 0, 0);
+                if (points)
+                    g.list->IASetPrimitiveTopology(topology);
+                g.list->SetPipelineState(pipeline);
+                if (shrunk)
+                    g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, systemConstants);
+                if (freshConstants)
+                    g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, vertexConstants);
+                if (freshIndices.BufferLocation)
+                    g.list->IASetIndexBuffer(&indexView);
+            }
+            if (!late)
+                g.list->EndQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, query + State::PROBE_OFFSET);
+            if (fromDefault)
+            {
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = g.defaultCopy.Get();
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g.list->ResourceBarrier(1, &barrier);
+                g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, systemConstants);
+                g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, vertexConstants);
+                g.list->SetGraphicsRootConstantBufferView(ROOT_PIXEL_FLOAT_CONSTANTS, pixelConstants);
+                g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu);
+                if (indexed)
+                    g.list->IASetIndexBuffer(&indexView);
+            }
+        }
+
+        // AR_SHADOW_SO: the draw again with its positions streamed out (depth test and writes off).
+        if (!g.soLabel.empty() && g.soLabels[g.frameIndex].size() < State::SO_SLOTS)
+        {
+            PipelineKey soKey = key;
+            soKey.depthControl = 0;
+            if (ID3D12PipelineState* soPipeline = GetPipeline(soKey, vertexShader, pixelShader, true))
+            {
+                uint64_t slot = uint64_t(g.frameIndex) * State::SO_SLOTS + g.soLabels[g.frameIndex].size();
+                uint64_t dataOffset = slot * State::SO_SLOT_SIZE, filledOffset = State::SO_FILLED_BASE + slot * 16;
+                auto zero = Upload(16, 16);
+                memset(zero.cpu, 0, 16);
+                g.list->CopyBufferRegion(g.soBuffer.Get(), filledOffset, g.uploadBuffer.Get(), zero.offset, 16);
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = g.soBuffer.Get();
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_STREAM_OUT;
+                g.list->ResourceBarrier(1, &barrier);
+                D3D12_STREAM_OUTPUT_BUFFER_VIEW view{ g.soBuffer->GetGPUVirtualAddress() + dataOffset, State::SO_SLOT_SIZE,
+                    g.soBuffer->GetGPUVirtualAddress() + filledOffset };
+                g.list->SOSetTargets(&view);
+                g.list->SetPipelineState(soPipeline);
+                if (indexed)
+                    g.list->DrawIndexedInstanced(count, 1, 0, 0, 0);
+                else
+                    g.list->DrawInstanced(count, 1, 0, 0);
+                g.list->SetPipelineState(pipeline);
+                g.list->SOSetTargets(nullptr);
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_STREAM_OUT;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                g.list->ResourceBarrier(1, &barrier);
+                g.list->CopyBufferRegion(g.soReadback.Get(), dataOffset, g.soBuffer.Get(), dataOffset, State::SO_SLOT_SIZE);
+                g.list->CopyBufferRegion(g.soReadback.Get(), filledOffset, g.soBuffer.Get(), filledOffset, 16);
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g.list->ResourceBarrier(1, &barrier);
+                g.soLabels[g.frameIndex].push_back(std::move(g.soLabel));
+            }
         }
         lap.Lap(g_profile.record);
     }
@@ -3550,6 +4406,52 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         D3D12_RECT rect{ x0, y0, x1, y1 };
         uint32_t destBase = registers[RB_COPY_DEST_BASE] & 0x1FFFFFFF;
+
+        // Diagnostics (AR_SHADOW_LOG): resolves out of the shadow map, between its draws (S lines).
+        static const bool shadowLog = AR_ENV("AR_SHADOW_LOG") != nullptr;
+        if (shadowLog && pitch == 1040)
+        {
+            static const int64_t first = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : 0;
+            static const int64_t frames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+            if (int64_t(g.frameNumber) >= first && int64_t(g.frameNumber) < first + frames)
+            {
+                LOGF_INFO("SR {} {:08X} {},{}-{},{} source {} marker {:08X}", g.frameNumber, destBase, x0, y0, x1, y1,
+                    sourceSelect, CurrentDrawMarker());
+                if (destBase != 0x10C22000)
+                    g.shadowResolves++;
+
+                // AR_SHADOW_LATE: the far cascade's probes, now.
+                if (destBase == 0x0F801000 && depthSource && !g.lateProbes.empty())
+                {
+                    Transition(*source, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                    auto dsv = CpuDsv(source->dsv);
+                    g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+                    for (const auto& probe : g.lateProbes)
+                    {
+                        SetViewportAndScissor(probe.viewportWidth, probe.viewportHeight, probe.scissor);
+                        g.list->SetGraphicsRootShaderResourceView(ROOT_VERTEX_DATA, g.uploadGpu);
+                        g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, probe.systemConstants);
+                        g.list->SetGraphicsRootConstantBufferView(ROOT_VERTEX_FLOAT_CONSTANTS, probe.vertexConstants);
+                        g.list->SetGraphicsRootConstantBufferView(ROOT_PIXEL_FLOAT_CONSTANTS, probe.pixelConstants);
+                        g.list->SetPipelineState(probe.pipeline);
+                        g.list->IASetPrimitiveTopology(probe.topology);
+                        g.list->BeginQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, probe.query);
+                        if (probe.indexed)
+                        {
+                            g.list->IASetIndexBuffer(&probe.indexView);
+                            g.list->DrawIndexedInstanced(probe.count, 1, 0, 0, 0);
+                        }
+                        else
+                        {
+                            g.list->DrawInstanced(probe.count, 1, 0, 0);
+                        }
+                        g.list->EndQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, probe.query);
+                    }
+                    g.drawState.valid = false;
+                }
+                g.lateProbes.clear();
+            }
+        }
         if (AR_ENV("AR_LOG_PRESENT") && g.frameNumber >= 300 && g.frameNumber < 303 && destBase == 0x0CEF0000)
             LOGF_INFO("frame {}: resolve to front buffer {},{}-{},{} from {} (base {}, pitch {}), command {}, clear {:X}", g.frameNumber,
                 x0, y0, x1, y1, sourceSelect, ColorInfo{ registers[RB_COLOR_INFO] }.Base(), pitch, control.Command(), (control.value >> 8) & 3);
@@ -4017,6 +4919,15 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         g.list->ResourceBarrier(1, &barrier);
+        if (g.occlusionHeap && !g.occlusionLabels[g.frameIndex].empty())
+        {
+            uint32_t base = g.frameIndex * State::OCCLUSIONS_PER_FRAME;
+            uint32_t used = uint32_t(g.occlusionLabels[g.frameIndex].size());
+            g.list->ResolveQueryData(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, base, used, g.occlusionReadback.Get(), uint64_t(base) * 8);
+            g.list->ResolveQueryData(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, base + State::PROBE_OFFSET, used,
+                g.occlusionReadback.Get(), uint64_t(base + State::PROBE_OFFSET) * 8);
+        }
+        g.shadowResolves = 0;
         if (g.timestampHeap)
         {
             uint32_t base = g.frameIndex * State::TIMESTAMPS_PER_FRAME;
@@ -4026,7 +4937,12 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.timestampsPending[g.frameIndex] = true;
         }
         Submit();
+        g_slotCursor[g.frameIndex] = g.uploadOffset;
         g.list->Present(0, g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        // Experiment (AR_SERIALIZE_FRAMES): the GPU finishes each frame before the next one is recorded.
+        static const bool serialize = AR_ENV("AR_SERIALIZE_FRAMES") != nullptr;
+        if (serialize)
+            WaitForFence(g.fenceValue);
         // Flip model swap chains go through their buffers in order.
         g.frameIndex = (g.frameIndex + 1) % FRAME_COUNT;
 

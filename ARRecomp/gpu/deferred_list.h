@@ -56,8 +56,13 @@ namespace gpu::d3d12
 
         // Queue work, in order with the commands: execute the list (closed by then) and signal the fence.
         void Execute(uint64_t fenceValue);
+        // Queue work, in order with the commands: execute another (closed) command list.
+        void ExecuteOther(ID3D12CommandList* other);
         void ResetAllocator(ID3D12CommandAllocator* allocator);
         void Present(UINT syncInterval, UINT flags);
+        void BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index);
+        void SOSetTargets(const D3D12_STREAM_OUTPUT_BUFFER_VIEW* view); // One view, or none when null.
+        void CopyBufferRegion(ID3D12Resource* dest, UINT64 destOffset, ID3D12Resource* source, UINT64 sourceOffset, UINT64 size);
         void EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index);
         void ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT count, ID3D12Resource* destination, UINT64 offset);
 
@@ -66,7 +71,8 @@ namespace gpu::d3d12
         {
             ClearDepth, ClearColor, Close, CopyResource, CopyTexture, DrawIndexed, Draw, IndexBuffer, Topology,
             BlendFactor, RenderTargets, StencilRef, Scissors, Viewports, Reset, Barriers, Heaps, RootCbv, RootTable,
-            RootSrv, RootSignature, Pipeline, Execute, ResetAllocator, Present, EndQuery, ResolveQueryData,
+            RootSrv, RootSignature, Pipeline, Execute, ResetAllocator, Present, BeginQuery, EndQuery, ResolveQueryData,
+            StreamOutput, CopyBuffer, ExecuteOther,
         };
 
         // Fixed size command slot: large enough for a texture copy (two copy locations and a box).

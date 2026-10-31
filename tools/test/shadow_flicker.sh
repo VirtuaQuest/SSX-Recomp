@@ -9,8 +9,10 @@ shift
 split_args "$@"
 cd "$RUN" || exit 1
 clear_dumps
-env "${ENV_ARGS[@]}" AR_DUMP_ALPHA=1 AR_DUMP_ONLY=0F801000 AR_DUMP_FRAME=2950 AR_DUMP_FRAMES=400 AR_SCREENSHOT_INTERVAL=100000 \
-    AR_AUTO_PRESS=6 AR_AUTO_SEQUENCE="$TO_GAMEPLAY,MOVE90,MOVE90,MOVE270,MOVE270,MOVE180,MOVE0" \
+# Settings given on the command line come last, so they override these (AR_DUMP_ONLY=1 turns the dumps off, and with
+# them the GPU waits each dump costs; pxdrop.py doesn't need dumps).
+env AR_DUMP_ALPHA=1 AR_DUMP_ONLY=0F801000 AR_DUMP_FRAME=2950 AR_DUMP_FRAMES=400 AR_SCREENSHOT_INTERVAL=100000 \
+    AR_AUTO_PRESS=6 AR_AUTO_SEQUENCE="$TO_GAMEPLAY,MOVE90,MOVE90,MOVE270,MOVE270,MOVE180,MOVE0" "${ENV_ARGS[@]}" \
     timeout 170 "$EXE" --game "$ISO" --screenshots "${GAME_ARGS[@]}" > "flicker_$name.log" 2>&1
 python "$TOOLS/altscore.py" screenshots
 python "$TOOLS/period.py" screenshots

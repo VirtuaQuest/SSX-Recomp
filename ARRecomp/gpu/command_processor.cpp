@@ -26,6 +26,7 @@ namespace gpu
         PM4_WAIT_REG_MEM = 0x3C,
         PM4_MEM_WRITE = 0x3D,
         PM4_INDIRECT_BUFFER = 0x3F,
+        PM4_NOP = 0x10,
         PM4_COND_WRITE = 0x45,
         PM4_EVENT_WRITE = 0x46,
         PM4_INTERRUPT = 0x54,
@@ -57,8 +58,16 @@ namespace gpu
     static std::mutex g_swapTimesMutex;
     static std::deque<std::chrono::steady_clock::time_point> g_swapTimes;
 
+    static std::atomic<uint32_t> g_submittedSwaps;
+
+    uint32_t SubmittedSwaps()
+    {
+        return g_submittedSwaps;
+    }
+
     void NoteSwapSubmitted()
     {
+        g_submittedSwaps++;
         std::lock_guard lock(g_swapTimesMutex);
         g_swapTimes.push_back(std::chrono::steady_clock::now());
 
@@ -356,12 +365,38 @@ namespace gpu
     }
 
     static int g_indirectDepth;
+    static uint32_t g_indirectAddresses[8], g_indirectSizes[8];
+
+    uint32_t GetIndirectBufferChain(uint32_t* addresses, uint32_t* sizes, uint32_t capacity)
+    {
+        uint32_t count = std::min<uint32_t>(uint32_t(g_indirectDepth), capacity);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            addresses[i] = g_indirectAddresses[i];
+            sizes[i] = g_indirectSizes[i];
+        }
+        return count;
+    }
 
     // Predicated tiling: a frame is rendered in screen tiles ("bins") by running the same commands once per tile.
     // Type 3 packets with the predicate bit only run when the selected bins overlap the mask, so per frame work
     // (fences, swaps) inside them runs once.
     static uint64_t g_binMask = 0xFFFFFFFF;
     static uint64_t g_binSelect = 0xFFFFFFFF;
+
+    // Diagnostics: the last draw marker (a NOP the CPU side inserts before draws, AR_MARK_DRAWS): the hash of the
+    // guest call chain and the model drawn.
+    static uint32_t g_drawMarker, g_drawMarkerObject;
+
+    uint32_t CurrentDrawMarker()
+    {
+        return g_drawMarker;
+    }
+
+    uint32_t CurrentDrawMarkerObject()
+    {
+        return g_drawMarkerObject;
+    }
 
     static void ExecutePacket3(PacketReader& reader, uint32_t opcode, uint32_t count, bool predicated)
     {
@@ -378,6 +413,16 @@ namespace gpu
 
         switch (opcode)
         {
+        case PM4_NOP:
+        {
+            if (count >= 3 && read() == 0x41524D4B) // 'ARMK'
+            {
+                g_drawMarker = read();
+                g_drawMarkerObject = read();
+            }
+            break;
+        }
+
         case PM4_INDIRECT_BUFFER:
         case PM4_INDIRECT_BUFFER_PFD:
         {
@@ -395,6 +440,8 @@ namespace gpu
                 break;
             }
 
+            g_indirectAddresses[g_indirectDepth] = address;
+            g_indirectSizes[g_indirectDepth] = length;
             g_indirectDepth++;
             PacketReader indirect(PhysicalToVirtual(address), length, 0, false);
             ExecuteBuffer(indirect, length);

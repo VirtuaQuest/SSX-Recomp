@@ -133,10 +133,13 @@ void InstallCrashHandler()
 // Debugging (AR_WATCH_PHYSICAL=<hex physical address>): logs where writes to the 4 KB page holding a physical
 // address come from, once per host instruction. The page is made read only in every physical view; a write faults,
 // is logged, and runs with the page writable for one instruction.
-static uint8_t* g_watchPages[3];
+static std::vector<uint8_t*> g_watchPages;
+static size_t g_watchLimit = 64; // Distinct writers logged (AR_WATCH_LIMIT).
 static std::set<DWORD64> g_watchSeen;
 static thread_local bool t_watchStepping;
 static uint8_t* g_watchExact; // Only writes to these 8 bytes are logged, when set.
+static std::vector<uint8_t*> g_watchWords; // Or only writes to these words (WatchGuestWords), each writer once per word.
+static std::set<std::pair<DWORD64, uint8_t*>> g_watchWordWriters;
 
 static void ProtectWatch(DWORD protection)
 {
@@ -168,7 +171,21 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
         std::lock_guard lock(g_crashMutex);
         bool exact = g_watchExact == nullptr || (address >= g_watchExact && address < g_watchExact + 8);
         static int exactLogs;
-        if (exact && (g_watchExact != nullptr ? exactLogs++ < 64 : g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < 64))
+        bool log;
+        if (!g_watchWords.empty())
+        {
+            log = false;
+            for (auto* word : g_watchWords)
+            {
+                if (address >= word && address < word + 4)
+                    log = g_watchWordWriters.insert({ info->ContextRecord->Rip, word }).second && g_watchWordWriters.size() < 256;
+            }
+        }
+        else
+        {
+            log = exact && (g_watchExact != nullptr ? exactLogs++ < 64 : g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < g_watchLimit);
+        }
+        if (log)
         {
             fmt::print(stderr, "==== watch: write to guest 0x{:08X} on guest thread {}\n", g_memory.MapVirtual(address),
                 GetCurrentGuestThreadId());
@@ -193,9 +210,18 @@ void InstallMemoryWatch()
         uint32_t address = uint32_t(strtoul(text, nullptr, 16));
         uint32_t page = address & ~0xFFFu;
         g_watchExact = g_memory.base + address;
-        for (auto& watched : g_watchPages)
-            watched = g_memory.base + page;
+        g_watchPages = { g_memory.base + page };
         AddVectoredExceptionHandler(1, WatchHandler);
+        if (const char* delay = getenv("AR_WATCH_DELAY"))
+        {
+            std::thread([seconds = atoi(delay)]
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                    fmt::print(stderr, "==== watch armed\n");
+                    ProtectWatch(PAGE_READONLY);
+                }).detach();
+            return;
+        }
         ProtectWatch(PAGE_READONLY);
         return;
     }
@@ -204,11 +230,58 @@ void InstallMemoryWatch()
     if (!text)
         return;
 
-    uint32_t page = uint32_t(strtoul(text, nullptr, 16)) & ~0xFFFu;
-    g_watchPages[0] = g_memory.base + 0xA0000000u + page;
-    g_watchPages[1] = g_memory.base + 0xC0000000u + page;
-    g_watchPages[2] = g_memory.base + 0xE0000000u + page; // Virtual 0xE0000000 + X is physical X + 0x1000, stored 4 KB up.
+    // AR_WATCH_PHYSICAL_SIZE: bytes to watch from the address (one page by default); AR_WATCH_LIMIT: distinct writers.
+    uint32_t start = uint32_t(strtoul(text, nullptr, 16)) & ~0xFFFu;
+    const char* sizeText = getenv("AR_WATCH_PHYSICAL_SIZE");
+    uint32_t size = sizeText ? uint32_t(strtoul(sizeText, nullptr, 0)) : 4096;
+    if (const char* limit = getenv("AR_WATCH_LIMIT"))
+        g_watchLimit = strtoul(limit, nullptr, 0);
+    for (uint32_t page = start; page < start + size; page += 4096)
+    {
+        g_watchPages.push_back(g_memory.base + 0xA0000000u + page);
+        g_watchPages.push_back(g_memory.base + 0xC0000000u + page);
+        g_watchPages.push_back(g_memory.base + 0xE0000000u + page); // Virtual 0xE0000000 + X is physical X + 0x1000, stored 4 KB up.
+    }
     AddVectoredExceptionHandler(1, WatchHandler);
+
+    // AR_WATCH_DELAY: seconds before watching (memory written every frame makes the game crawl while watched).
+    if (const char* delay = getenv("AR_WATCH_DELAY"))
+    {
+        std::thread([seconds = atoi(delay)]
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                fmt::print(stderr, "==== watch armed\n");
+                ProtectWatch(PAGE_READONLY);
+            }).detach();
+        return;
+    }
+    ProtectWatch(PAGE_READONLY);
+}
+
+// Debugging: logs the writers of these guest words (each writer once per word) from now on, with their stacks.
+void WatchGuestWords(const std::vector<uint32_t>& addresses)
+{
+    std::lock_guard lock(g_crashMutex);
+    std::set<uint8_t*> pages;
+    for (uint32_t address : addresses)
+    {
+        g_watchWords.push_back(g_memory.base + address);
+        pages.insert(g_memory.base + (address & ~0xFFFu));
+        if (address >= 0xA0000000)
+        {
+            // Physical heap addresses: the other views of the same page too.
+            uint32_t physical = address & 0x1FFFFFFF;
+            for (uint32_t view : { 0xA0000000u, 0xC0000000u, 0xE0000000u })
+                pages.insert(g_memory.base + ((view + physical) & ~0xFFFu)); // As AR_WATCH_PHYSICAL.
+        }
+    }
+    g_watchPages.assign(pages.begin(), pages.end());
+    static bool installed;
+    if (!installed)
+    {
+        installed = true;
+        AddVectoredExceptionHandler(1, WatchHandler);
+    }
     ProtectWatch(PAGE_READONLY);
 }
 
