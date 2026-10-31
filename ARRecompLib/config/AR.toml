@@ -18,3 +18,42 @@ savevmx_64_address = 0x8244B604
 # r1 from the jmp_buf and is one of the two callers of RtlUnwind; setjmp is the only function saving that layout.
 longjmp_address = 0x825664C0
 setjmp_address = 0x82566900
+
+# UI updates that pass their elements a fixed 1/30 s per update (loaded from the constant pool into f31): the UI
+# manager (sub_827BA3B0: HUD, radar, dialogue, result screens), its twin sub_82789708, sub_827B5BC8/827B6690/827B6E40
+# and sub_827F7828. Above 30 fps the step is scaled by the game's time step (kernel/timing_hooks.cpp).
+[[midasm_hook]]
+name = "UiTimeStepHook"
+address = 0x827BA410
+registers = ["f31"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiTimeStepHook2"
+address = 0x8278974C
+registers = ["f31"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiTimeStepHook3"
+address = 0x827B5C34
+registers = ["f31"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiTimeStepHook4"
+address = 0x827B66FC
+registers = ["f31"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiTimeStepHook5"
+address = 0x827B6EAC
+registers = ["f31"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiTimeStepHook6"
+address = 0x827F7840
+registers = ["f31"]
+after_instruction = true
