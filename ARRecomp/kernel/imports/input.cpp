@@ -3,6 +3,7 @@
 #include <kernel/imports.h>
 #include <kernel/xam.h>
 #include <Xinput.h>
+#include <sstream>
 #include <gpu/d3d12_renderer.h>
 
 // XAMINPUT structures in xbox.h use the host XInput layout; guest memory holds them big endian.
@@ -38,7 +39,7 @@ static void StartConnectionMonitor()
     static std::once_flag once;
     std::call_once(once, []
         {
-            g_connectedMask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") ? 1u : 0u);
+            g_connectedMask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") ? 1u : 0u);
             LOGF_INFO("controllers connected: mask 0x{:X}", g_connectedMask.load());
 
             std::thread([]
@@ -46,7 +47,7 @@ static void StartConnectionMonitor()
                     while (true)
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                        uint32_t mask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") ? 1u : 0u);
+                        uint32_t mask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") ? 1u : 0u);
                         uint32_t previous = g_connectedMask.exchange(mask);
                         if (mask != previous)
                         {
@@ -197,11 +198,168 @@ static uint16_t AutoPressButtons(float& stickAngle)
     return tapped || (buttons & AUTO_HOLD) ? buttons : 0;
 }
 
+// Remote control for debugging (AR_REMOTE=<file>): lines appended to the file while the game runs are carried out in
+// order. A line lists what to hold and for how long: button names as in AR_AUTO_SEQUENCE (plus RT), L<degrees> and
+// R<degrees> for the left and right stick (counterclockwise from up), and a duration in ms (150 with buttons,
+// otherwise 0), e.g. "L0 A 400". A bare number waits; "shot <name>" saves the next frame to screenshots/<name>.bmp;
+// "scan" starts a timer scan (AR_SCAN_TIMERS), "scanwatch" one that also watches the timers it finds; "find ..." and
+// "track ..." search and log guest memory (RunFind in timing_hooks.cpp).
+// Buttons are released for 60 ms after each line, so repeated lines are separate presses.
+struct RemoteAction
+{
+    uint16_t buttons = 0;
+    float left = -1.0f, right = -1.0f;
+    bool leftTrigger = false, rightTrigger = false;
+    int64_t milliseconds = 0;
+    std::string shot; // Screenshot taken when the action starts.
+    int scan = 0; // Timer scan started when the action starts (2: and watch the timers).
+    std::string find; // Memory search step or tracker (see RunFind in timing_hooks.cpp).
+};
+
+void RequestTimerScan(bool watch);
+void RequestFind(const std::string& request);
+
+static bool RemoteControl(XINPUT_STATE& state)
+{
+    static const char* path = AR_ENV("AR_REMOTE");
+    if (!path)
+        return false;
+
+    static std::mutex mutex;
+    static std::deque<RemoteAction> actions;
+    static size_t linesRead;
+    static auto lastPoll = std::chrono::steady_clock::time_point{};
+    static auto actionEnd = std::chrono::steady_clock::time_point{};
+    static RemoteAction current;
+    std::lock_guard lock(mutex);
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastPoll > std::chrono::milliseconds(50))
+    {
+        lastPoll = now;
+        std::ifstream file(path);
+        std::string line;
+        size_t index = 0;
+        while (std::getline(file, line))
+        {
+            if (index++ < linesRead || line.empty())
+                continue;
+            linesRead = index;
+            std::istringstream words(line);
+            std::string word;
+            RemoteAction action;
+            bool timed = false;
+            while (words >> word)
+            {
+                static const std::pair<const char*, uint16_t> names[] = { { "A", XINPUT_GAMEPAD_A }, { "B", XINPUT_GAMEPAD_B },
+                    { "X", XINPUT_GAMEPAD_X }, { "Y", XINPUT_GAMEPAD_Y }, { "START", XINPUT_GAMEPAD_START }, { "BACK", XINPUT_GAMEPAD_BACK },
+                    { "UP", XINPUT_GAMEPAD_DPAD_UP }, { "DOWN", XINPUT_GAMEPAD_DPAD_DOWN }, { "LEFT", XINPUT_GAMEPAD_DPAD_LEFT },
+                    { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER },
+                    { "LS", XINPUT_GAMEPAD_LEFT_THUMB }, { "RS", XINPUT_GAMEPAD_RIGHT_THUMB } };
+                if (word == "shot")
+                {
+                    words >> action.shot;
+                    if (action.shot.empty())
+                        action.shot = "remote";
+                    continue;
+                }
+                if (word == "find" || word == "track")
+                {
+                    std::string rest;
+                    std::getline(words, rest);
+                    rest.erase(0, rest.find_first_not_of(' '));
+                    action.find = word == "track" ? "track " + rest : rest;
+                    continue;
+                }
+                if (word == "scan" || word == "scanwatch")
+                {
+                    action.scan = word == "scan" ? 1 : 2;
+                    continue;
+                }
+                if (word == "LT")
+                    action.leftTrigger = true;
+                else if (word == "RT")
+                    action.rightTrigger = true;
+                else if ((word[0] == 'L' || word[0] == 'R') && word.size() > 1 && (isdigit(uint8_t(word[1])) || word[1] == '-'))
+                    (word[0] == 'L' ? action.left : action.right) = std::fmod(float(atof(word.c_str() + 1)) + 360.0f, 360.0f);
+                else if (isdigit(uint8_t(word[0])))
+                {
+                    action.milliseconds = atoll(word.c_str());
+                    timed = true;
+                }
+                for (auto& [name, button] : names)
+                {
+                    if (word == name)
+                        action.buttons |= button;
+                }
+            }
+            bool pressing = action.buttons || action.leftTrigger || action.rightTrigger;
+            if (!timed)
+                action.milliseconds = pressing ? 150 : 0;
+            if (action.milliseconds > 0 || pressing || action.left >= 0.0f || action.right >= 0.0f || !action.shot.empty() || action.scan || !action.find.empty())
+                actions.push_back(action);
+            if (pressing)
+                actions.push_back(RemoteAction{ .milliseconds = 60 });
+        }
+    }
+
+    if (now >= actionEnd)
+    {
+        current = {};
+        if (!actions.empty())
+        {
+            current = actions.front();
+            actions.pop_front();
+            actionEnd = now + std::chrono::milliseconds(current.milliseconds);
+            if (!current.shot.empty())
+                gpu::d3d12::RequestScreenshot(current.shot);
+            if (!current.find.empty())
+                RequestFind(current.find);
+            if (current.scan)
+            {
+                RequestTimerScan(current.scan == 2);
+                LOGF_INFO("remote: timer scan at frame {}", gpu::d3d12::GetFrameNumber());
+            }
+            LOGF_INFO("remote: buttons 0x{:04X} left {} right {} for {} ms at frame {}", current.buttons, current.left, current.right,
+                current.milliseconds, gpu::d3d12::GetFrameNumber());
+        }
+    }
+
+    auto stick = [](float angle, SHORT& x, SHORT& y)
+        {
+            float radians = angle * 3.14159265f / 180.0f;
+            x = SHORT(-std::sin(radians) * 32767.0f);
+            y = SHORT(std::cos(radians) * 32767.0f);
+        };
+    if (current.left >= 0.0f)
+        stick(current.left, state.Gamepad.sThumbLX, state.Gamepad.sThumbLY);
+    if (current.right >= 0.0f)
+        stick(current.right, state.Gamepad.sThumbRX, state.Gamepad.sThumbRY);
+    state.Gamepad.wButtons |= current.buttons;
+    if (current.leftTrigger)
+        state.Gamepad.bLeftTrigger = 255;
+    if (current.rightTrigger)
+        state.Gamepad.bRightTrigger = 255;
+    return true;
+}
+
 static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
 {
     bool connected = XInputGetState(user, &state) == ERROR_SUCCESS;
     if (!connected)
         memset(&state, 0, sizeof(state));
+
+    if (user == 0 && AR_ENV("AR_REMOTE"))
+    {
+        RemoteControl(state);
+        static std::atomic<uint32_t> packet;
+        static std::atomic<uint64_t> lastState;
+        uint64_t packed = state.Gamepad.wButtons | uint64_t(state.Gamepad.bLeftTrigger) << 16 | uint64_t(state.Gamepad.bRightTrigger) << 24 |
+            uint64_t(uint16_t(state.Gamepad.sThumbLX)) << 32 | uint64_t(uint16_t(state.Gamepad.sThumbLY)) << 48;
+        if (lastState.exchange(packed) != packed)
+            packet++;
+        state.dwPacketNumber = packet + (connected ? 0x10000 : 0);
+        return true;
+    }
 
     if (user == 0 && AR_ENV("AR_AUTO_PRESS"))
     {
@@ -303,7 +461,7 @@ namespace imports
         XINPUT_CAPABILITIES host;
         if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(userIndex & 0xFF, XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
         {
-            if ((userIndex & 0xFF) != 0 || !AR_ENV("AR_AUTO_PRESS"))
+            if ((userIndex & 0xFF) != 0 || !(AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE")))
                 return X_ERROR_DEVICE_NOT_CONNECTED;
             host = {};
             host.Type = XINPUT_DEVTYPE_GAMEPAD;

@@ -140,6 +140,7 @@ static thread_local bool t_watchStepping;
 static uint8_t* g_watchExact; // Only writes to these 8 bytes are logged, when set.
 static std::vector<uint8_t*> g_watchWords; // Or only writes to these words (WatchGuestWords), each writer once per word.
 static std::set<std::pair<DWORD64, uint8_t*>> g_watchWordWriters;
+static std::atomic<bool> g_watchStopped; // StopWatchingGuestWords: nothing is logged or protected any more.
 
 static void ProtectWatch(DWORD protection)
 {
@@ -154,7 +155,7 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
     if (record->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watchStepping)
     {
         t_watchStepping = false;
-        ProtectWatch(PAGE_READONLY);
+        ProtectWatch(g_watchStopped ? PAGE_READWRITE : PAGE_READONLY);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1)
@@ -262,6 +263,8 @@ void InstallMemoryWatch()
 void WatchGuestWords(const std::vector<uint32_t>& addresses)
 {
     std::lock_guard lock(g_crashMutex);
+    g_watchStopped = false;
+    g_watchWords.clear();
     std::set<uint8_t*> pages;
     for (uint32_t address : addresses)
     {
@@ -283,6 +286,13 @@ void WatchGuestWords(const std::vector<uint32_t>& addresses)
         AddVectoredExceptionHandler(1, WatchHandler);
     }
     ProtectWatch(PAGE_READONLY);
+}
+
+// Ends WatchGuestWords, whose page faults otherwise slow the game to a few frames per second.
+void StopWatchingGuestWords()
+{
+    g_watchStopped = true;
+    ProtectWatch(PAGE_READWRITE);
 }
 
 // Prints the calling thread's host stack (recompiled functions are named after their guest addresses).

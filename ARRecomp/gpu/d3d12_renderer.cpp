@@ -4696,6 +4696,15 @@ float4 main(float4 position : SV_Position) : SV_Target
         return g.frameNumber;
     }
 
+    static std::mutex g_screenshotRequestMutex;
+    static std::string g_screenshotRequest;
+
+    void RequestScreenshot(const std::string& name)
+    {
+        std::lock_guard lock(g_screenshotRequestMutex);
+        g_screenshotRequest = name;
+    }
+
     void EnableScreenshots(const std::filesystem::path& folder)
     {
         g_screenshotFolder = folder;
@@ -4882,6 +4891,22 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             SaveScreenshot(resolved->second.texture, (swap.width ? swap.width : 1280) * g_scale, (swap.height ? swap.height : 720) * g_scale,
                 g_screenshotFolder / fmt::format("frame_{:06}.bmp", g.frameNumber), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2);
+        }
+        if (resolved != g.resolvedTextures.end() && resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
+        {
+            std::string request;
+            {
+                std::lock_guard lock(g_screenshotRequestMutex);
+                request.swap(g_screenshotRequest);
+            }
+            if (!request.empty())
+            {
+                std::error_code ec;
+                std::filesystem::create_directories("screenshots", ec);
+                SaveScreenshot(resolved->second.texture, (swap.width ? swap.width : 1280) * g_scale, (swap.height ? swap.height : 720) * g_scale,
+                    fmt::format("screenshots/{}.bmp", request), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2);
+                LOGF_INFO("remote: saved screenshots/{}.bmp at frame {}", request, g.frameNumber);
+            }
         }
 
         if (resolved != g.resolvedTextures.end())

@@ -36,4 +36,7 @@ namespace gpu::d3d12
 
     // Frames presented so far.
     uint64_t GetFrameNumber();
+
+    // Saves the next presented frame to screenshots/<name>.bmp (debugging remote control, AR_REMOTE).
+    void RequestScreenshot(const std::string& name);
 }

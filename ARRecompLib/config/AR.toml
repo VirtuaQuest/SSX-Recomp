@@ -57,3 +57,237 @@ name = "UiTimeStepHook6"
 address = 0x827F7840
 registers = ["f31"]
 after_instruction = true
+
+# Character movement's limit per update (1.5, 0x820A4130 + 644): sub_82A36F98, sub_82CD1F20, sub_82A5A270.
+[[midasm_hook]]
+name = "MotionCapHook"
+address = 0x82A37794
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "MotionCapHook"
+address = 0x82CD2B98
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "MotionCapHook"
+address = 0x82A5CA2C
+registers = ["f30"]
+after_instruction = true
+
+# The other UI code loading the 1/30 s step (0x820A4130 + 192) for itself, the two-character dialogues' line timing among
+# it. Not all of the title's loads: character code multiplies it by the time step (see timing_hooks.cpp).
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827520E8
+address = 0x82753960
+registers = ["f1"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82756AB0
+address = 0x82757398
+registers = ["f12"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82761618
+address = 0x82761664
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82765BB0
+address = 0x82765CCC
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82769578
+address = 0x82769614
+registers = ["f1"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82776218
+address = 0x82776278
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82776358
+address = 0x827763B0
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827764D0
+address = 0x82776528
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82776648
+address = 0x827766A0
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82785018
+address = 0x827850B0
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82785018
+address = 0x827850EC
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8278B870
+address = 0x8278B8D8
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8278BF98
+address = 0x8278C000
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827BE088
+address = 0x827BE0E0
+registers = ["f28"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827C5FB8
+address = 0x827C5FF0
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827CCC78
+address = 0x827CCCB4
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827CD248
+address = 0x827CD280
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827D5E20
+address = 0x827D5E54
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827E44F8
+address = 0x827E45F0
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827E44F8
+address = 0x827E4674
+registers = ["f12"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827EC068
+address = 0x827EC0DC
+registers = ["f1"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827EDA28
+address = 0x827EDBA8
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827F4DC8
+address = 0x827F4EE0
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_827F4DC8
+address = 0x827F4FAC
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8280D248
+address = 0x8280D65C
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8280D248
+address = 0x8280D6CC
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8280D248
+address = 0x8280D7C4
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82810A90
+address = 0x82810B60
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82819978
+address = 0x82819B20
+registers = ["f12"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_82819CA8
+address = 0x82819D24
+registers = ["f28"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8281A2A8
+address = 0x8281A3C0
+registers = ["f30"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # sub_8282BF40
+address = 0x8282C250
+registers = ["f0"]
+after_instruction = true
+
+# The same limit approached gradually (the rate at 0x820A4130 + 220), which falling goes through.
+
+[[midasm_hook]]
+name = "MotionCapHook" # sub_82A36F98
+address = 0x82A37D90
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "MotionCapHook" # sub_82A5A270
+address = 0x82A5CFE0
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "MotionCapHook" # sub_82CD1CA8
+address = 0x82CD1DA0
+registers = ["f0"]
+after_instruction = true

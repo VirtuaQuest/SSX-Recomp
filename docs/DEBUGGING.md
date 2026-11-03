@@ -75,6 +75,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_LOG_QUERIES`, `AR_LOG_QUERY_RESULTS` | Occlusion query waits (5 s summary) and results |
 | `AR_LOG_TIMEBASE`, `AR_LOG_QPC`, `AR_LOG_TIMESTEP` | Who reads the clock; the game's time step |
 | `AR_LOG_UI_TIME`, `AR_LOG_UI_TIMESTEP` | How fast UI time runs per real second (1 is right); calls per UI step hook |
+| `AR_LOG_ANIM_STEP`, `AR_LOG_INPUT_REPEAT` | Objects getting the time step for their animation; each menu input repeat |
+| `AR_SCAN_KEY` | F9 scans for values changing by a fixed amount per update while playing; F10 also logs their writers for 10 updates, slowing the game for those. Compare scans with `timerdiff.py` |
 | `AR_SCAN_TIMERS=<update>\|@<seconds>`, `AR_SCAN_TIMERS_WATCH` | Values counting updates instead of time (run at `--fps 120`), and who writes them |
 | `AR_WATCH_UI_TIME=<seconds>`, `AR_LOG_UI_ITEMS=<frame>,<count>` | Writers of UI element times; the UI's sprite draw items |
 | `AR_LOG_PRIORITIES`, `AR_LOG_DELAYS`, `AR_LOG_READS`, `AR_LOG_SHA`, `AR_LOG_SAVE_ERRORS` | Kernel calls |
@@ -92,6 +94,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_NATIVE_RESET` | Guest strip indices with the host's restart value |
 | `AR_WAIT_QUERIES` | Answering occlusion queries at once (polls like before) |
 | `AR_NO_TIMESTEP_FIX`, `AR_NO_UI_TIMESTEP_FIX` | Normal game speed above 30 fps; normal UI speed (HUD, radar, dialogue, results) above 30 fps |
+| `AR_NO_MOTION_CAP_FIX`, `AR_NO_ANIM_STEP_FIX`, `AR_NO_INPUT_REPEAT_FIX` | Above 30 fps: normal speed of launches from vents and ramps; of animation of objects not refreshing their step (dialogues); of menu input repeat |
 | `AR_NO_COMPOSITE` | Assembling textures from consecutive resolves |
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
@@ -107,6 +110,15 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 `AR_AUTO_PRESS=<seconds>` and `AR_AUTO_SEQUENCE=<steps>` press buttons in order (A, B, X, Y, START, UP, DOWN, LT,
 LTHOLD, MOVE<degrees>, WAIT). `AR_AUTO_FRAMES` steps by presented frames instead of time. Test runs also read a
 connected controller.
+
+`AR_REMOTE=<file>` drives the game live instead: lines appended to the file run in order. A line lists buttons, `L<degrees>` and
+`R<degrees>` for the sticks and a duration in ms (`L0 A 400`); a bare number waits. Also `shot <name>` (saves
+screenshots/<name>.bmp, needs no `--screenshots`), `scan`, `scanwatch`, and `find new|changed|same|list`, `find watch <addresses>`
+(writers, for 30 updates) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
+frame rate, but walking to a place by timing alone isn't reliable. A connected controller still works alongside it.
+
+`tools/test/world_speed.sh <name> --fps <n>` continues the campaign and measures running speed: it catches large errors such as
+slow motion. Peaks vary between runs and routes (6-9 at every frame rate so far), so it can't show small ones.
 
 ## Memory watches
 

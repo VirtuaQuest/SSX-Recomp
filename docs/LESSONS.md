@@ -133,6 +133,12 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   120 fps (`AR_SCAN_TIMERS=@<seconds>`): anything following the time step changes by 0.25-0.5 there, and the scan's
   own slow first frame weeds out the rest. `AR_SCAN_TIMERS_WATCH` then logs the code writing a sample of them. That
   led from a UI element's derived counter to its time, to the manager adding a fixed step.
+- For what runs fast only in one scene, have someone press F9 in it (`AR_SCAN_KEY`) and compare with a scan in ordinary play
+  (`timerdiff.py`). A value changing by the same amount through the scan's own slow updates ignores the time step. F10 then
+  logs who writes those values. Check any fix with characters too: slow motion from one was first blamed on the debug tool
+  because the watch really did slow the game at the time; `world_speed.sh` measures it without a tester.
+- When a search by signature keeps catching other things, narrow it to the memory range where the real hits were: a hunt for
+  a steady 1.5 per update first caught only sound threads.
 - For draws that come and go, measure them on the GPU instead of comparing images: an occlusion query around each
   draw (`AR_SHADOW_PIXELS`) gives the samples it wrote, and drawing it again without depth testing gives its
   rasterized area. That separates "not issued" from "failed the depth test" from "rasterized nothing".
@@ -161,6 +167,20 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   screens not reached by the tests). Other code that keeps the 1/30 constant in a register and passes it on, not
   hooked yet: `sub_829F9750`, `sub_829F9DD0`, `sub_82BB0F48`, `sub_8281A2A8`. If something else still runs fast
   above 30 fps, look there first, then use `AR_SCAN_TIMERS`.
+- High frame rates, what was fixed in November 2026 (all in `kernel/timing_hooks.cpp` and `AR.toml`, each with an off switch):
+  - Two-character dialogues' line timing: 32 more loads of the 1/30 constant, all in the UI code range 0x82750000-0x82840000
+    (`UiConstantHook`), plus `sub_827EAEE0`, which advances element time. The title has 303 such loads. Do not scale the
+    constant itself: character code multiplies it by the time step, so characters ran at a quarter speed at 120 fps.
+  - Dialogue characters' lips and idle motion: animation advances by its object's own step at +944. Most objects refresh it
+    from `sub_82BC9B28(category)`; those that don't keep the 1 they were created with. `sub_82BAE108`, which all animation
+    goes through, now gives those the time step. In-engine cutscenes keep their timing with this.
+  - Vents and ramps: characters move toward a target, at most 1.5 units per update (0x820A4130 + 644). Normal movement stays
+    below that and follows the time step, but launches hit it. `MotionCapHook` scales the limit where three movement routines
+    load it (`sub_82A36F98`, `sub_82CD1F20`, `sub_82A5A270`), and the gradually approached limit falling goes through.
+  - Menu input: `sub_826E91E0` counts updates a button is held, repeating at counts from globals (delay 10, period 3, at
+    0x831AE360/0x831AE35C). The count now advances at 30 Hz. A 3 s hold: 27 repeats at 30 fps, 27 at 120 fps, 101 unfixed.
+  - Known, not fixed: values around -180 to 180 changing by 10 per update during launches, written from `sub_826DEDE0` and
+    `sub_82965678` (they look like angles; nobody has reported a visible problem).
 - D3D's `IDirect3DQuery9::GetData` is `sub_8223F950` (device fence progress at device + 11036, completed value at
   *(device + 11024)); the title's QueryPerformanceCounter is `sub_8245B458`.
 - Effects pass depth is restored by drawing saved depth words as colour at EDRAM 0x5B7; the shadow map depth buffer is
