@@ -291,3 +291,37 @@ name = "MotionCapHook" # sub_82CD1CA8
 address = 0x82CD1DA0
 registers = ["f0"]
 after_instruction = true
+
+# The Gallery's character viewer (sub_82E1C508) adds a fixed amount per update while a stick or the D-pad is held: its zoom, rotation and
+# tilt, and moving up and down. Above 30 fps these follow the time step, like the UI's constants above.
+# Zoom is slower than the original besides (kernel/timing_hooks.cpp): it crossed its whole range in a third of a second.
+
+[[midasm_hook]]
+name = "ViewerZoomHook" # zoom, the largest characters
+address = 0x82E1C59C
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "ViewerZoomHook" # zoom
+address = 0x82E1C5A4
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # rotation and tilt
+address = 0x82E1C604
+registers = ["f29"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # moving, the largest characters
+address = 0x82E1C6B4
+registers = ["f13"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "UiConstantHook" # moving
+address = 0x82E1C6BC
+registers = ["f13"]
+after_instruction = true

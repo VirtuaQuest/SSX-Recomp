@@ -82,8 +82,9 @@ PPC_FUNC(sub_8245B458)
     __imp__sub_8245B458(ctx, base);
 }
 
-void WatchGuestWords(const std::vector<uint32_t>& addresses);
+void WatchGuestWords(const std::vector<uint32_t>& addresses, bool reads = false);
 void StopWatchingGuestWords();
+void RequestUiDump();
 
 // Whether a watch started here is active: starting another then would lose track of the pages it protects.
 static bool g_watchActive;
@@ -117,6 +118,11 @@ static void ScanTimers(uint8_t* base)
         // The low bit also reports presses from before this run: only act on a key going down.
         static bool f9Down, f10Down;
         bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0, f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        static bool f11Down;
+        bool f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+        if (f11 && !f11Down)
+            RequestUiDump();
+        f11Down = f11;
         if (f9 && !f9Down)
             RequestTimerScan(false);
         if (f10 && !f10Down)
@@ -299,6 +305,9 @@ void RequestFind(const std::string& request)
     g_findRequests.push_back(request);
 }
 
+static std::vector<std::pair<uint32_t, uint32_t>> g_intCandidates;
+static bool g_intFresh;
+
 static void RunFind(uint8_t* base)
 {
     static constexpr std::pair<uint32_t, uint32_t> ranges[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83B00000 },
@@ -342,11 +351,303 @@ static void RunFind(uint8_t* base)
             memcpy(&value, &bits, 4);
             return std::isfinite(value) && std::abs(value) > 1e-3f && std::abs(value) < 1e6f;
         };
-    if (request.rfind("watch", 0) == 0)
+    if (request == "intnew" || request.rfind("intstep ", 0) == 0)
     {
-        // "find watch <addresses>": logs who writes these guest words, for 30 updates.
+        // "find intnew", then "find intstep <delta>" after each change: small integers that changed by exactly that much. List
+        // them with "find intlist".
+        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x83000000, 0x83B00000 } };
+        static std::vector<uint32_t> snapshot[2];
+        if (request == "intnew")
+        {
+            g_intCandidates.clear();
+            for (int r = 0; r < 2; r++)
+            {
+                auto [first, end] = searched[r];
+                const auto* memory = reinterpret_cast<const uint32_t*>(base + first);
+                snapshot[r].assign(memory, memory + (end - first) / 4);
+            }
+            g_intFresh = true;
+            LOGF_INFO("FINDINT snapshot");
+            return;
+        }
+        int32_t delta = atoi(request.c_str() + 8);
+        if (g_intFresh)
+        {
+            g_intFresh = false;
+            for (int r = 0; r < 2; r++)
+            {
+                auto [first, end] = searched[r];
+                const auto* memory = reinterpret_cast<const uint32_t*>(base + first);
+                for (size_t i = 0; i < snapshot[r].size(); i++)
+                {
+                    uint32_t before = ByteSwap(snapshot[r][i]), after = ByteSwap(memory[i]);
+                    if (after - before == uint32_t(delta) && before < 256)
+                        g_intCandidates.push_back({ first + uint32_t(i) * 4, after });
+                }
+                snapshot[r] = {};
+            }
+        }
+        else
+        {
+            std::vector<std::pair<uint32_t, uint32_t>> alive;
+            for (auto [address, value] : g_intCandidates)
+            {
+                uint32_t now = PPC_LOAD_U32(address);
+                if (now - value == uint32_t(delta))
+                    alive.push_back({ address, now });
+            }
+            g_intCandidates = std::move(alive);
+        }
+        LOGF_INFO("FINDINT step {}: {} left", delta, g_intCandidates.size());
+        return;
+    }
+    if (request == "bytenew" || request.rfind("bytestep ", 0) == 0 || request == "bytelist")
+    {
+        // The same with single bytes, in the heap the UI's objects live in.
+        static constexpr uint32_t first = 0x40000000, end = 0x48000000;
+        static std::vector<uint8_t> snapshot;
+        static std::vector<std::pair<uint32_t, uint8_t>> kept;
+        static bool fresh;
+        const uint8_t* memory = base + first;
+        if (request == "bytenew")
+        {
+            kept.clear();
+            snapshot.assign(memory, memory + (end - first));
+            fresh = true;
+            return;
+        }
+        if (request == "bytelist")
+        {
+            for (size_t i = 0; i < kept.size() && i < 60; i++)
+                LOGF_INFO("FINDBYTE {:08X} = {}", kept[i].first, base[kept[i].first]);
+            return;
+        }
+        int delta = atoi(request.c_str() + 9);
+        if (fresh)
+        {
+            fresh = false;
+            for (size_t i = 0; i < snapshot.size(); i++)
+            {
+                if (uint8_t(memory[i] - snapshot[i]) == uint8_t(delta) && snapshot[i] < 32)
+                    kept.push_back({ first + uint32_t(i), memory[i] });
+            }
+            snapshot = {};
+        }
+        else
+        {
+            std::vector<std::pair<uint32_t, uint8_t>> alive;
+            for (auto [address, value] : kept)
+            {
+                if (uint8_t(base[address] - value) == uint8_t(delta))
+                    alive.push_back({ address, base[address] });
+            }
+            kept = std::move(alive);
+        }
+        LOGF_INFO("FINDBYTE step {}: {} left", delta, kept.size());
+        return;
+    }
+    if (request == "seqnew" || request == "seq+" || request == "seq-" || request == "seqlist")
+    {
+        // "find seqnew", then "find seq+" and "find seq-" after moves one way and the other: words changing by the same amount each
+        // way, whatever it is, as integers or floats. "find seqlist" logs them.
+        struct Candidate
+        {
+            uint32_t address, value;
+            int32_t delta;
+            float floatDelta;
+        };
+        static constexpr uint32_t first = 0x40000000, end = 0x48000000;
+        static std::vector<uint32_t> snapshot;
+        static std::vector<Candidate> kept;
+        static bool fresh;
+        const auto* memory = reinterpret_cast<const uint32_t*>(base + first);
+        uint32_t words = (end - first) / 4;
+        auto asFloat = [](uint32_t bits) { float value; memcpy(&value, &bits, 4); return value; };
+        if (request == "seqnew")
+        {
+            kept.clear();
+            snapshot.assign(memory, memory + words);
+            fresh = true;
+            return;
+        }
+        if (request == "seqlist")
+        {
+            for (size_t i = 0; i < kept.size() && i < 80; i++)
+                LOGF_INFO("FINDSEQ {:08X} = {:08X} ({}) delta {} / {}", kept[i].address, PPC_LOAD_U32(kept[i].address), asFloat(PPC_LOAD_U32(kept[i].address)), kept[i].delta, kept[i].floatDelta);
+            return;
+        }
+        int sign = request == "seq+" ? 1 : -1;
+        if (fresh)
+        {
+            fresh = false;
+            for (uint32_t i = 0; i < words; i++)
+            {
+                if (memory[i] == snapshot[i])
+                    continue;
+                uint32_t before = ByteSwap(snapshot[i]), after = ByteSwap(memory[i]);
+                kept.push_back({ first + i * 4, after, int32_t(after - before) * sign, (asFloat(after) - asFloat(before)) * float(sign) });
+            }
+            snapshot = {};
+        }
+        else
+        {
+            std::vector<Candidate> alive;
+            for (auto candidate : kept)
+            {
+                uint32_t now = PPC_LOAD_U32(candidate.address);
+                if (now == candidate.value)
+                    continue;
+                bool same = int32_t(now - candidate.value) * sign == candidate.delta;
+                float floatDelta = (asFloat(now) - asFloat(candidate.value)) * float(sign);
+                same |= std::isfinite(floatDelta) && std::abs(floatDelta - candidate.floatDelta) <= std::abs(candidate.floatDelta) * 0.01f;
+                if (same)
+                {
+                    candidate.value = now;
+                    alive.push_back(candidate);
+                }
+            }
+            kept = std::move(alive);
+        }
+        LOGF_INFO("FINDSEQ {}: {} left", request, kept.size());
+        return;
+    }
+    if (request == "intlist")
+    {
+        for (size_t i = 0; i < g_intCandidates.size() && i < 60; i++)
+            LOGF_INFO("FINDINT {:08X} = {}", g_intCandidates[i].first, PPC_LOAD_U32(g_intCandidates[i].first));
+        return;
+    }
+    if (request == "uidump")
+    {
+        RequestUiDump();
+        return;
+    }
+    if (request.rfind("dump ", 0) == 0)
+    {
+        // "find dump <label> <addresses>": those words, in hex.
+        char label[32] = {};
+        int used = 0;
+        sscanf(request.c_str() + 5, "%31s %n", label, &used);
+        const char* text = request.c_str() + 5 + used;
+        std::string values;
+        char* next;
+        for (unsigned long address = strtoul(text, &next, 16); next != text; address = strtoul(text, &next, 16))
+        {
+            values += fmt::format(" {:08X}", PPC_LOAD_U32(uint32_t(address)));
+            text = next;
+        }
+        LOGF_INFO("FINDDUMP {}{}", label, values);
+        return;
+    }
+    if (request.rfind("text ", 0) == 0)
+    {
+        // "find text <text>": where it is in memory, in UTF-16 (big endian) or ASCII.
+        std::string text = request.substr(5);
+        std::vector<uint8_t> wide;
+        for (char c : text)
+        {
+            wide.push_back(0);
+            wide.push_back(uint8_t(c));
+        }
+        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83B00000 }, { 0xA0000000, 0xC0000000 } };
+        uint32_t found = 0;
+        for (auto [first, end] : searched)
+        {
+            const uint8_t* start = base + first;
+            size_t size = end - first;
+            auto search = [&](const uint8_t* pattern, size_t length, const char* kind)
+                {
+                    const uint8_t* at = start;
+                    while (found < 40 && (at = std::search(at, start + size, pattern, pattern + length)) != start + size)
+                    {
+                        LOGF_INFO("FINDTEXT {:08X} {}", first + uint32_t(at - start), kind);
+                        found++;
+                        at += length;
+                    }
+                };
+            search(wide.data(), wide.size(), "utf16");
+            std::vector<uint8_t> little(wide);
+            for (size_t i = 0; i + 1 < little.size(); i += 2)
+                std::swap(little[i], little[i + 1]);
+            search(little.data(), little.size(), "utf16le");
+            search(reinterpret_cast<const uint8_t*>(text.data()), text.size(), "ascii");
+        }
+        LOGF_INFO("FINDTEXT '{}': {} found", text, found);
+        return;
+    }
+    if (request.rfind("ptr ", 0) == 0)
+    {
+        // "find ptr <address>": words holding that value.
+        uint32_t wanted = uint32_t(strtoul(request.c_str() + 4, nullptr, 16));
+        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83B00000 }, { 0xA0000000, 0xC0000000 } };
+        uint32_t found = 0;
+        for (auto [first, end] : searched)
+        {
+            const auto* memory = reinterpret_cast<const uint32_t*>(base + first);
+            uint32_t words = (end - first) / 4, swapped = ByteSwap(wanted);
+            for (uint32_t i = 0; i < words && found < 60; i++)
+            {
+                if (memory[i] == swapped)
+                {
+                    LOGF_INFO("FINDPTR {:08X} -> {:08X}", first + i * 4, wanted);
+                    found++;
+                }
+            }
+        }
+        LOGF_INFO("FINDPTR {:08X}: {} found", wanted, found);
+        return;
+    }
+    if (request.rfind("state ", 0) == 0)
+    {
+        // "find state a" in menus, "find state b" in gameplay: words of the image's data with one value in every "b" snapshot
+        // and another value in every "a" snapshot. "find state list" logs them.
+        static constexpr uint32_t first = 0x82000000, end = 0x83B00000;
+        static std::vector<uint32_t> firstA;
+        static std::vector<std::pair<uint32_t, uint32_t>> kept; // Address, value in gameplay.
+        static bool started;
+        const auto* memory = reinterpret_cast<const uint32_t*>(base + first);
+        uint32_t words = (end - first) / 4;
+        char state = request[6];
+        if (request == "state list")
+        {
+            for (size_t i = 0; i < kept.size() && i < 200; i++)
+                LOGF_INFO("FINDSTATE {:08X} gameplay {:08X} now {:08X}", kept[i].first, kept[i].second, PPC_LOAD_U32(kept[i].first));
+            return;
+        }
+        if (!started)
+        {
+            if (state == 'a' && firstA.empty())
+                firstA.assign(memory, memory + words);
+            else if (state == 'b' && !firstA.empty())
+            {
+                started = true;
+                for (uint32_t i = 0; i < words; i++)
+                {
+                    if (memory[i] != firstA[i])
+                        kept.push_back({ first + i * 4, ByteSwap(memory[i]) });
+                }
+                firstA = {};
+            }
+        }
+        else
+        {
+            std::vector<std::pair<uint32_t, uint32_t>> alive;
+            for (auto [address, value] : kept)
+            {
+                if ((PPC_LOAD_U32(address) == value) == (state == 'b'))
+                    alive.push_back({ address, value });
+            }
+            kept = std::move(alive);
+        }
+        LOGF_INFO("FINDSTATE {}: {} left", state, kept.size());
+        return;
+    }
+    if (request.rfind("watch", 0) == 0 || request.rfind("readwatch", 0) == 0)
+    {
+        // "find watch <addresses>": logs who writes these guest words, for 120 updates. "find readwatch <addresses>": and who reads them.
         std::vector<uint32_t> watched;
-        const char* text = request.c_str() + 5;
+        bool reads = request[0] == 'r';
+        const char* text = request.c_str() + (reads ? 9 : 5);
         char* end;
         for (unsigned long address = strtoul(text, &end, 16); end != text; address = strtoul(text, &end, 16))
         {
@@ -356,8 +657,8 @@ static void RunFind(uint8_t* base)
         if (!watched.empty() && !g_watchActive)
         {
             g_watchActive = true;
-            g_huntWatchLeft = 30;
-            WatchGuestWords(watched);
+            g_huntWatchLeft = 120;
+            WatchGuestWords(watched, reads);
         }
         return;
     }
@@ -590,6 +891,101 @@ PPC_FUNC(sub_827EAEE0)
     __imp__sub_827EAEE0(ctx, base);
 }
 
+// Result screens run their timers on the UI's step (scaled above), but count up per update: above 30 fps the scores and the bar for what
+// gets unlocked went 2-4 times too fast. Each counts on the updates that would have happened at 30 fps, the others skip it.
+// AR_NO_RESULT_STEP_FIX counts every update; AR_LOG_RESULTS logs each screen's steps with the time they took.
+static bool ResultCountDue(float& fraction)
+{
+    static const bool fix = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_RESULT_STEP_FIX");
+    if (!fix)
+        return true;
+    fraction += UiStepScale();
+    if (fraction < 1.0f)
+        return false;
+    fraction = std::min(fraction - 1.0f, 1.0f);
+    return true;
+}
+
+static void LogResultStep(const char* screen, uint32_t state, uint32_t step)
+{
+    static const bool log = AR_ENV("AR_LOG_RESULTS") != nullptr;
+    if (!log)
+        return;
+    static uint64_t before;
+    static auto beforeTime = std::chrono::steady_clock::now();
+    uint64_t now = (uint64_t(state) << 32) | step;
+    if (now == before)
+        return;
+    auto time = std::chrono::steady_clock::now();
+    LOGF_INFO("RESULTS {} step {}.{} after {} ms", screen, state, step, std::chrono::duration_cast<std::chrono::milliseconds>(time - beforeTime).count());
+    before = now;
+    beforeTime = time;
+}
+
+// Bring a shown number closer to its total by half the difference, and return whether it's there (one of a mission's scores).
+PPC_FUNC_IMPL(__imp__sub_827F0808);
+PPC_FUNC(sub_827F0808)
+{
+    static float fraction;
+    if (!ResultCountDue(fraction))
+    {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_827F0808(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_827F08F0);
+PPC_FUNC(sub_827F08F0)
+{
+    static float fraction;
+    if (!ResultCountDue(fraction))
+    {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_827F08F0(ctx, base);
+}
+
+// A mission's result screen (state at +4140, its step at +4144). Step 1 of state 3 raises the total behind the unlock bar. Another step
+// value does nothing and goes on to draw it, so that's what it sees when not counting.
+PPC_FUNC_IMPL(__imp__sub_828042B8);
+PPC_FUNC(sub_828042B8)
+{
+    static constexpr uint32_t STEP_DOING_NOTHING = 99;
+    uint32_t screen = ctx.r3.u32;
+    uint32_t state = PPC_LOAD_U32(screen + 4140), step = PPC_LOAD_U32(screen + 4144);
+    LogResultStep("mission", state, step);
+    static float fraction;
+    if (state == 3 && step == 1 && !ResultCountDue(fraction))
+    {
+        PPC_STORE_U32(screen + 4144, STEP_DOING_NOTHING);
+        __imp__sub_828042B8(ctx, base);
+        PPC_STORE_U32(screen + 4144, 1);
+        return;
+    }
+    __imp__sub_828042B8(ctx, base);
+}
+
+// Another result screen (state at +1148): state 2 raises ten numbers by a thirtieth of their totals. A state past its last does nothing and goes on to draw it.
+PPC_FUNC_IMPL(__imp__sub_82803688);
+PPC_FUNC(sub_82803688)
+{
+    static constexpr uint32_t STATE_DOING_NOTHING = 99;
+    uint32_t screen = ctx.r3.u32;
+    uint32_t state = PPC_LOAD_U32(screen + 1148);
+    LogResultStep("scores", state, 0);
+    static float fraction;
+    if (state == 2 && !ResultCountDue(fraction))
+    {
+        PPC_STORE_U32(screen + 1148, STATE_DOING_NOTHING);
+        __imp__sub_82803688(ctx, base);
+        PPC_STORE_U32(screen + 1148, 2);
+        return;
+    }
+    __imp__sub_82803688(ctx, base);
+}
+
 // Characters move toward a target each update, at most 1.5 units per update (0x820A4130 + 644, shared with other code).
 // Ordinary movement stays below it and already follows the time step, but launches from vents and ramps hit it, so above
 // 30 fps they went up 2-4 times too fast. Hooks after each load of the limit scale it by the time step
@@ -604,6 +1000,38 @@ void MotionCapHook(PPCRegister& limit)
     memcpy(&step, &bits, 4);
     if (std::isfinite(step) && step > 0.0f && step <= 4.0f)
         limit.f64 = double(float(limit.f64) * step);
+}
+
+// Diagnostics (AR_LOG_CAMERA): which code sets where the camera looks, to find what moves it in a scene.
+static void LogCameraCaller(const char* what, uint32_t caller)
+{
+    static const bool log = AR_ENV("AR_LOG_CAMERA") != nullptr;
+    if (!log)
+        return;
+    // Each once, and again after not being seen for two seconds: scenes use several every frame.
+    static std::mutex mutex;
+    static std::map<uint32_t, std::chrono::steady_clock::time_point> seen;
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto [entry, isNew] = seen.try_emplace(caller, now);
+    if (isNew || now - entry->second > std::chrono::seconds(2))
+        LOGF_INFO("CAMERA {} from {:08X} at frame {} step {}", what, caller, gpu::d3d12::GetFrameNumber(), UiStepScale());
+    entry->second = now;
+}
+
+PPC_FUNC_IMPL(__imp__sub_826F6088);
+PPC_FUNC(sub_826F6088)
+{
+    LogCameraCaller("target", uint32_t(ctx.lr));
+    __imp__sub_826F6088(ctx, base);
+}
+
+// The zoom of the Gallery's character viewer: follows the time step too, and a held stick crossed its whole range in a third of a second, so it's
+// slower than the original (AR_VIEWER_ZOOM_SPEED: 1 is the original's).
+void ViewerZoomHook(PPCRegister& step)
+{
+    static const float speed = AR_ENV("AR_VIEWER_ZOOM_SPEED") ? float(atof(AR_ENV("AR_VIEWER_ZOOM_SPEED"))) : 0.2f;
+    step.f64 = double(float(step.f64) * UiStepScale() * speed);
 }
 
 void UiTimeStepHook(PPCRegister& f31) { ScaleUiStep(f31, 1); } // sub_827BA3B0, the UI manager.

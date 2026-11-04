@@ -398,6 +398,29 @@ namespace gpu
         return g_drawMarkerObject;
     }
 
+    // Diagnostics (AR_SHADOW_STATS): packets writing texture fetch constant 0 since the last call, and such packets skipped
+    // by the predicate, for the shadow map draws' logs.
+    static const bool g_noteFetch0 = AR_ENV("AR_SHADOW_STATS") != nullptr;
+    static uint32_t g_fetch0Writes, g_fetch0Skipped;
+    static char g_fetch0Kind = '-';
+
+    static void NoteFetch0(uint32_t base, uint32_t words, char kind)
+    {
+        if (g_noteFetch0 && base < SHADER_CONSTANT_FETCH_00_0 + 6 && base + words > SHADER_CONSTANT_FETCH_00_0)
+        {
+            g_fetch0Writes++;
+            g_fetch0Kind = kind;
+        }
+    }
+
+    std::string TakeFetch0Log()
+    {
+        auto text = fmt::format(" tfw {} {} skipped {} bins {:X} {:X}", g_fetch0Writes, g_fetch0Kind, g_fetch0Skipped, g_binSelect, g_binMask);
+        g_fetch0Writes = g_fetch0Skipped = 0;
+        g_fetch0Kind = '-';
+        return text;
+    }
+
     static void ExecutePacket3(PacketReader& reader, uint32_t opcode, uint32_t count, bool predicated)
     {
         uint32_t start = reader.Position();
@@ -407,6 +430,15 @@ namespace gpu
         // Predicated swaps are skipped too: a frame is presented once, not per tile.
         if (predicated && ((g_binSelect & g_binMask) == 0 || opcode == PM4_XE_SWAP))
         {
+            if (g_noteFetch0 && count > 1 && (opcode == PM4_SET_CONSTANT || opcode == PM4_SET_CONSTANT2 || opcode == PM4_SET_SHADER_CONSTANTS))
+            {
+                uint32_t first = reader.Read();
+                reader.Skip(count - 1);
+                uint32_t base = opcode == PM4_SET_CONSTANT ? ConstantRegister(first) : first & 0xFFFF;
+                if (base < SHADER_CONSTANT_FETCH_00_0 + 6 && base + count - 1 > SHADER_CONSTANT_FETCH_00_0)
+                    g_fetch0Skipped++;
+                return;
+            }
             reader.Skip(count);
             return;
         }
@@ -483,6 +515,7 @@ namespace gpu
         case PM4_SET_CONSTANT:
         {
             uint32_t base = ConstantRegister(read());
+            NoteFetch0(base, count - 1, 'S');
             if (count > 1 && PlainRegisters(base, count - 1))
             {
                 reader.ReadRaw(&Registers()[base], count - 1);
@@ -498,6 +531,7 @@ namespace gpu
         case PM4_SET_SHADER_CONSTANTS:
         {
             uint32_t base = read() & 0xFFFF;
+            NoteFetch0(base, count - 1, '2');
             if (count > 1 && PlainRegisters(base, count - 1))
             {
                 reader.ReadRaw(&Registers()[base], count - 1);
@@ -515,6 +549,7 @@ namespace gpu
             uint32_t base = ConstantRegister(read());
             uint32_t sizeWords = read() & 0xFFF;
             auto* source = g_memory.Translate<be<uint32_t>>(PhysicalToVirtual(address));
+            NoteFetch0(base, sizeWords, 'L');
             if (d3d12::TraceThisFrame())
                 LOGF_INFO("load alu constant from 0x{:08X} to register 0x{:04X}, {} words", address, base, sizeWords);
             if (g_checkConstantLoads)
@@ -812,6 +847,7 @@ namespace gpu
             uint32_t base = header & 0x7FFF;
             uint32_t count = ((header >> 16) & 0x3FFF) + 1;
             bool single = (header >> 15) & 1;
+            NoteFetch0(base, single ? 1 : count, '0');
             if (!single && PlainRegisters(base, count))
             {
                 reader.ReadRaw(&Registers()[base], count);

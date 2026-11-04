@@ -5,6 +5,7 @@
 #include <Xinput.h>
 #include <sstream>
 #include <gpu/d3d12_renderer.h>
+#include <kernel/keyboard_mouse.h>
 
 // XAMINPUT structures in xbox.h use the host XInput layout; guest memory holds them big endian.
 static void WriteGamepad(XAMINPUT_GAMEPAD* guest, const XINPUT_GAMEPAD& host)
@@ -39,7 +40,7 @@ static void StartConnectionMonitor()
     static std::once_flag once;
     std::call_once(once, []
         {
-            g_connectedMask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") ? 1u : 0u);
+            g_connectedMask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled() ? 1u : 0u);
             LOGF_INFO("controllers connected: mask 0x{:X}", g_connectedMask.load());
 
             std::thread([]
@@ -47,7 +48,7 @@ static void StartConnectionMonitor()
                     while (true)
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                        uint32_t mask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") ? 1u : 0u);
+                        uint32_t mask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled() ? 1u : 0u);
                         uint32_t previous = g_connectedMask.exchange(mask);
                         if (mask != previous)
                         {
@@ -214,6 +215,7 @@ struct RemoteAction
     std::string shot; // Screenshot taken when the action starts.
     int scan = 0; // Timer scan started when the action starts (2: and watch the timers).
     std::string find; // Memory search step or tracker (see RunFind in timing_hooks.cpp).
+    std::string kbm; // A test's keyboard or mouse input (kbm::TestCommand).
 };
 
 void RequestTimerScan(bool watch);
@@ -262,6 +264,13 @@ static bool RemoteControl(XINPUT_STATE& state)
                         action.shot = "remote";
                     continue;
                 }
+                if (word == "key" || word == "cursor" || word == "mouse")
+                {
+                    std::string rest;
+                    std::getline(words, rest);
+                    action.kbm = word + rest;
+                    continue;
+                }
                 if (word == "find" || word == "track")
                 {
                     std::string rest;
@@ -295,7 +304,7 @@ static bool RemoteControl(XINPUT_STATE& state)
             bool pressing = action.buttons || action.leftTrigger || action.rightTrigger;
             if (!timed)
                 action.milliseconds = pressing ? 150 : 0;
-            if (action.milliseconds > 0 || pressing || action.left >= 0.0f || action.right >= 0.0f || !action.shot.empty() || action.scan || !action.find.empty())
+            if (action.milliseconds > 0 || pressing || action.left >= 0.0f || action.right >= 0.0f || !action.shot.empty() || action.scan || !action.find.empty() || !action.kbm.empty())
                 actions.push_back(action);
             if (pressing)
                 actions.push_back(RemoteAction{ .milliseconds = 60 });
@@ -314,6 +323,8 @@ static bool RemoteControl(XINPUT_STATE& state)
                 gpu::d3d12::RequestScreenshot(current.shot);
             if (!current.find.empty())
                 RequestFind(current.find);
+            if (!current.kbm.empty())
+                kbm::TestCommand(current.kbm);
             if (current.scan)
             {
                 RequestTimerScan(current.scan == 2);
@@ -347,6 +358,23 @@ static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
     bool connected = XInputGetState(user, &state) == ERROR_SUCCESS;
     if (!connected)
         memset(&state, 0, sizeof(state));
+
+    // Keyboard and mouse on top of controller 0. The packet number changes with the merged state too.
+    if (user == 0)
+    {
+        kbm::Apply(state, connected);
+        if (kbm::Enabled())
+        {
+            static std::atomic<uint32_t> changes;
+            static std::atomic<uint64_t> lastMerged;
+            uint64_t merged = uint64_t(state.Gamepad.wButtons) | uint64_t(state.Gamepad.bLeftTrigger) << 16 | uint64_t(state.Gamepad.bRightTrigger) << 24 |
+                uint64_t(uint16_t(state.Gamepad.sThumbLX ^ state.Gamepad.sThumbRY)) << 32 | uint64_t(uint16_t(state.Gamepad.sThumbLY ^ state.Gamepad.sThumbRX)) << 48;
+            if (lastMerged.exchange(merged) != merged)
+                changes++;
+            state.dwPacketNumber += changes;
+            connected = true;
+        }
+    }
 
     if (user == 0 && AR_ENV("AR_REMOTE"))
     {
@@ -461,7 +489,7 @@ namespace imports
         XINPUT_CAPABILITIES host;
         if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(userIndex & 0xFF, XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
         {
-            if ((userIndex & 0xFF) != 0 || !(AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE")))
+            if ((userIndex & 0xFF) != 0 || !(AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled()))
                 return X_ERROR_DEVICE_NOT_CONNECTED;
             host = {};
             host.Type = XINPUT_DEVTYPE_GAMEPAD;

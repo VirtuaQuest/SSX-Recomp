@@ -2,6 +2,7 @@
 #include <kernel/memory.h>
 #include "command_processor.h"
 #include <unordered_set>
+#include <kernel/keyboard_mouse.h>
 
 // Guest return addresses up the stack: the callee saves its return address 8 bytes below its caller's stack pointer,
 // and each frame starts with the back chain to the previous one.
@@ -149,7 +150,7 @@ PPC_FUNC(sub_826F4720)
 
         // AR_LOG_QUEUE_ITEMS=<queue>: that queue's items (object and its draw function).
         static const std::string itemsOf = AR_ENV("AR_LOG_QUEUE_ITEMS") ? AR_ENV("AR_LOG_QUEUE_ITEMS") : "";
-        if (!itemsOf.empty() && itemsOf.find(fmt::format("{:08X}", queue)) != std::string::npos)
+        if (!itemsOf.empty() && (itemsOf == "all" || itemsOf.find(fmt::format("{:08X}", queue)) != std::string::npos))
         {
             std::string text = fmt::format("{} {:08X}", gpu::SubmittedSwaps(), queue);
             uint32_t count = PPC_LOAD_U32(queue + 72);
@@ -217,9 +218,478 @@ AR_MARK_DRAW_HOOK(82250778)
 AR_MARK_DRAW_HOOK(82252208)
 AR_MARK_DRAW_HOOK(82251DF0)
 
+// Menu rows for the mouse: the highlight behind a row is a sprite of this colour, scaled horizontally to 1 when the row is
+// selected and to 0 otherwise. Rows of pages waiting off screen are left out.
+static void NoteMenuSprite(uint32_t item, uint8_t* base, int64_t frame)
+{
+    static std::vector<kbm::MenuRow> rows;
+    // The pause menu and windows popping up over it: rows between thin lines, and a selector moving over them. In the order drawn,
+    // so the frontmost list stays last.
+    struct LineList
+    {
+        float x, width;
+        std::vector<float> lines;
+        bool hasSelector = false;
+        float selectorX = 0.0f, selectorY = 0.0f;
+    };
+    static std::vector<LineList> lists;
+    struct Selector
+    {
+        float x, y, width;
+    };
+    static std::vector<Selector> selectors;
+    static int64_t rowsFrame = -1;
+    if (frame != rowsFrame)
+    {
+        for (const Selector& selector : selectors)
+        {
+            for (LineList& list : lists)
+            {
+                if (selector.x <= list.x + 2.0f && selector.x + selector.width >= list.x + list.width - 2.0f && std::abs(selector.width - list.width) < 40.0f)
+                {
+                    list.hasSelector = true;
+                    list.selectorX = selector.x;
+                    list.selectorY = selector.y;
+                }
+            }
+        }
+        for (LineList& list : lists)
+        {
+            if (!list.hasSelector || list.lines.size() < 2)
+                continue;
+            std::sort(list.lines.begin(), list.lines.end());
+            list.lines.erase(std::unique(list.lines.begin(), list.lines.end()), list.lines.end());
+            for (size_t i = 0; i + 1 < list.lines.size(); i++)
+            {
+                bool selected = list.selectorY >= list.lines[i] - 20.0f && list.selectorY < list.lines[i + 1] - 20.0f;
+                rows.push_back({ list.selectorX, list.lines[i], list.x + list.width, list.lines[i + 1], selected, true });
+            }
+        }
+        kbm::SetMenuRows(rows);
+        rows.clear();
+        lists.clear();
+        selectors.clear();
+        rowsFrame = frame;
+    }
+
+    auto floatAt = [&](uint32_t address)
+        {
+            uint32_t bits = PPC_LOAD_U32(address);
+            float value;
+            memcpy(&value, &bits, 4);
+            return value;
+        };
+    uint32_t vertices = PPC_LOAD_U32(item + 36 * 4);
+    if (vertices == 0 || PPC_LOAD_U32(item + 34 * 4) != 36 || PPC_LOAD_U32(item + 35 * 4) != 4)
+        return;
+    float red = floatAt(vertices + 5 * 4), green = floatAt(vertices + 6 * 4), blue = floatAt(vertices + 7 * 4);
+    float x0 = FLT_MAX, x1 = -FLT_MAX, y0 = FLT_MAX, y1 = -FLT_MAX;
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        float x = floatAt(vertices + i * 36), y = floatAt(vertices + i * 36 + 4);
+        x0 = std::min(x0, x);
+        x1 = std::max(x1, x);
+        y0 = std::min(y0, y);
+        y1 = std::max(y1, y);
+    }
+    float tx = floatAt(item + 16 * 4), ty = floatAt(item + 17 * 4), scale = floatAt(item + 4 * 4);
+    if (x1 - x0 >= 80.0f && std::abs(y1 - y0 - 42.0f) < 2.0f)
+        selectors.push_back({ tx, ty, x1 - x0 });
+    bool highlightColor = std::abs(red - 0.341f) <= 0.01f && std::abs(green - 0.678f) <= 0.01f && blue == 0.0f;
+    if (!highlightColor)
+        return;
+    if (x1 - x0 >= 60.0f && y1 - y0 <= 3.0f)
+    {
+        LineList* list = nullptr;
+        for (LineList& candidate : lists)
+            list = std::abs(candidate.x - tx) < 1.0f && std::abs(candidate.width - (x1 - x0)) < 1.0f ? &candidate : list;
+        if (!list)
+        {
+            lists.push_back({ tx, x1 - x0 });
+            list = &lists.back();
+        }
+        list->lines.push_back(ty);
+        return;
+    }
+    if (x1 - x0 < 200.0f || y1 - y0 < 16.0f || y1 - y0 > 60.0f)
+        return;
+    if (tx + x1 < 0.0f || tx + x0 > 1280.0f)
+        return;
+    // The highlight grows over a few frames. A row is selected once fully grown or while growing; the UI can update more than
+    // once per frame, so a row remembers which way it last changed.
+    struct RowScale
+    {
+        float scale;
+        int direction;
+    };
+    static std::map<uint32_t, RowScale> rowScales;
+    uint32_t rowKey = uint32_t(int32_t(tx)) * 4096u + uint32_t(int32_t(ty));
+    auto [entry, added] = rowScales.try_emplace(rowKey, RowScale{ scale, 0 });
+    if (scale > entry->second.scale)
+        entry->second.direction = 1;
+    else if (scale < entry->second.scale)
+        entry->second.direction = -1;
+    entry->second.scale = scale;
+    rows.push_back({ tx + x0, ty + y0, tx + x1, ty + y1, scale >= 0.999f || (entry->second.direction > 0 && scale > 0.0f) });
+}
+
+// The prompts for breaking out of a stun: a stick on the left, four buttons on the right. With the keyboard and mouse in use the
+// groups change places: the buttons go left and show W, A, S and D (the icons' stun version, see GetTextureUncached), and the stick
+// goes right, standing still, and shows the mouse with both buttons lit. The sprites are made anew each frame, so moving them
+// here doesn't add up. They are recognised by the texture coordinates and sizes of their quads.
+static void RearrangeStunPrompt(uint32_t item, uint8_t* base, int64_t frame)
+{
+    static int64_t stickSeen = -100;
+    static float stickX, stickY, buttonsX, buttonsY, buttonsNextX, buttonsNextY;
+    static int buttonsNext;
+    static int64_t lastFrame = -1;
+    if (frame != lastFrame)
+    {
+        lastFrame = frame;
+        if (buttonsNext > 0)
+        {
+            buttonsX = buttonsNextX / float(buttonsNext);
+            buttonsY = buttonsNextY / float(buttonsNext);
+        }
+        buttonsNextX = buttonsNextY = 0.0f;
+        buttonsNext = 0;
+        kbm::SetStunPromptVisible(frame - stickSeen < 5);
+    }
+
+    uint32_t vertices = PPC_LOAD_U32(item + 36 * 4);
+    if (vertices == 0 || PPC_LOAD_U32(item + 34 * 4) != 36 || PPC_LOAD_U32(item + 35 * 4) != 4)
+        return;
+    auto floatAt = [&](uint32_t address)
+        {
+            uint32_t bits = PPC_LOAD_U32(address);
+            float value;
+            memcpy(&value, &bits, 4);
+            return value;
+        };
+    auto setFloat = [&](uint32_t address, float value)
+        {
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            PPC_STORE_U32(address, bits);
+        };
+    float half = std::abs(floatAt(vertices)), u = floatAt(vertices + 3 * 4), v = floatAt(vertices + 4 * 4);
+    auto isUv = [&](float wantedU, float wantedV) { return std::abs(u - wantedU) < 0.006f && std::abs(v - wantedV) < 0.006f; };
+    auto isSize = [&](float wanted) { return std::abs(half - wanted) < 1.5f; };
+    bool pulse = isUv(0.502f, 0.348f), disc = isUv(0.004f, 0.793f), stripes = isUv(0.566f, 0.691f);
+    bool stickIcon = isUv(0.246f, 0.004f) && isSize(27.0f);
+    bool buttonIcon = isSize(20.0f) && (isUv(0.520f, 0.238f) || isUv(0.348f, 0.238f) || isUv(0.473f, 0.004f) || isUv(0.645f, 0.004f));
+    bool stickPart = stickIcon || (pulse && isSize(32.0f)) || (disc && (isSize(32.0f) || isSize(27.0f) || isSize(21.0f))) ||
+        (stripes && (isSize(32.0f) || isSize(27.0f)));
+    bool buttonPart = buttonIcon || (pulse && isSize(18.0f)) || ((disc || stripes) && isSize(13.0f));
+    if (!stickPart && !buttonPart)
+        return;
+
+    float tx = floatAt(item + 16 * 4), ty = floatAt(item + 17 * 4);
+    if (stickIcon)
+        stickSeen = frame;
+    if (disc && isSize(32.0f))
+    {
+        stickX = tx;
+        stickY = ty;
+    }
+    if (buttonIcon)
+    {
+        buttonsNextX += tx;
+        buttonsNextY += ty;
+        buttonsNext++;
+    }
+    if (!kbm::Active() || frame - stickSeen >= 5 || buttonsX == 0.0f)
+        return;
+
+    if (buttonPart)
+    {
+        setFloat(item + 16 * 4, tx + stickX - buttonsX);
+        setFloat(item + 17 * 4, ty + stickY - buttonsY);
+    }
+    else
+    {
+        setFloat(item + 16 * 4, buttonsX);
+        setFloat(item + 17 * 4, buttonsY);
+        // The stick's trailing rings become rings pulsing outward, as fast as the buttons'.
+        if (pulse)
+        {
+            static const auto start = std::chrono::steady_clock::now();
+            float time = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+            float phase = time * 7.0f + floatAt(item + 29 * 4);
+            float scale = 1.0f + 0.5f * (phase - std::floor(phase));
+            setFloat(item + 4 * 4, scale);
+            setFloat(item + 9 * 4, scale);
+        }
+    }
+}
+
+static std::atomic<bool> g_uiDumpRequest, g_uiTextDumpRequest;
+
+void RequestUiDump()
+{
+    g_uiDumpRequest = true;
+    g_uiTextDumpRequest = true;
+}
+
+PPC_FUNC_IMPL(__imp__sub_8297F6E0);
+
+// The Gallery's character viewer, each update (r3: its object): the mouse turns the character and tilts the camera, the same things the right
+// stick does there, without going through a stick's dead zone and curve. The tilt is limited as the title limits it, in degrees at +336 and +340.
+PPC_FUNC_IMPL(__imp__sub_82E1C508);
+PPC_FUNC_IMPL(__imp__sub_8270B3C8);
+PPC_FUNC_IMPL(__imp__sub_826F5EF8);
+PPC_FUNC_IMPL(__imp__sub_826F5E90);
+PPC_FUNC(sub_82E1C508)
+{
+    kbm::NoteViewer();
+    float turn, tilt;
+    if (kbm::TakeViewerMouse(turn, tilt))
+    {
+        static constexpr uint32_t CAMERA = 0x831C51C0;
+        auto loadFloat = [&](uint32_t address)
+            {
+                uint32_t bits = PPC_LOAD_U32(address);
+                float value;
+                memcpy(&value, &bits, 4);
+                return value;
+            };
+        uint32_t viewer = ctx.r3.u32, character = PPC_LOAD_U32(0x831C3110);
+        PPCContext saved = ctx;
+        if (character != 0 && turn != 0.0f)
+        {
+            ctx.r3.u64 = character;
+            ctx.f1.f64 = turn;
+            __imp__sub_8270B3C8(ctx, base);
+            ctx = saved;
+        }
+        if (tilt != 0.0f)
+        {
+            static constexpr float RADIANS = 3.14159265f / 180.0f;
+            float value = std::clamp(loadFloat(CAMERA + 608) + tilt, loadFloat(viewer + 336) * RADIANS, loadFloat(viewer + 340) * RADIANS);
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            PPC_STORE_U32(CAMERA + 608, bits);
+            ctx.r3.u64 = CAMERA + 304;
+            __imp__sub_826F5EF8(ctx, base);
+            ctx = saved;
+            ctx.r3.u64 = CAMERA + 304;
+            __imp__sub_826F5E90(ctx, base);
+            ctx = saved;
+        }
+    }
+    __imp__sub_82E1C508(ctx, base);
+}
+
+// The speed of a camera (r3: 0 normal, otherwise aiming), which the title asks for each update after setting its other settings.
+PPC_FUNC_IMPL(__imp__sub_82E5EFC8);
+PPC_FUNC(sub_82E5EFC8)
+{
+    bool aiming = int16_t(ctx.r3.u32) != 0;
+    __imp__sub_82E5EFC8(ctx, base);
+    float speed;
+    if (kbm::MouseCameraSpeed(aiming, speed))
+        ctx.f1.f64 = speed;
+}
+
+// The sounds of the rows added to Options: sub_8297F6E0(the sounds of the menus, id, 0), as its menus do.
+static void PlayOptionsSounds(PPCContext& __restrict ctx, uint8_t* base)
+{
+    for (int sound = kbm::TakeOptionsSound(); sound >= 0; sound = kbm::TakeOptionsSound())
+    {
+        PPCContext saved = ctx;
+        ctx.r3.u64 = 0x820A5F58;
+        ctx.r4.u64 = uint64_t(sound);
+        ctx.r5.u64 = 0;
+        __imp__sub_8297F6E0(ctx, base);
+        ctx = saved;
+    }
+}
+
+// The title updates its Options screen: from the pause menu.
+PPC_FUNC_IMPL(__imp__sub_827F2370);
+PPC_FUNC(sub_827F2370)
+{
+    kbm::NoteOptionsUpdate();
+    __imp__sub_827F2370(ctx, base);
+    PlayOptionsSounds(ctx, base);
+}
+
+// The main menu each update (r3 = its object, +316 its state: 22 on the Options screen).
+PPC_FUNC_IMPL(__imp__sub_82E29220);
+PPC_FUNC(sub_82E29220)
+{
+    bool options = PPC_LOAD_U32(ctx.r3.u32 + 316) == 22;
+    if (options)
+        kbm::NoteOptionsUpdate();
+    __imp__sub_82E29220(ctx, base);
+    if (options)
+        PlayOptionsSounds(ctx, base);
+}
+
+// The Options screen with the rows added to it (see keyboard_mouse.cpp): what the title draws of its rows moved down, its sprites for
+// a row's background and highlight drawn again for the added rows, so they look the same. Returns whether to draw the item.
+PPC_FUNC_IMPL(__imp__sub_8280FA08);
+static bool OptionsSprite(PPCContext& __restrict ctx, uint8_t* base, int64_t frame)
+{
+    if (!kbm::OptionsLayoutActive())
+        return true;
+    uint32_t item = ctx.r3.u32;
+    uint32_t vertices = PPC_LOAD_U32(item + 36 * 4);
+    if (vertices == 0 || PPC_LOAD_U32(item + 34 * 4) != 36 || PPC_LOAD_U32(item + 35 * 4) != 4)
+        return true;
+    auto floatAt = [&](uint32_t address)
+        {
+            uint32_t bits = PPC_LOAD_U32(address);
+            float value;
+            memcpy(&value, &bits, 4);
+            return value;
+        };
+    auto setFloat = [&](uint32_t address, float value)
+        {
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            PPC_STORE_U32(address, bits);
+        };
+    float x0 = FLT_MAX, x1 = -FLT_MAX, y0 = FLT_MAX, y1 = -FLT_MAX;
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        float x = floatAt(vertices + i * 36), y = floatAt(vertices + i * 36 + 4);
+        x0 = std::min(x0, x);
+        x1 = std::max(x1, x);
+        y0 = std::min(y0, y);
+        y1 = std::max(y1, y);
+    }
+    float tx = floatAt(item + 16 * 4), ty = floatAt(item + 17 * 4), width = x1 - x0, height = y1 - y0;
+    float center = ty + (y0 + y1) * 0.5f;
+    if (center < 193.0f || center >= 600.0f)
+        return true;
+    float red = floatAt(vertices + 5 * 4), green = floatAt(vertices + 6 * 4);
+    bool background = std::abs(tx - 88.0f) < 1.0f && std::abs(width - 416.0f) < 1.0f && std::abs(height - 28.0f) < 1.0f;
+    bool highlight = std::abs(tx - 88.0f) < 1.0f && std::abs(width - 414.0f) < 1.0f && std::abs(height - 28.0f) < 1.0f && std::abs(red - 0.341f) < 0.01f && std::abs(green - 0.678f) < 0.01f;
+    bool small = tx >= 300.0f && tx < 620.0f && width <= 24.0f && height <= 24.0f;
+    if (!background && !highlight && !small)
+        return true;
+
+    int extra = kbm::OptionsExtraRow(), line = kbm::OptionsMouseLine();
+    bool mouseOpen = line >= 0 && extra >= 0;
+    float moved = ty + kbm::OptionsShift(center);
+    setFloat(item + 17 * 4, moved);
+    if (small)
+    {
+        // Values aren't shown beside a row opened, and those of a row the title thinks is selected are the wrong colour.
+        if (mouseOpen)
+            return false;
+        return !(extra >= 0 && !kbm::OptionsGameOpen() && std::abs(center - kbm::OptionsGameRowY(kbm::OptionsGameRow())) < 14.0f);
+    }
+
+    auto drawAgain = [&](float centerY, float scale)
+        {
+            setFloat(item + 17 * 4, centerY);
+            setFloat(item + 4 * 4, scale);
+            ctx.r3.u64 = item;
+            __imp__sub_8280FA08(ctx, base);
+        };
+    static int64_t backgroundFrame = -1, highlightFrame = -1;
+    if (background)
+    {
+        if (backgroundFrame == frame)
+            return true;
+        backgroundFrame = frame;
+        __imp__sub_8280FA08(ctx, base);
+        for (int i = 0; i < 4; i++)
+        {
+            bool opened = mouseOpen && extra == i;
+            drawAgain(kbm::OptionsExtraRowY(i), opened ? kbm::OptionsOpenScale() : 1.0f);
+            if (opened)
+            {
+                drawAgain(kbm::OptionsExtraRowY(i) + 28.0f, kbm::OptionsOpenScale());
+                drawAgain(kbm::OptionsExtraRowY(i) + 56.0f, kbm::OptionsOpenScale());
+            }
+        }
+        return false;
+    }
+
+    // AR_LOG_OPTIONS: how its highlights grow.
+    static const bool logHighlights = AR_ENV("AR_LOG_OPTIONS") != nullptr;
+    if (logHighlights && floatAt(item + 4 * 4) > 0.0f && floatAt(item + 4 * 4) < 0.999f)
+        LOGF_INFO("options highlight {} {:.3f} frame {}", ty, floatAt(item + 4 * 4), frame);
+    // The title's highlight doesn't show on the row it thinks is selected, while an added row is, but shrinks and grows as usual.
+    if (kbm::OptionsGameHighlightLimit() < 1.0f)
+        setFloat(item + 4 * 4, std::min(floatAt(item + 4 * 4), kbm::OptionsGameHighlightLimit()));
+    if (highlightFrame == frame)
+        return true;
+    highlightFrame = frame;
+    __imp__sub_8280FA08(ctx, base);
+    for (int i = 0; i < 4; i++)
+    {
+        float grown = kbm::OptionsExtraHighlight(i);
+        if (grown <= 0.0f)
+            continue;
+        if (mouseOpen && extra == i)
+            drawAgain(kbm::OptionsExtraRowY(i) + 28.0f * float(line), grown * kbm::OptionsOpenScale() * 416.0f / 414.0f);
+        else
+            drawAgain(kbm::OptionsExtraRowY(i), grown * 416.0f / 414.0f);
+    }
+    return false;
+}
+
+// The same for its text. Returns whether to draw it.
+static bool OptionsText(uint32_t item, uint8_t* base)
+{
+    if (!kbm::OptionsLayoutActive())
+        return true;
+    auto floatAt = [&](uint32_t address)
+        {
+            uint32_t bits = PPC_LOAD_U32(address);
+            float value;
+            memcpy(&value, &bits, 4);
+            return value;
+        };
+    auto setFloat = [&](uint32_t address, float value)
+        {
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            PPC_STORE_U32(address, bits);
+        };
+    float x = floatAt(item + 16 * 4), y = floatAt(item + 17 * 4);
+    // How far the screen has faded in: its big title's text (a row opened dims the rows). A faint copy of the title follows it, drifting
+    // up and down over the same place, which isn't that: the title comes first each frame.
+    static int64_t alphaFrame = -1;
+    int64_t frame = gpu::SubmittedSwaps();
+    if (frame != alphaFrame && std::abs(x - 76.0f) < 1.0f && std::abs(y - 150.0f) < 1.0f)
+    {
+        alphaFrame = frame;
+        kbm::SetOptionsTextAlpha(floatAt(item + 25 * 4));
+    }
+    if (y < 193.0f || y >= 620.0f)
+        return true; // The title, the footer.
+    int extra = kbm::OptionsExtraRow();
+    if (x > 600.0f)
+        return extra < 0; // The description is about the title's row.
+    bool label = std::abs(x - 96.0f) < 1.0f;
+    // The cameras' labels: the overlay draws their new names.
+    if (label && (std::abs(y - kbm::OptionsGameRowY(2)) < 1.0f || std::abs(y - kbm::OptionsGameRowY(3)) < 1.0f))
+        return false;
+    if (kbm::OptionsMouseLine() >= 0)
+    {
+        // A mouse row opened: the rest of the list dims, without values, as for the title's own.
+        if (!label)
+            return false;
+        setFloat(item + 25 * 4, floatAt(item + 25 * 4) * 0.4f);
+    }
+    // The row the title thinks is selected isn't as far as anyone can see.
+    if (extra >= 0 && !kbm::OptionsGameOpen() && std::abs(y - kbm::OptionsGameRowY(kbm::OptionsGameRow())) < 1.0f)
+    {
+        uint32_t grey = 0x3F60E000;
+        for (uint32_t i = 22; i < 25; i++)
+            PPC_STORE_U32(item + i * 4, grey);
+    }
+    setFloat(item + 17 * 4, y + kbm::OptionsShift(y));
+    return true;
+}
+
 // The UI's sprite draw (a render queue item's draw function, r3 = item). Diagnostics (AR_LOG_UI_ITEMS=<frame>,<count>):
 // the item's first 48 words in those frames.
-PPC_FUNC_IMPL(__imp__sub_8280FA08);
 PPC_FUNC(sub_8280FA08)
 {
     static int64_t first = -1, frames = 0;
@@ -234,17 +704,68 @@ PPC_FUNC(sub_8280FA08)
             return true;
         }();
     int64_t frame = gpu::SubmittedSwaps();
-    if (enabled && frame >= first && frame < first + frames)
+    NoteMenuSprite(ctx.r3.u32, base, frame);
+    RearrangeStunPrompt(ctx.r3.u32, base, frame);
+    // Also on request (remote control "find uidump", or F11 with AR_SCAN_KEY): this frame and the next, with the quad's vertices.
+    static int64_t requestedFrame = -1;
+    if (g_uiDumpRequest.exchange(false))
+        requestedFrame = frame;
+    bool requested = requestedFrame >= 0 && frame >= requestedFrame && frame < requestedFrame + 2;
+    if ((enabled && frame >= first && frame < first + frames) || requested)
     {
         std::string text;
         for (uint32_t i = 0; i < 48; i++)
             text += fmt::format(" {:08X}", PPC_LOAD_U32(ctx.r3.u32 + i * 4));
         LOGF_INFO("UI {} {:08X}:{}", frame, ctx.r3.u32, text);
+        if (requested)
+        {
+            uint32_t vertices = PPC_LOAD_U32(ctx.r3.u32 + 36 * 4), stride = PPC_LOAD_U32(ctx.r3.u32 + 34 * 4), count = PPC_LOAD_U32(ctx.r3.u32 + 35 * 4);
+            if (vertices != 0 && stride == 36 && count <= 64)
+            {
+                std::string data;
+                for (uint32_t i = 0; i < std::min(count, 4u) * 9; i++)
+                    data += fmt::format(" {:08X}", PPC_LOAD_U32(vertices + i * 4));
+                LOGF_INFO("UIV {} {:08X}:{}", frame, ctx.r3.u32, data);
+            }
+        }
     }
-    __imp__sub_8280FA08(ctx, base);
+    if (OptionsSprite(ctx, base, frame))
+        __imp__sub_8280FA08(ctx, base);
 }
 
-void WatchGuestWords(const std::vector<uint32_t>& addresses);
+// A UI text item's draw (r3 = item). Diagnostics: dumped with the sprites.
+PPC_FUNC_IMPL(__imp__sub_82B7E680);
+PPC_FUNC(sub_82B7E680)
+{
+    static int64_t requestedFrame = -1;
+    int64_t frame = gpu::SubmittedSwaps();
+    if (g_uiTextDumpRequest.exchange(false))
+        requestedFrame = frame;
+    if (requestedFrame >= 0 && frame >= requestedFrame && frame < requestedFrame + 1)
+    {
+        std::string text;
+        for (uint32_t i = 0; i < 40; i++)
+            text += fmt::format(" {:08X}", PPC_LOAD_U32(ctx.r3.u32 + i * 4));
+        LOGF_INFO("UIT {} {:08X}:{}", frame, ctx.r3.u32, text);
+    }
+
+    // The title screen's prompt, in black on its strip, which comes in from the left: replaced.
+    {
+        uint32_t item = ctx.r3.u32;
+        uint32_t xBits = PPC_LOAD_U32(item + 16 * 4), yBits = PPC_LOAD_U32(item + 17 * 4), alphaBits = PPC_LOAD_U32(item + 25 * 4);
+        float x, y, alpha;
+        memcpy(&x, &xBits, 4);
+        memcpy(&y, &yBits, 4);
+        memcpy(&alpha, &alphaBits, 4);
+        if (std::abs(y - 604.0f) < 4.0f && x <= 70.0f && PPC_LOAD_U32(item + 22 * 4) == 0 && (PPC_LOAD_U32(0x83214CF0) & 0x02000000) != 0 && kbm::ReplaceTitlePrompt(x, y, alpha))
+            return;
+    }
+    if (!OptionsText(ctx.r3.u32, base))
+        return;
+    __imp__sub_82B7E680(ctx, base);
+}
+
+void WatchGuestWords(const std::vector<uint32_t>& addresses, bool reads = false);
 
 // A UI element's per-update effects (r3 = element; its time in frames is the float at +116). Diagnostics
 // (AR_WATCH_UI_TIME=<seconds>): after that long, logs who writes the time of the next elements seen.

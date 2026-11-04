@@ -1,0 +1,20 @@
+// The name Windows shows for this program, in Task Manager and the like.
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS 0x40004
+FILETYPE 1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Anarchy Reigns"
+            VALUE "ProductName", "Anarchy Reigns"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

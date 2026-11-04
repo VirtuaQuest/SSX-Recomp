@@ -141,6 +141,7 @@ static uint8_t* g_watchExact; // Only writes to these 8 bytes are logged, when s
 static std::vector<uint8_t*> g_watchWords; // Or only writes to these words (WatchGuestWords), each writer once per word.
 static std::set<std::pair<DWORD64, uint8_t*>> g_watchWordWriters;
 static std::atomic<bool> g_watchStopped; // StopWatchingGuestWords: nothing is logged or protected any more.
+static std::atomic<bool> g_watchReads;   // WatchGuestWords also logs reads.
 
 static void ProtectWatch(DWORD protection)
 {
@@ -155,10 +156,10 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
     if (record->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watchStepping)
     {
         t_watchStepping = false;
-        ProtectWatch(g_watchStopped ? PAGE_READWRITE : PAGE_READONLY);
+        ProtectWatch(g_watchStopped ? PAGE_READWRITE : g_watchReads ? PAGE_NOACCESS : PAGE_READONLY);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1)
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || (record->ExceptionInformation[0] != 1 && !(g_watchReads && record->ExceptionInformation[0] == 0)))
         return EXCEPTION_CONTINUE_SEARCH;
 
     auto* address = reinterpret_cast<uint8_t*>(record->ExceptionInformation[1]);
@@ -178,7 +179,8 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
             log = false;
             for (auto* word : g_watchWords)
             {
-                if (address >= word && address < word + 4)
+                // Wider than the word: vector stores of whole blocks report the block's start.
+                if (address + 16 > word && address < word + 4)
                     log = g_watchWordWriters.insert({ info->ContextRecord->Rip, word }).second && g_watchWordWriters.size() < 256;
             }
         }
@@ -188,7 +190,7 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
         }
         if (log)
         {
-            fmt::print(stderr, "==== watch: write to guest 0x{:08X} on guest thread {}\n", g_memory.MapVirtual(address),
+            fmt::print(stderr, "==== watch: {} guest 0x{:08X} on guest thread {}\n", record->ExceptionInformation[0] == 0 ? "read of" : "write to", g_memory.MapVirtual(address),
                 GetCurrentGuestThreadId());
             if (auto* ctx = GetPPCContext())
                 fmt::print(stderr, "     guest r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} r6 0x{:08X} r31 0x{:08X} lr 0x{:08X}\n",
@@ -260,10 +262,12 @@ void InstallMemoryWatch()
 }
 
 // Debugging: logs the writers of these guest words (each writer once per word) from now on, with their stacks.
-void WatchGuestWords(const std::vector<uint32_t>& addresses)
+void WatchGuestWords(const std::vector<uint32_t>& addresses, bool reads)
 {
     std::lock_guard lock(g_crashMutex);
     g_watchStopped = false;
+    g_watchReads = reads;
+    g_watchWordWriters.clear();
     g_watchWords.clear();
     std::set<uint8_t*> pages;
     for (uint32_t address : addresses)
@@ -285,7 +289,7 @@ void WatchGuestWords(const std::vector<uint32_t>& addresses)
         installed = true;
         AddVectoredExceptionHandler(1, WatchHandler);
     }
-    ProtectWatch(PAGE_READONLY);
+    ProtectWatch(reads ? PAGE_NOACCESS : PAGE_READONLY);
 }
 
 // Ends WatchGuestWords, whose page faults otherwise slow the game to a few frames per second.
@@ -293,6 +297,7 @@ void StopWatchingGuestWords()
 {
     g_watchStopped = true;
     ProtectWatch(PAGE_READWRITE);
+    g_watchReads = false;
 }
 
 // Prints the calling thread's host stack (recompiled functions are named after their guest addresses).

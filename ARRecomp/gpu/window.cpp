@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include "window.h"
 #include "video_settings.h"
+#include <kernel/keyboard_mouse.h>
 
 namespace gpu
 {
@@ -15,6 +16,10 @@ namespace gpu::window
 
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
+        LRESULT inputResult;
+        if (kbm::HandleWindowMessage(hwnd, message, wParam, lParam, inputResult))
+            return inputResult;
+
         switch (message)
         {
         case WM_SIZE:
@@ -50,6 +55,9 @@ namespace gpu::window
                         windowClass.hInstance = GetModuleHandleW(nullptr);
                         windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
                         windowClass.lpszClassName = L"ARRecomp";
+                        // The window's and the taskbar's icon, if there is one with the user's files.
+                        windowClass.hIcon = HICON(LoadImageW(nullptr, L"user/icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
+                        windowClass.hIconSm = HICON(LoadImageW(nullptr, L"user/icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
                         RegisterClassExW(&windowClass);
 
                         const auto& settings = g_videoSettings;
@@ -92,6 +100,7 @@ namespace gpu::window
                         GetClientRect(hwnd, &client);
                         g_width = std::max<LONG>(client.right - client.left, 1);
                         g_height = std::max<LONG>(client.bottom - client.top, 1);
+                        kbm::AttachWindow(hwnd);
                         ShowWindow(hwnd, SW_SHOW);
                         {
                             std::lock_guard lock(mutex);

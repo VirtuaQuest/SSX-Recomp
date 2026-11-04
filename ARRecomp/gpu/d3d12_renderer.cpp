@@ -7,6 +7,7 @@
 #include "video_settings.h"
 #include "deferred_list.h"
 #include "command_processor.h"
+#include <kernel/keyboard_mouse.h>
 #include <kernel/memory.h>
 #include "xenia/gpu/shader.h"
 
@@ -260,6 +261,8 @@ namespace gpu::d3d12
         Texture texture;
         ContentCheck content;
         uint64_t checkedFrame = UINT64_MAX;
+        int keyboardArt = -1; // A controller atlas with a keyboard and mouse version (index into KEYBOARD_ART).
+        int gameFont = -1; // One of the title's fonts the overlay draws text with.
     };
 
     struct PipelineKey
@@ -342,6 +345,8 @@ namespace gpu::d3d12
         ComPtr<ID3D12RootSignature> rootSignature;
         std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
         std::vector<uint8_t> rectangleGeometryShader, pointGeometryShader;
+        std::vector<uint8_t> overlayPixelShader;
+        ComPtr<ID3D12PipelineState> overlayPipeline;
         std::vector<uint8_t> blitVertexShader, blitPixelShader, presentPixelShader, depthBlitPixelShader, depthCopyPixelShader,
             colorToDepthPixelShader;
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> colorToDepthPipelines;
@@ -404,6 +409,16 @@ namespace gpu::d3d12
         static constexpr uint32_t PROBE_OFFSET = OCCLUSIONS_PER_FRAME / 2;
         ComPtr<ID3D12QueryHeap> occlusionHeap;
         ComPtr<ID3D12Resource> occlusionReadback;
+        // AR_SHADOW_STATS: pipeline statistics of the same draws (vertices fetched, shader runs, primitives through the
+        // clipper), which tell where in the pipeline a draw that wrote nothing got lost.
+        // AR_SHADOW_READBACK: the far cascade copied every frame without waiting, then counted a frame later (SM lines).
+        ComPtr<ID3D12Resource> shadowReadback[FRAME_COUNT];
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT shadowFootprint[FRAME_COUNT] = {};
+        uint64_t shadowCopyFrame[FRAME_COUNT] = {};
+        bool shadowCopied[FRAME_COUNT] = {};
+        DXGI_FORMAT shadowCopyFormat = DXGI_FORMAT_UNKNOWN;
+        ComPtr<ID3D12QueryHeap> statsHeap;
+        ComPtr<ID3D12Resource> statsReadback;
         std::vector<std::string> occlusionLabels[FRAME_COUNT];
         // Upload ranges each queried draw reads (offset, size, hash when recorded), checked again once the GPU is done.
         std::vector<std::array<uint64_t, 3>> occlusionInputs[FRAME_COUNT];
@@ -709,6 +724,60 @@ namespace gpu::d3d12
             }
             labels.clear();
         }
+        if (g.shadowCopied[g.frameIndex])
+        {
+            g.shadowCopied[g.frameIndex] = false;
+            const auto& layout = g.shadowFootprint[g.frameIndex].Footprint;
+            uint8_t* data;
+            if (SUCCEEDED(g.shadowReadback[g.frameIndex]->Map(0, nullptr, reinterpret_cast<void**>(&data))))
+            {
+                // Texels holding something else than the clear value, in a 16 x 16 grid over the cascade's 1024 x 1024.
+                uint32_t size = std::min({ layout.Width, layout.Height, 1024u });
+                uint32_t texelBytes = g.shadowCopyFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+                // The clear value: the most common of a sample of texels.
+                std::map<uint32_t, uint32_t> sampled;
+                for (uint32_t y = 0; y < size; y += 16)
+                {
+                    for (uint32_t x = 0; x < size; x += 16)
+                    {
+                        uint32_t word;
+                        memcpy(&word, data + layout.RowPitch * y + x * texelBytes, 4);
+                        sampled[word]++;
+                    }
+                }
+                uint32_t clear = 0, clearCount = 0;
+                for (auto [word, count] : sampled)
+                {
+                    if (count > clearCount)
+                    {
+                        clear = word;
+                        clearCount = count;
+                    }
+                }
+                std::array<uint32_t, 256> cells{};
+                uint64_t total = 0;
+                for (uint32_t y = 0; y < size; y++)
+                {
+                    const uint8_t* row = data + layout.RowPitch * y;
+                    for (uint32_t x = 0; x < size; x++)
+                    {
+                        uint32_t word;
+                        memcpy(&word, row + x * texelBytes, 4);
+                        if (word != clear)
+                        {
+                            cells[(y * 16 / size) * 16 + x * 16 / size]++;
+                            total++;
+                        }
+                    }
+                }
+                std::string text;
+                for (uint32_t cell : cells)
+                    text += fmt::format(" {}", cell);
+                LOGF_INFO("SM {} format {} clear {:08X} written {}{}", g.shadowCopyFrame[g.frameIndex], int(g.shadowCopyFormat), clear, total, text);
+                D3D12_RANGE nothing{ 0, 0 };
+                g.shadowReadback[g.frameIndex]->Unmap(0, &nothing);
+            }
+        }
         if (g.occlusionHeap && !g.occlusionLabels[g.frameIndex].empty())
         {
             auto& labels = g.occlusionLabels[g.frameIndex];
@@ -717,6 +786,12 @@ namespace gpu::d3d12
             D3D12_RANGE range{ base * 8, (base + State::OCCLUSIONS_PER_FRAME) * 8 };
             if (SUCCEEDED(g.occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&samples))))
             {
+                void* statsMapped = nullptr;
+                if (g.statsReadback)
+                {
+                    D3D12_RANGE statsRange{ 0, size_t(FRAME_COUNT) * State::OCCLUSIONS_PER_FRAME * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) };
+                    g.statsReadback->Map(0, &statsRange, &statsMapped);
+                }
                 samples += base;
                 CheckOcclusionInputs(g.frameIndex);
                 auto& inputs = g.occlusionInputs[g.frameIndex];
@@ -737,12 +812,24 @@ namespace gpu::d3d12
                         if (!differs.empty())
                             changed += " GPU sees different " + differs;
                     }
+                    if (g.statsReadback)
+                    {
+                        const auto* stats = reinterpret_cast<const D3D12_QUERY_DATA_PIPELINE_STATISTICS*>(statsMapped) +
+                            g.frameIndex * State::OCCLUSIONS_PER_FRAME + i;
+                        changed += fmt::format(" stats ia {} {} vs {} clip {} {} psruns {}", stats->IAVertices, stats->IAPrimitives, stats->VSInvocations,
+                            stats->CInvocations, stats->CPrimitives, stats->PSInvocations);
+                    }
                     static const bool probe = atoi(AR_ENV("AR_SHADOW_PIXELS")) >= 3;
                     if (probe)
                         LOGF_INFO("PX {}{}{} area {} {}", labels[i], changed.empty() ? "" : " changed ", changed,
                             samples[State::PROBE_OFFSET + i], samples[i]);
                     else
                         LOGF_INFO("PX {}{}{} {}", labels[i], changed.empty() ? "" : " changed ", changed, samples[i]);
+                }
+                if (g.statsReadback)
+                {
+                    D3D12_RANGE nothing{ 0, 0 };
+                    g.statsReadback->Unmap(0, &nothing);
                 }
                 inputs.clear();
                 g.gpuCheckOffsets[g.frameIndex].clear();
@@ -1301,6 +1388,33 @@ float4 main(float4 position : SV_Position) : SV_Target
 }
 )";
 
+    // Art on top of the picture: a rectangle of a texture's alpha, tinted.
+    static constexpr const char* OVERLAY_PS = R"(
+cbuffer OverlayConstants : register(b0)
+{
+    float2 viewportOrigin;
+    float2 viewportSize;
+    float2 uvOrigin;
+    float2 uvSize;
+    float4 tint;
+    uint sourceIndex;
+    uint samplerIndex;
+    uint picture; // 1: the texture's colours, rather than its alpha in the tint's colour. 2: that alpha with hard edges.
+};
+
+Texture2D<float4> textures[] : register(t0, space0);
+SamplerState samplers[] : register(s0, space0);
+
+float4 main(float4 position : SV_Position) : SV_Target
+{
+    float2 uv = uvOrigin + (position.xy - viewportOrigin) / viewportSize * uvSize;
+    float4 texel = textures[sourceIndex].SampleLevel(samplers[samplerIndex], uv, 0.0f);
+    if (picture == 2u)
+        return float4(tint.rgb, tint.a * saturate((texel.a - 0.3725f) / 0.157f));
+    return picture != 0u ? float4(texel.rgb, tint.a) : float4(tint.rgb, tint.a * texel.a);
+}
+)";
+
     static bool CreateRootSignature()
     {
         D3D12_DESCRIPTOR_RANGE ranges[5]{};
@@ -1555,6 +1669,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         g.blitVertexShader = CompileInternal(BLIT_VS, L"vs_6_0", "blit_vs");
         g.blitPixelShader = CompileInternal(BLIT_PS, L"ps_6_0", "blit_ps");
         g.presentPixelShader = CompileInternal(PRESENT_PS, L"ps_6_0", "present_ps");
+        g.overlayPixelShader = CompileInternal(OVERLAY_PS, L"ps_6_0", "overlay_ps");
         g.depthBlitPixelShader = CompileInternal(DEPTH_BLIT_PS, L"ps_6_0", "depth_blit_ps");
         g.layoutPixelShader = CompileInternal(LAYOUT_PS, L"ps_6_0", "layout_ps");
         g.layoutDepthPixelShader = CompileInternal((std::string("#define DEPTH\n") +
@@ -1682,6 +1797,18 @@ float4 main(float4 position : SV_Position) : SV_Target
                     nullptr, IID_PPV_ARGS(&g.occlusionReadback))))
             {
                 g.occlusionHeap.Reset();
+            }
+            if (g.occlusionHeap && AR_ENV("AR_SHADOW_STATS"))
+            {
+                D3D12_QUERY_HEAP_DESC statsDesc{ D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, FRAME_COUNT * State::OCCLUSIONS_PER_FRAME, 0 };
+                D3D12_RESOURCE_DESC statsBuffer = readbackDesc;
+                statsBuffer.Width = uint64_t(FRAME_COUNT) * State::OCCLUSIONS_PER_FRAME * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+                if (FAILED(g.device->CreateQueryHeap(&statsDesc, IID_PPV_ARGS(&g.statsHeap))) ||
+                    FAILED(g.device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &statsBuffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                        nullptr, IID_PPV_ARGS(&g.statsReadback))))
+                {
+                    g.statsHeap.Reset();
+                }
             }
         }
         g.list.Start(!AR_ENV("AR_SINGLE_THREAD"));
@@ -2032,6 +2159,141 @@ float4 main(float4 position : SV_Position) : SV_Target
         return texture.srv;
     }
 
+    // The title's button icons and controller diagram have keyboard and mouse versions, shown while those are the input in
+    // use (see tools/mkb_art/make_mkb_art.py). They're recognised by their contents, wherever the title loads them.
+#include "mkb_art.inl"
+    struct KeyboardArt
+    {
+        uint64_t guestHash;
+        uint32_t size;
+        const uint8_t* alpha;
+        size_t alphaSize;
+        uint32_t height = 0; // 0: as wide as tall.
+        Texture texture;
+    };
+    static KeyboardArt KEYBOARD_ART[] = {
+        { 0x6588FD3326A35AA6ull, 256, g_mkbIcons, sizeof(g_mkbIcons) },
+        { 0x86739066C3B5D4FFull, 512, g_mkbDiagram, sizeof(g_mkbDiagram) },
+        { 0ull, 256, g_mkbMenuIcons, sizeof(g_mkbMenuIcons) }, // Icons again, in menus: picked by GetTextureUncached.
+        { 0ull, 1024, g_overlayAtlas, sizeof(g_overlayAtlas), 256 },
+        { 0ull, 1280, g_controlsKeyboard, sizeof(g_controlsKeyboard), 720 },
+        { 0ull, 1280, g_controlsController, sizeof(g_controlsController), 720 },
+        { 0ull, 256, g_mkbStunIcons, sizeof(g_mkbStunIcons) }, // Icons again, while the stun prompts show.
+        { 0ull, 1280, g_controlsKeysLit, sizeof(g_controlsKeysLit), 720 }, // The keyboard page's keys lit.
+        { 0ull, 1024, g_pageFont, sizeof(g_pageFont), 128 }, // The keyboard page's text.
+        { 0ull, 256, g_mkbViewerIcons, sizeof(g_mkbViewerIcons) }, // Icons again, in the Gallery's character viewer.
+    };
+
+    // The controls page for the controller is the title's own diagram: a picture of a loading screen, taken the first time one
+    // shows (with the controller's art, whatever is in use) and kept in the user's folder. Nothing of it is in this project.
+    static const char* CONTROLLER_DIAGRAM_FILE = "user/controller_diagram.bmp";
+
+    static constexpr uint64_t GAME_ICONS_HASH = 0x1AEBE5D5E582F6BAull, GAME_STENCIL_HASH = 0xE242DB80AEB462ADull;
+
+    // The title's fonts for the Options screen, for the rows added to it (see kbm::GetOverlay): recognised by their contents.
+    static constexpr uint64_t GAME_FONT_HASHES[4] = { 0x219D81F7D336DB88ull, 0x146C441743931623ull, GAME_ICONS_HASH, GAME_STENCIL_HASH };
+    static CachedTexture* g_gameFonts[4];
+
+    static bool GameFontReady(int index)
+    {
+        return g_gameFonts[index] && g_gameFonts[index]->gameFont == index && g_gameFonts[index]->texture.resource;
+    }
+
+    bool TitleFontsAvailable()
+    {
+        return GameFontReady(1) && GameFontReady(3);
+    }
+
+    bool GameIconsAvailable()
+    {
+        return g_gameFonts[2] && g_gameFonts[2]->gameFont == 2 && g_gameFonts[2]->texture.resource;
+    }
+
+    bool GameFontsAvailable()
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            if (!g_gameFonts[i] || g_gameFonts[i]->gameFont != i || !g_gameFonts[i]->texture.resource)
+                return false;
+        }
+        return true;
+    }
+
+    static void NoteGameFont(CachedTexture& entry, const DecodedTexture& decoded, uint32_t address)
+    {
+        entry.gameFont = -1;
+        bool icons = decoded.width == 128 && decoded.height == 64;
+        bool stencil = decoded.format == DXGI_FORMAT_BC3_UNORM && decoded.width == 512 && decoded.height == 512;
+        if (!icons && !stencil && (decoded.format != DXGI_FORMAT_BC3_UNORM || !((decoded.width == 256 && decoded.height == 256) || (decoded.width == 2048 && decoded.height == 1024))))
+            return;
+        uint64_t hash = HashMemory(decoded.data.data(), decoded.data.size());
+        static const bool log = AR_ENV("AR_LOG_ATLAS_HASHES") != nullptr;
+        if (log && (icons || stencil))
+            LOGF_INFO("atlas {:08X} {}x{} format {} hash {:016X}", address, decoded.width, decoded.height, int(decoded.format), hash);
+        for (int i = 0; i < 4; i++)
+        {
+            if (hash == GAME_FONT_HASHES[i])
+            {
+                entry.gameFont = i;
+                g_gameFonts[i] = &entry;
+            }
+        }
+    }
+    static uint64_t g_diagramSeenFrame = UINT64_MAX;
+    static bool g_diagramCapturing;
+    static Texture g_diagramTexture;
+
+    static int FindKeyboardArt(const DecodedTexture& decoded, uint32_t address)
+    {
+        static const bool log = AR_ENV("AR_LOG_ATLAS_HASHES") != nullptr;
+        if (decoded.format == DXGI_FORMAT_BC3_UNORM && log && decoded.width == 2048 && decoded.height == 1024)
+            LOGF_INFO("atlas {:08X} {}x{} hash {:016X}", address, decoded.width, decoded.height, HashMemory(decoded.data.data(), decoded.data.size()));
+        if (decoded.format != DXGI_FORMAT_BC3_UNORM || decoded.width != decoded.height || (decoded.width != 256 && decoded.width != 512))
+            return -1;
+        uint64_t hash = HashMemory(decoded.data.data(), decoded.data.size());
+        if (log)
+            LOGF_INFO("atlas {:08X} {}x{} hash {:016X}", address, decoded.width, decoded.height, hash);
+        for (size_t i = 0; i < std::size(KEYBOARD_ART); i++)
+        {
+            if (KEYBOARD_ART[i].guestHash == hash)
+                return int(i);
+        }
+        return -1;
+    }
+
+    static const Texture& GetKeyboardArt(int index)
+    {
+        KeyboardArt& art = KEYBOARD_ART[index];
+        if (!art.texture.resource)
+        {
+            // (Pages are wider than tall: art.size is the width, the height comes from the data.)
+            DecodedTexture decoded{};
+            decoded.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            uint32_t height = art.height ? art.height : art.size;
+            decoded.width = art.size;
+            decoded.height = height;
+            decoded.depth = 1;
+            decoded.rowPitch = art.size * 4;
+            decoded.rowCount = height;
+            decoded.data.resize(size_t(art.size) * height * 4);
+            size_t pixel = 0, total = size_t(art.size) * height;
+            for (size_t i = 0; i + 1 < art.alphaSize && pixel < total; i += 2)
+            {
+                for (uint32_t run = uint32_t(art.alpha[i]) + 1; run != 0 && pixel < total; run--, pixel++)
+                {
+                    uint8_t* out = &decoded.data[pixel * 4];
+                    // Like the originals: white where there's anything, black elsewhere (the UI's shadow pass shows otherwise).
+                    out[0] = out[1] = out[2] = art.alpha[i + 1] != 0 ? 255 : 0;
+                    out[3] = art.alpha[i + 1];
+                }
+            }
+            art.texture = CreateTexture(art.size, height, 1, false, decoded.format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (art.texture.resource)
+                UploadTexture(art.texture, decoded);
+        }
+        return art.texture;
+    }
+
     static uint32_t GetTextureUncached(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth)
     {
         rawDepth = 0;
@@ -2131,8 +2393,35 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (!firstUpload && AR_ENV("AR_TRACE_FRAME") && changeLogs++ < 40)
                     LOGF_INFO("texture {:08X} changed in frame {}", fetch.BaseAddress(), g.frameNumber);
                 UploadTexture(entry.texture, decoded);
+                entry.keyboardArt = FindKeyboardArt(decoded, fetch.BaseAddress());
+                NoteGameFont(entry, decoded, fetch.BaseAddress());
 
-                if (TraceThisFrame() || (AR_ENV("AR_DUMP_TEXTURES") && firstUpload))
+                // AR_DUMP_TEXTURES: every texture when first uploaded, from that frame on (0: from the start) for AR_DUMP_TEXTURE_FRAMES
+                // frames; compressed ones as they are, in .dds files.
+                static const int64_t dumpTexturesFrom = AR_ENV("AR_DUMP_TEXTURES") ? atoll(AR_ENV("AR_DUMP_TEXTURES")) : -1;
+                static const int64_t dumpTextureFrames = AR_ENV("AR_DUMP_TEXTURE_FRAMES") ? atoll(AR_ENV("AR_DUMP_TEXTURE_FRAMES")) : INT64_MAX / 2;
+                bool dumpTexture = firstUpload && dumpTexturesFrom >= 0 && int64_t(g.frameNumber) >= dumpTexturesFrom &&
+                    int64_t(g.frameNumber) < dumpTexturesFrom + dumpTextureFrames;
+                if (dumpTexture && decoded.format != DXGI_FORMAT_R8G8B8A8_UNORM && decoded.depth <= 1)
+                {
+                    struct DdsHeader
+                    {
+                        uint32_t magic = 0x20534444, size = 124, flags = 0x1007, height, width, pitch = 0, depth = 0, mips = 1, reserved[11] = {};
+                        uint32_t formatSize = 32, formatFlags = 4, fourCc = 0x30315844, bits = 0, masks[4] = {};
+                        uint32_t caps = 0x1000, caps2 = 0, caps3 = 0, caps4 = 0, reserved2 = 0;
+                        uint32_t dxgi, dimension = 3, misc = 0, arraySize = 1, misc2 = 0;
+                    } header;
+                    header.height = decoded.height;
+                    header.width = decoded.width;
+                    header.dxgi = uint32_t(decoded.format);
+                    std::error_code ec;
+                    std::filesystem::create_directories("screenshots", ec);
+                    std::ofstream file(fmt::format("screenshots/texture_{:08X}.dds", fetch.BaseAddress()), std::ios::binary);
+                    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+                    file.write(reinterpret_cast<const char*>(decoded.data.data()), decoded.data.size());
+                    LOGF_INFO("texture {:08X} {}x{} format {} dumped as dds", fetch.BaseAddress(), decoded.width, decoded.height, int(decoded.format));
+                }
+                if (TraceThisFrame() || dumpTexture)
                 {
                     uint32_t minimum = 255, maximum = 0;
                     for (uint8_t value : decoded.data)
@@ -2156,6 +2445,17 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
         }
 
+        if (entry.keyboardArt == 1)
+            g_diagramSeenFrame = g.frameNumber;
+        if (entry.keyboardArt >= 0 && entry.texture.resource && kbm::Active() && !g_diagramCapturing)
+        {
+            int artIndex = entry.keyboardArt;
+            if (artIndex == 0)
+                artIndex = kbm::StunPromptVisible() ? 6 : kbm::ViewerActive() ? 9 : kbm::InMenu() ? 2 : 0;
+            const Texture& art = GetKeyboardArt(artIndex);
+            if (art.resource)
+                return art.srv;
+        }
         return entry.texture.resource ? entry.texture.srv : nullSrv;
     }
 
@@ -3005,6 +3305,15 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (mode != EdramMode::ColorDepth && mode != EdramMode::DepthOnly)
             return;
 
+        // Depth only mode doesn't run a pixel shader: D3D switches to it when the title sets a null pixel shader, and the
+        // previous one stays loaded unused (see EdramMode in Xenia's xenos.h). Running it anyway put shadow casters at the
+        // mercy of the last cut-out caster's shader and texture: with no coordinates from the vertex shader, one texel's
+        // alpha killed the whole draw or none of it, which changed with the draw order (flickering shadows).
+        // AR_DEPTH_ONLY_PS keeps running it.
+        static const bool depthOnlyShader = AR_ENV("AR_DEPTH_ONLY_PS") != nullptr;
+        if (mode == EdramMode::DepthOnly && !depthOnlyShader)
+            pixelShader = nullptr;
+
         // Debugging (AR_SKIP_PS=<hex hash prefixes, comma separated>): draws with these pixel shaders are skipped.
         static const std::vector<std::string> skippedShaders = []
             {
@@ -3205,6 +3514,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                     auto& slot = system.textures[index];
                     uint32_t rawDepth;
                     slot[0] = GetTexture(fetch, hostDimension, system.textureTransforms[index], rawDepth);
+                    if (TraceThisFrame())
+                        LOGF_INFO("  texture {} at {:08X} {}x{} format {}", index, fetch.BaseAddress(), fetch.Width(), fetch.Height(), fetch.Format());
                     // Raw depth words can't be filtered.
                     // Filters set in the fetch instruction override the fetch constant's.
                     TextureFetch samplerFetch = fetch;
@@ -3621,6 +3932,28 @@ float4 main(float4 position : SV_Position) : SV_Target
                     }
                     g.occlusionLabel = fmt::format("{} {} {:08X} {:08X} {} {}{}", g.frameNumber, g.shadowResolves,
                         uint32_t(vertexShader.hash >> 32), address, int32_t(uint32_t(registers[VGT_INDX_OFFSET])), count, vertexText);
+                    static const bool logStats = AR_ENV("AR_SHADOW_STATS") != nullptr;
+                    if (logStats)
+                        g.occlusionLabel += fmt::format(" ps {:08X} cc {:08X} aref {} dc {:08X}", pixelShader ? uint32_t(pixelShader->hash >> 32) : 0u,
+                            uint32_t(registers[RB_COLORCONTROL]), RegisterFloat(registers, RB_ALPHA_REF), uint32_t(registers[RB_DEPTHCONTROL]));
+                    if (logStats)
+                    {
+                        // What the cut-out pixel shader (4018513F) reads: texture 0, and the constants it adds to the
+                        // coordinates and compares the alpha with.
+                        TextureFetch fetch0;
+                        for (uint32_t i = 0; i < 6; i++)
+                            fetch0.words[i] = registers[SHADER_CONSTANT_FETCH_00_0 + i];
+                        uint32_t psBase = uint32_t(registers[0x2308]) & 0x1FF;
+                        auto pixelConstant = [&](uint32_t c, uint32_t component)
+                            {
+                                return psBase + c < 512 ? RegisterFloat(registers, SHADER_CONSTANT_000_X + (psBase + c) * 4 + component) : -999.0f;
+                            };
+                        g.occlusionLabel += TakeFetch0Log();
+                        g.occlusionLabel += fmt::format(" mode {:X}", uint32_t(registers[RB_MODECONTROL]) & 7);
+                        g.occlusionLabel += fmt::format(" tf0 {:08X} {}x{} fmt {} srv {} xf {} {} raw {:X} c185 {} {} c255 {} {}", fetch0.BaseAddress(), fetch0.Width(),
+                            fetch0.Height(), fetch0.Format(), system.textures[0][0], system.textureTransforms[0][0], system.textureTransforms[0][1],
+                            system.textures[0][3], pixelConstant(185, 0), pixelConstant(185, 1), pixelConstant(255, 0), pixelConstant(255, 1));
+                    }
 
                     // AR_SHADOW_CPU_VS: the far cascade's static caster shader (741845E2) run on the CPU for the draw's
                     // indices: vertices inside the shadow map, out of all, and the depth range.
@@ -4042,6 +4375,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             {
                 g.list->BeginQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                     g.frameIndex * State::OCCLUSIONS_PER_FRAME + uint32_t(labels.size()));
+                if (g.statsHeap)
+                    g.list->BeginQuery(g.statsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                        g.frameIndex * State::OCCLUSIONS_PER_FRAME + uint32_t(labels.size()));
                 // What the GPU reads for the draw: indices, vertex constants (the first 64), system constants, and the
                 // first vertex buffer when it is in the vertex cache (which mid-frame flushes don't reuse).
                 auto& inputs = g.occlusionInputs[g.frameIndex];
@@ -4098,6 +4434,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             uint32_t query = g.frameIndex * State::OCCLUSIONS_PER_FRAME + uint32_t(g.occlusionLabels[g.frameIndex].size()) - 1;
             g.list->EndQuery(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, query);
+            if (g.statsHeap)
+                g.list->EndQuery(g.statsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, query);
 
             // AR_SHADOW_GPUCHECK: what the GPU sees of the draw's inputs, copied for comparison.
             if (g.gpuCheckReadback)
@@ -4603,6 +4941,41 @@ float4 main(float4 position : SV_Position) : SV_Target
                         SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
                     }
                     // AR_DUMP_ONLY limits the dumps to resolves to the listed addresses (hex, comma separated).
+                    static const bool shadowReadback = AR_ENV("AR_SHADOW_READBACK") != nullptr;
+                    if (shadowReadback && destBase == 0x0F801000)
+                    {
+                        Texture& texture = resolved.texture;
+                        D3D12_RESOURCE_DESC desc = texture.resource->GetDesc();
+                        UINT64 totalSize;
+                        g.device->GetCopyableFootprints(&desc, 0, 1, 0, &g.shadowFootprint[g.frameIndex], nullptr, nullptr, &totalSize);
+                        auto& readback = g.shadowReadback[g.frameIndex];
+                        if (!readback || readback->GetDesc().Width < totalSize)
+                        {
+                            readback.Reset();
+                            D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_READBACK };
+                            D3D12_RESOURCE_DESC bufferDesc{};
+                            bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                            bufferDesc.Width = totalSize;
+                            bufferDesc.Height = 1;
+                            bufferDesc.DepthOrArraySize = 1;
+                            bufferDesc.MipLevels = 1;
+                            bufferDesc.SampleDesc.Count = 1;
+                            bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                            g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                IID_PPV_ARGS(&readback));
+                        }
+                        if (readback)
+                        {
+                            Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                            D3D12_TEXTURE_COPY_LOCATION source{ texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                            D3D12_TEXTURE_COPY_LOCATION dest{ readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                            dest.PlacedFootprint = g.shadowFootprint[g.frameIndex];
+                            g.list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+                            g.shadowCopied[g.frameIndex] = true;
+                            g.shadowCopyFrame[g.frameIndex] = g.frameNumber;
+                            g.shadowCopyFormat = texture.format;
+                        }
+                    }
                     static const std::vector<uint32_t> dumpOnly = []
                         {
                             std::vector<uint32_t> addresses;
@@ -4662,6 +5035,172 @@ float4 main(float4 position : SV_Position) : SV_Target
     }
 
     // ---- Presentation ----
+
+    static bool LoadControllerDiagram()
+    {
+        static bool tried;
+        if (g_diagramTexture.resource)
+            return true;
+        if (tried)
+            return false;
+        std::ifstream file(CONTROLLER_DIAGRAM_FILE, std::ios::binary);
+        BITMAPFILEHEADER header{};
+        BITMAPINFOHEADER info{};
+        if (!file.read(reinterpret_cast<char*>(&header), sizeof(header)) || !file.read(reinterpret_cast<char*>(&info), sizeof(info)) ||
+            info.biBitCount != 32 || info.biWidth <= 0 || info.biHeight <= 0)
+            return false;
+        tried = true;
+        DecodedTexture decoded{};
+        decoded.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        decoded.width = uint32_t(info.biWidth);
+        decoded.height = uint32_t(info.biHeight);
+        decoded.depth = 1;
+        decoded.rowPitch = decoded.width * 4;
+        decoded.rowCount = decoded.height;
+        decoded.data.resize(size_t(decoded.rowPitch) * decoded.height);
+        std::vector<uint8_t> row(decoded.rowPitch);
+        for (uint32_t y = 0; y < decoded.height; y++)
+        {
+            if (!file.read(reinterpret_cast<char*>(row.data()), row.size()))
+                return false;
+            uint8_t* out = &decoded.data[size_t(decoded.height - 1 - y) * decoded.rowPitch];
+            for (uint32_t x = 0; x < decoded.width; x++)
+            {
+                out[x * 4 + 0] = row[x * 4 + 2];
+                out[x * 4 + 1] = row[x * 4 + 1];
+                out[x * 4 + 2] = row[x * 4 + 0];
+                out[x * 4 + 3] = 255;
+            }
+        }
+        g_diagramTexture = CreateTexture(decoded.width, decoded.height, 1, false, decoded.format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!g_diagramTexture.resource)
+            return false;
+        UploadTexture(g_diagramTexture, decoded);
+        return true;
+    }
+
+    static void DrawOverlay(float originX, float originY, float scale)
+    {
+        std::vector<OverlayQuad> quads;
+        kbm::GetOverlay(quads);
+        if (quads.empty())
+            return;
+        if (!g.overlayPipeline)
+        {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = g.rootSignature.Get();
+            desc.VS = Bytecode(g.blitVertexShader);
+            desc.PS = Bytecode(g.overlayPixelShader);
+            auto& blend = desc.BlendState.RenderTarget[0];
+            blend.BlendEnable = TRUE;
+            blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOp = D3D12_BLEND_OP_ADD;
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+            blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            desc.SampleMask = UINT_MAX;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.NumRenderTargets = 1;
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g.overlayPipeline))))
+                return;
+        }
+
+        struct OverlayConstants
+        {
+            float origin[2], size[2], uvOrigin[2], uvSize[2];
+            float tint[4];
+            uint32_t sourceIndex, samplerIndex, picture;
+        };
+        const Texture& atlas = GetKeyboardArt(3);
+        const Texture& keyboardPage = GetKeyboardArt(4);
+        const Texture& controllerPage = GetKeyboardArt(5);
+        g.list->SetPipelineState(g.overlayPipeline.Get());
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        for (const OverlayQuad& quad : quads)
+        {
+            OverlayConstants constants{};
+            const Texture* texture = &atlas;
+            float x0 = 0.0f, y0 = 0.0f, width = 4.0f / 1024.0f, height = 4.0f / 256.0f;
+            if (quad.item >= 0 && size_t(quad.item) < std::size(g_overlayRects))
+            {
+                const auto* rect = g_overlayRects[quad.item];
+                x0 = float(rect[0]) / 1024.0f;
+                y0 = float(rect[1]) / 256.0f;
+                width = float(rect[2]) / 1024.0f;
+                height = float(rect[3]) / 256.0f;
+            }
+            else if (quad.item == -2 || quad.item == -3)
+            {
+                texture = quad.item == -2 ? &keyboardPage : &controllerPage;
+                width = height = 1.0f;
+            }
+            else if ((quad.item == -4 || quad.item == -5 || quad.item == -6 || quad.item == -9) && GameFontReady(quad.item == -9 ? 3 : -4 - quad.item))
+            {
+                texture = &g_gameFonts[quad.item == -9 ? 3 : -4 - quad.item]->texture;
+                float atlasWidth = quad.item == -4 ? 256.0f : quad.item == -5 ? 2048.0f : quad.item == -9 ? 512.0f : 128.0f;
+                float atlasHeight = quad.item == -4 ? 256.0f : quad.item == -5 ? 1024.0f : quad.item == -9 ? 512.0f : 64.0f;
+                x0 = quad.texels[0] / atlasWidth;
+                y0 = quad.texels[1] / atlasHeight;
+                width = (quad.texels[2] - quad.texels[0]) / atlasWidth;
+                height = (quad.texels[3] - quad.texels[1]) / atlasHeight;
+            }
+            else if (quad.item == -7 || quad.item == -8)
+            {
+                texture = &GetKeyboardArt(quad.item == -7 ? 7 : 8);
+                float atlasWidth = quad.item == -7 ? 1280.0f : 1024.0f, atlasHeight = quad.item == -7 ? 720.0f : 128.0f;
+                x0 = quad.texels[0] / atlasWidth;
+                y0 = quad.texels[1] / atlasHeight;
+                width = (quad.texels[2] - quad.texels[0]) / atlasWidth;
+                height = (quad.texels[3] - quad.texels[1]) / atlasHeight;
+            }
+            bool picture = false;
+            float quadTop = quad.y, quadHeight2 = quad.height;
+            if (quad.item == -3 && LoadControllerDiagram())
+            {
+                // The part of the loading screen with the diagram: under its title, above its tip.
+                texture = &g_diagramTexture;
+                picture = true;
+                y0 = 112.0f / 720.0f;
+                height = (566.0f - 112.0f) / 720.0f;
+                quadTop = 133.0f;
+                quadHeight2 = 566.0f - 112.0f;
+            }
+            if (!texture->resource)
+                continue;
+            // Text at the size it has in the atlas, whatever was asked for.
+            float quadWidth = quad.width, quadHeight = quadHeight2;
+            if (quad.item >= 0 && size_t(quad.item) < std::size(g_overlayRects))
+            {
+                quadWidth = float(g_overlayRects[quad.item][2]);
+                quadHeight = float(g_overlayRects[quad.item][3]);
+            }
+            float left = originX + quad.x * scale, top = originY + quadTop * scale, right = left + quadWidth * scale, bottom = top + quadHeight * scale;
+            constants.origin[0] = left;
+            constants.origin[1] = top;
+            constants.size[0] = right - left;
+            constants.size[1] = bottom - top;
+            constants.uvOrigin[0] = x0;
+            constants.uvOrigin[1] = y0;
+            constants.uvSize[0] = width;
+            constants.uvSize[1] = height;
+            memcpy(constants.tint, quad.color, sizeof(constants.tint));
+            constants.sourceIndex = texture->srv;
+            constants.samplerIndex = GetLinearClampSampler();
+            constants.picture = picture ? 1 : quad.sharpen ? 2 : 0;
+            D3D12_VIEWPORT viewport{ left, top, right - left, bottom - top, 0.0f, 1.0f };
+            D3D12_RECT scissor{ LONG(left), LONG(top), LONG(right + 1.0f), LONG(bottom + 1.0f) };
+            g.list->RSSetViewports(1, &viewport);
+            g.list->RSSetScissorRects(1, &scissor);
+            g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+            g.list->DrawInstanced(3, 1, 0, 0);
+        }
+    }
 
     static std::filesystem::path g_screenshotFolder;
 
@@ -4892,6 +5431,41 @@ float4 main(float4 position : SV_Position) : SV_Target
             SaveScreenshot(resolved->second.texture, (swap.width ? swap.width : 1280) * g_scale, (swap.height ? swap.height : 720) * g_scale,
                 g_screenshotFolder / fmt::format("frame_{:06}.bmp", g.frameNumber), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2);
         }
+        // The picture of the controller's diagram: once the loading screen has faded in, with the original art for two frames.
+        {
+            static bool haveDiagram = std::filesystem::exists(CONTROLLER_DIAGRAM_FILE);
+            static uint64_t firstSeen = UINT64_MAX, captureAt = UINT64_MAX;
+            static auto firstSeenTime = std::chrono::steady_clock::time_point{};
+            if (!haveDiagram)
+            {
+                bool seen = g_diagramSeenFrame != UINT64_MAX && g.frameNumber - g_diagramSeenFrame < 5;
+                if (!seen)
+                {
+                    firstSeen = UINT64_MAX;
+                    g_diagramCapturing = false;
+                }
+                else if (firstSeen == UINT64_MAX)
+                {
+                    firstSeen = g.frameNumber;
+                    firstSeenTime = std::chrono::steady_clock::now();
+                }
+                else if (!g_diagramCapturing && std::chrono::steady_clock::now() - firstSeenTime > std::chrono::milliseconds(1500))
+                {
+                    g_diagramCapturing = true;
+                    captureAt = g.frameNumber + 3;
+                }
+                else if (g_diagramCapturing && g.frameNumber >= captureAt && resolved != g.resolvedTextures.end() &&
+                    resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
+                {
+                    SaveScreenshot(resolved->second.texture, (swap.width ? swap.width : 1280) * g_scale, (swap.height ? swap.height : 720) * g_scale,
+                        CONTROLLER_DIAGRAM_FILE, fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2);
+                    LOGF_INFO("saved the controller diagram to {}", CONTROLLER_DIAGRAM_FILE);
+                    haveDiagram = true;
+                    g_diagramCapturing = false;
+                }
+            }
+        }
+
         if (resolved != g.resolvedTextures.end() && resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
         {
             std::string request;
@@ -4940,6 +5514,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
             g.list->DrawInstanced(3, 1, 0, 0);
+
+            DrawOverlay(viewX, viewY, viewWidth / 1280.0f);
         }
 
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
@@ -4951,6 +5527,9 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.list->ResolveQueryData(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, base, used, g.occlusionReadback.Get(), uint64_t(base) * 8);
             g.list->ResolveQueryData(g.occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, base + State::PROBE_OFFSET, used,
                 g.occlusionReadback.Get(), uint64_t(base + State::PROBE_OFFSET) * 8);
+            if (g.statsHeap)
+                g.list->ResolveQueryData(g.statsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, base, used, g.statsReadback.Get(),
+                    uint64_t(base) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
         }
         g.shadowResolves = 0;
         if (g.timestampHeap)

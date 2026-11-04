@@ -52,6 +52,9 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_LOG_MODEL_DRAWS=<frame>,<count>`, `AR_HASH_MODEL_DRAWS` | The engine's model draw calls with guest call chains; per-frame count and hash |
 | `AR_LOG_DRAW_CALLS`, `AR_LOG_QUEUES`, `AR_LOG_QUEUE_ITEMS=<queues>` | The title's draw packet writers per 5 s; render queue executions and their items |
 | `AR_CHECK_VERTEX_MEMO` | Vertex uploads reused within a command list although guest memory changed |
+| `AR_SHADOW_STATS` | With `AR_SHADOW_PIXELS`: per draw pipeline statistics, pixel shader, alpha and depth state, texture 0 and writes to it |
+| `AR_SHADOW_READBACK` | The far cascade copied every frame without waiting, texels written per grid cell logged as SM lines; `smflick.py` counts flicker from them (`shadow_flick.sh`, or `shadow_stats.sh` with the per draw logs) |
+| `AR_DEPTH_ONLY_PS` | Runs the leftover pixel shader in depth only mode (the shadow flicker) |
 | `AR_SHADOW_PIXELS=4..6` | Probe variants: 5 shrinks the viewport transform 64x about its centre, 6 also draws points |
 | `AR_SHADOW_CPU_VS` | The far cascade's static caster shader run on the CPU per draw (`cpu inside/total`, depth range) |
 | `AR_SHADOW_GPUCHECK` | The GPU copies each logged draw's inputs back after the draw; PX lines say if they differ from what the CPU wrote |
@@ -105,6 +108,16 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_SERIALIZE_FRAMES`, `AR_NO_VERTEX_CACHE`, `AR_STRIPS_AS_LISTS` | Experiments: GPU finishes each frame first; no cross-frame vertex cache; strips drawn as lists |
 | `AR_UPLOAD_RING`, `AR_ROTATE_UPLOADS`, `AR_UPLOAD_WRITE_BACK`, `AR_UPLOAD_FENCE`, `AR_VRAM_UPLOADS` | Upload memory experiments: 1 GB without reuse for frames; shifted per frame; cache coherent; fenced; mirrored in video memory |
 
+## Keyboard and mouse
+
+`kernel/keyboard_mouse.cpp` merges them into controller 0. Bindings are in `user/key_bindings.txt` (delete it for the defaults), the window's icon in `user/icon.ico`. `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
+`AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. `AR_KBM_ICONS=1|0`
+forces which icons show, `AR_LOG_INPUT_DEVICE` logs switches, `AR_MOUSE_FULL_SPEED` (counts per second for a full stick, 3000)
+and `AR_MOUSE_DEAD_ZONE` (0.41, just past the title's 0.4) tune the camera. `AR_CLICK_CHORD_MS` (35) is how long a click waits for the other
+button before it attacks on its own. `AR_LOG_BUTTONS` logs the buttons the title gets as they change, `AR_LOG_OPTIONS` the Options screen's state
+and how its highlights grow, `AR_OPTIONS_HIGHLIGHT_SPEED` (4.4 per second) how fast the added rows' grow. `AR_LOG_ATLAS_HASHES` logs atlas hashes if the art stops being recognised.
+The art comes from `tools/mkb_art/make_mkb_art.py`, which writes `ARRecomp/gpu/mkb_art.inl`.
+
 ## Driving the game without a controller
 
 `AR_AUTO_PRESS=<seconds>` and `AR_AUTO_SEQUENCE=<steps>` press buttons in order (A, B, X, Y, START, UP, DOWN, LT,
@@ -114,8 +127,10 @@ connected controller.
 `AR_REMOTE=<file>` drives the game live instead: lines appended to the file run in order. A line lists buttons, `L<degrees>` and
 `R<degrees>` for the sticks and a duration in ms (`L0 A 400`); a bare number waits. Also `shot <name>` (saves
 screenshots/<name>.bmp, needs no `--screenshots`), `scan`, `scanwatch`, and `find new|changed|same|list`, `find watch <addresses>`
-(writers, for 30 updates) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
+(writers, for 120 updates), `find readwatch <addresses>` (readers too) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
 frame rate, but walking to a place by timing alone isn't reliable. A connected controller still works alongside it.
+
+`AR_KBM=1 AR_KBM_TEST=1` tests the keyboard and mouse without real input, so nothing can land in another window: `key <vk> <0|1>`, `cursor <x> <y>` (on the 1280 x 720 picture) and `mouse <dx> <dy>` lines go to the remote file, and the game acts as if it were in front. Run it in a folder of its own with a copy of `user/` to leave saves and settings alone. `AR_LOG_CAMERA` logs which code sets where the camera looks, as it changes. `AR_LOG_RESULTS` logs the result screens' steps with the time each took; `AR_NO_RESULT_STEP_FIX` and `AR_VIEWER_ZOOM_SPEED` (1 is the original's, default 0.2), `AR_VIEWER_MOUSE_SPEED` go with those fixes.
 
 `tools/test/world_speed.sh <name> --fps <n>` continues the campaign and measures running speed: it catches large errors such as
 slow motion. Peaks vary between runs and routes (6-9 at every frame rate so far), so it can't show small ones.

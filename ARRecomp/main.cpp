@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <kernel/keyboard_mouse.h>
 #include <cpu/guest_thread.h>
 #include <gpu/command_processor.h>
 #include <gpu/renderer.h>
@@ -32,7 +33,9 @@ static void PrintUsage()
         "  --fps N                Frame rate: 30 (default), 60 or 120.\n"
         "  --antialiasing N       Anti-aliasing samples (not implemented yet).\n"
         "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n"
-        "  --shadows on|off       Dynamic shadows (default on).\n");
+        "  --shadows on|off       Dynamic shadows (default on).\n"
+        "  --mouse-sensitivity N  Camera speed with the mouse (default 1).\n"
+        "  --invert-mouse         Mouse down looks up.\n");
 }
 
 int main(int argc, char* argv[])
@@ -47,6 +50,8 @@ int main(int argc, char* argv[])
     std::filesystem::path xexPath;
     std::filesystem::path userPath = "user";
     int dumpThreadsAfter = 0;
+    float mouseSensitivity = 1.0f;
+    bool invertMouse = false;
     bool gpuSurvey = false;
 
     for (int i = 1; i < argc; i++)
@@ -89,6 +94,10 @@ int main(int argc, char* argv[])
             gpu::g_videoSettings.antiAliasing = atoi(argv[++i]);
         else if (arg == "--shadows" && i + 1 < argc)
             gpu::g_videoSettings.shadows = std::string_view(argv[++i]) != "off";
+        else if (arg == "--mouse-sensitivity" && i + 1 < argc)
+            mouseSensitivity = std::clamp(float(atof(argv[++i])), 0.05f, 20.0f);
+        else if (arg == "--invert-mouse")
+            invertMouse = true;
         else if (arg == "--dump-threads" && i + 1 < argc)
             dumpThreadsAfter = atoi(argv[++i]);
         else
@@ -103,6 +112,7 @@ int main(int argc, char* argv[])
         PrintUsage();
         return 1;
     }
+    kbm::SetMouseOptions(mouseSensitivity, invertMouse);
 
     if (gpuSurvey)
         gpu::EnableSurvey(userPath / "shaders");

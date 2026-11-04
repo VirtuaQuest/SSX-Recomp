@@ -37,6 +37,22 @@ namespace gpu::d3d12
     // Frames presented so far.
     uint64_t GetFrameNumber();
 
+    // Drawn on top of the picture: 1280 x 720 coordinates, an item of the overlay's art (see mkb_art.inl; -1 solid colour,
+    // -2 and -3 the keyboard and controller pages; -4, -5 and -6 a rectangle, in texels, of the title's fonts and small icons; -7 and -8 the same of the keyboard page's lit keys and font, -9 of the title's stencil letters) and a colour.
+    struct OverlayQuad
+    {
+        float x, y, width, height;
+        int item;
+        float color[4];
+        float texels[4] = {};
+        bool sharpen = false; // A soft letter with hard edges.
+    };
+
+    // Whether the title's fonts for the Options screen have been loaded (it has to be showing for that).
+    bool GameFontsAvailable();
+    bool GameIconsAvailable();
+    bool TitleFontsAvailable(); // The stencil letters for the title screen's words.
+
     // Saves the next presented frame to screenshots/<name>.bmp (debugging remote control, AR_REMOTE).
     void RequestScreenshot(const std::string& name);
 }

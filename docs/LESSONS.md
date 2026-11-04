@@ -129,6 +129,8 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 - Watch out for the machine: other games and emulators running in the background slow everything uniformly. Check
   CPU use before benchmarking.
 - Dumps are big: always limit them (`AR_DUMP_ONLY`, `AR_DUMP_FRAME/FRAMES`) and clear old ones. They filled a disk once.
+- To find which code uses an input, watch who reads it: the stick values are floats at 0x832151D0 + 16 to + 28 (pad 0), and `find readwatch` on them named the class that copies them for the screen showing. From there the copy's offsets lead to the code that acts on them. Searching for the camera's values had found only UI text.
+- A `shot` is taken before the overlay is drawn, so anything added by `kbm::GetOverlay` is missing from it (rows looked gone that weren't). `PrintWindow` with full content (flag 3) gets the window as shown, even behind other windows.
 - To find what runs too fast at high frame rates, scan memory for values that change by exactly 1 per update at
   120 fps (`AR_SCAN_TIMERS=@<seconds>`): anything following the time step changes by 0.25-0.5 there, and the scan's
   own slow first frame weeds out the rest. `AR_SCAN_TIMERS_WATCH` then logs the code writing a sample of them. That
@@ -139,6 +141,14 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   because the watch really did slow the game at the time; `world_speed.sh` measures it without a tester.
 - When a search by signature keeps catching other things, narrow it to the memory range where the real hits were: a hunt for
   a steady 1.5 per update first caught only sound threads.
+- Pipeline statistics queries (`AR_SHADOW_STATS`) say where a draw got lost: vertices, shader runs, primitives through the
+  clipper, pixel shader runs. The shadow flicker cost days because occlusion queries alone (zero samples) pointed at invalid
+  vertex outputs, while the pixel shader was running and killing everything. Measure this first.
+- Check which shader a draw really uses, per draw. Notes said the shadow pixel shader was a trivial one; that came from a
+  different draw, so textures and pixel constants were never compared. A comparison of "all inputs" must include all of them.
+- A diagnostic that waits for the GPU can hide what it looks for: dumping every frame slows the game to a few frames per
+  second, and at that speed the flicker didn't show (why was not established). `AR_SHADOW_READBACK` copies without waiting (`smflick.py`).
+- Read Xenia's comments on a register before guessing at its behaviour.
 - For draws that come and go, measure them on the GPU instead of comparing images: an occlusion query around each
   draw (`AR_SHADOW_PIXELS`) gives the samples it wrote, and drawing it again without depth testing gives its
   rasterized area. That separates "not issued" from "failed the depth test" from "rasterized nothing".
@@ -181,53 +191,48 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
     0x831AE360/0x831AE35C). The count now advances at 30 Hz. A 3 s hold: 27 repeats at 30 fps, 27 at 120 fps, 101 unfixed.
   - Known, not fixed: values around -180 to 180 changing by 10 per update during launches, written from `sub_826DEDE0` and
     `sub_82965678` (they look like angles; nobody has reported a visible problem).
+- Flickering distant shadows (fixed November 2026): plain shadow casters draw in depth only mode (RB_MODECONTROL 5), which D3D
+  selects for a null pixel shader while the previous shader stays loaded; the hardware doesn't run it (`EdramMode` in Xenia's
+  xenos.h). The renderer did. That leftover was the cut-out casters' shader 4018513F (texture fetch, then kill), and the plain
+  casters export no coordinates, so one texel of whichever texture the last cut-out caster bound decided all or nothing for
+  the whole draw. Draw order changes per frame, so buildings dropped out for single frames. `AR_DEPTH_ONLY_PS` restores it.
+  Large one frame changes of the far cascade: 26 and 19 per run before, 3, 0 and 0 after.
 - D3D's `IDirect3DQuery9::GetData` is `sub_8223F950` (device fence progress at device + 11036, completed value at
   *(device + 11024)); the title's QueryPerformanceCounter is `sub_8245B458`.
 - Effects pass depth is restored by drawing saved depth words as colour at EDRAM 0x5B7; the shadow map depth buffer is
   EDRAM base 128, pitch 1040, D24FS8, cleared by a 1x strip plus a 4x MSAA alias rectangle; the shadow mask is the
   alpha of resolve 0x0E75F000 (pixel shader 47A3CA).
+- Button prompts and the controller diagram are textures, not text: a 256 x 256 icon atlas (hash 6588FD33...) and a 512 x 512
+  diagram atlas (86739066...), both BC3, white with the picture in alpha and black where empty in the icon atlas. Swapping
+  them per device changes every prompt that uses them, with no game files touched. Dump textures with `AR_DUMP_TEXTURES=<frame>`.
+- Adding rows to a menu without changing the title's menu code (`kernel/keyboard_mouse.cpp`, `OptionsSprite`/`OptionsText` in
+  `gpu/draw_hooks.cpp`): sprite and text items are rebuilt each frame and their translate is applied when drawn, so a draw hook can move
+  them, or call the draw again with another translate and scale to get another row that blends exactly like the title's (the highlight
+  is additive, which an overlay can't copy). New text and icons go in an overlay using the title's own textures, found by hash at
+  upload, so nothing of the game's art is stored. The title's cursor keeps waiting on a neighbouring row with its highlight hidden.
+  There are two Options screens with different code (pause: `sub_827F2370`, seven rows; main menu: `sub_82E29220` with state 22, nine rows),
+  so the selection is read from the highlights drawn rather than from either menu's object.
+- When an overlay copies a value from a UI item, check nothing else matches. The Options names flickered because the fade level was read from the big title's text, and a faint animated copy of it passes over the same place.
+- Windows that pop up during gameplay (something unlocked) leave the menu flags at 0x83214CF0 as they were, so "in a menu" also has to mean such a window is being drawn (`AR_TEST_IGNORE_MENU_FLAGS` tests that path on the pause menu).
+- Fonts are cut down to the letters a screen needs: the title screen's distressed stencil has only W D P R B I H S A C E L K T. The soft stencil for big titles, in the 2048 x 1024 atlas, has them all, and with hard edges (a threshold in the overlay's shader) passes for the same lettering.
+- Sounds: `sub_8297F6E0(0x820A5F58, id, 0)`. Menus: 544 move, 545 change value, 542 confirm, 543 back; call it from the menu's own update.
+- Camera: the camera object is at 0x831C51C0: +5504 and +5508 invert vertical and horizontal, +6100 and +6104 normal and aiming speed, +5936
+  and +5940 its angles. `sub_82E693B8` sets those from the saved settings each update and turns the camera inside the same call, so a value
+  written after it returns is too late; `sub_82E5EFC8` (the speed lookup) is called right after the invert flags are set, which is the place
+  to change them. The stick has a dead zone of 0.4 per axis. The speed table at 0x820ADEF8 is only 0.6 to 1.5.
+- The Gallery's character viewer: `sub_82E3AC60` updates it by a state at +156; state 2 runs `sub_82E1C508`, the camera. It adds a fixed amount per update (zoom 0.4 at camera +628, tilt and turn 0.3 times the stick squared, moving 0.05 at +580, ten times that for the largest characters), so above 30 fps all of it ran 2-4 times too fast. Even at 30 fps a held stick crosses the whole zoom range in a third of a second. Turning goes through `sub_8270B3C8` on the character at 0x831C3110.
+- Result screens are classes with an update in vtable slot 3 (f1 is the UI's step). Timers use it, but counting up doesn't: `sub_828042B8` (mission; `sub_827F0808`/`sub_827F08F0` bring each score half way to its total per update, state 3 step 1 raises the unlock bar by a thirtieth per update) and `sub_82803688` (state 2, a thirtieth per update). Each counts only on the updates 30 fps would have had. `sub_82802C08` and `sub_82803C40` only use timers.
+- Verify settings by measuring what they should change. Writing a value and seeing it stick proved nothing here: reading the camera's angles with
+  injected mouse movement showed the invert flags had no effect while the values looked right.
+- The controller's Back button opens the mission list, not a map.
+- Menu state: the word at 0x83214CF0 has bit 0x02000000 on the title screen and main menus and 0x00200000 in the pause menu and
+  what it opens (0000C000 in gameplay). Menus are separate classes in 0x8275-0x8283 that copy the pad state into themselves and
+  dispatch on a byte at +177; their text isn't plain text in memory. Row text ids aren't the cursor: 0x4090285C (0x2A + row in
+  Options) is the description's text id.
 - Testing: `AR_AUTO_SEQUENCE` drives the menus (see `tools/test/common.sh`); Training > Practice has no enemies.
 
 ## Open issues
 
-- Distant shadows occasionally flicker (the launcher's Shadows Off setting avoids it). Not fixed. What is known
-  (October 2026, `AR_SHADOW_PIXELS` occlusion queries per shadow map draw):
-  - The flicker is whole buildings vanishing from (or, when they occlude others, appearing in) the far cascade for
-    one frame, 10-70 times in a `shadow_flicker.sh` run (`pxdrop.py`).
-  - The title issues those draws every frame: same draw set per cascade, same order, same call chains. The earlier
-    note blaming the title for skipping casters was wrong; it compared all cascades together.
-  - In the bad frame the draw rasterizes nothing at all: drawn again without depth testing it still covers 0
-    pixels, where neighbouring frames cover 20,000-120,000. So the vertices land outside the view or are degenerate.
-  - Yet everything the draw reads is identical to the neighbouring frames and intact until the GPU is done: vertex
-    data (same upload offset and hash), indices, the constants the shader reads (c16-c19 world, constant; c28-c31
-    light matrix, smooth), system constants, context registers, pipeline object, topology and count.
-  - Ruled out by switches, with drops still present: the state cache (`AR_NO_STATE_CACHE`), the submission thread
-    (`AR_SINGLE_THREAD`), MSAA layout conversion (`AR_NO_LAYOUT`), native strip restart (`AR_NO_NATIVE_RESET`), depth
-    clipping (`AR_NO_DEPTH_CLIP`), a full clear of the shadow map (`AR_FORCE_SHADOW_CLEAR`), EDRAM syncs (none into
-    the shadow map), stale vertex upload reuse (`AR_CHECK_VERTEX_MEMO`: none), mid-frame upload flushes (they happen
-    in the middle cascade, after the far one).
-  - Proven GPU side (31 October): running the far cascade's shader (741845E2, a plain float3 fetch and two matrix
-    transforms) on the CPU for a dropped draw puts its vertices inside the map at normal depths, exactly like the
-    neighbouring frames (`AR_SHADOW_CPU_VS`), and a GPU copy of every input the draw reads matches what the CPU
-    wrote (`AR_SHADOW_GPUCHECK`). Yet on the GPU, even as points with the viewport transform shrunk 64x, no vertex
-    lands anywhere: the outputs are invalid.
-  - Also ruled out, drops still present: a full rebind of everything before redrawing (`AR_SHADOW_REBIND`), redrawing
-    the far cascade just before its resolve (`AR_SHADOW_LATE`; so not a stretch of GPU time), fresh copies of
-    constants, vertex data and indices (`AR_SHADOW_FRESH`), the depth descriptor (unchanged), serialized frames
-    (`AR_SERIALIZE_FRAMES`), no vertex cache (`AR_NO_VERTEX_CACHE`), whole vertex buffers (`AR_FULL_VERTEX_BUFFERS`),
-    strips as triangle lists (`AR_STRIPS_AS_LISTS`), upload addresses not reused for frames (`AR_UPLOAD_RING`,
-    `AR_ROTATE_UPLOADS`), cache coherent upload memory (`AR_UPLOAD_WRITE_BACK`), a store fence before submitting
-    (`AR_UPLOAD_FENCE`), and all uploads read from a video memory mirror (`AR_VRAM_UPLOADS`, 20-40 MB copied per
-    frame). Redraws reading video memory copies rendered for about half the dropped draws once, but the mirror for
-    the real draws did not remove drops, so that was most likely noise.
-  - The same few objects drop most (vertex buffers 09E150A0, 09E330A0, 0B2CF0A0, 09E590A0, 09E200A0: small strips
-    drawn at an index offset; 0AE870A0, 0AD0F0A0), often several of them in one frame, in a run of consecutive draws.
-    Run to run counts vary from 0 to 70, so compare several runs (`pxdrop.py`, without dumps: `AR_DUMP_ONLY=1`).
-  - Next: a PIX (or NVIDIA Nsight) capture of a frame with a drop, to see the vertex shader's real outputs and the
-    draw's state as the driver has it; trying another GPU or driver version (RTX 3080 Ti, driver 32.0.15.9597) would
-    show whether it is a driver problem. `AR_SHADOW_SO` (stream output capture) is wired up but captured nothing.
-  - Test artifact found on the way: each dumped resolve (`AR_DUMP_FRAME`) waits for the GPU (`SaveScreenshot`), so
-    dumping runs have a mid-frame flush per dump; normal play has none.
 - Short bursts (about 2 s) where the GPU thread is uniformly ~4x slower, mostly with other games running.
 - 120 fps setting: correct speed; light scenes 110-120 fps, the heaviest fights 56-85 (the GPU command processor
   thread is saturated, and the title's render thread is close behind).

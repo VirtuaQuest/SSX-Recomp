@@ -30,6 +30,7 @@ namespace gpu
     // Diagnostics: the ID of the last draw marker the CPU side inserted into the command stream (AR_MARK_DRAWS).
     uint32_t CurrentDrawMarker();
     uint32_t CurrentDrawMarkerObject();
+    std::string TakeFetch0Log();
 
     // Prints the command processor state, for diagnosing hangs.
     void DumpState();
