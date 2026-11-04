@@ -166,6 +166,85 @@ PPC_FUNC(sub_826F4720)
     __imp__sub_826F4720(ctx, base);
 }
 
+// The world's solid geometry queue, the same shape but with pairs (object, data). AR_LOG_QUEUES logs it too.
+PPC_FUNC_IMPL(__imp__sub_821C5270);
+PPC_FUNC(sub_821C5270)
+{
+    static const bool logQueues = AR_ENV("AR_LOG_QUEUES") != nullptr;
+    if (logQueues)
+    {
+        uint32_t queue = ctx.r3.u32, counter = PPC_LOAD_U32(queue + 36), count = PPC_LOAD_U32(queue + 72);
+        uint32_t array = PPC_LOAD_U32(queue + ((((counter - 1) & 1) + 19) * 4));
+        LOGF_INFO("QW {} {:08X} counter {} count {} array {:08X} other {:08X} first {:08X} {:08X} caller {:08X}", gpu::SubmittedSwaps(), queue, counter, count, array,
+            PPC_LOAD_U32(queue + (((counter & 1) + 19) * 4)), count ? PPC_LOAD_U32(array) : 0, count ? PPC_LOAD_U32(array + 4) : 0, uint32_t(ctx.lr));
+    }
+    __imp__sub_821C5270(ctx, base);
+}
+
+// Chooses an object's level of detail (r3 the object, r4 the camera). The measure, at +468, is how big it looks: its size / (tan(field of view) * distance). The level, at +533, is
+// the first of the thresholds at +452, +456 and +460 that measure beats (0 the most detailed, parts draw the batches their table at +879 lists for it), and beyond the distance at +464
+// the object isn't drawn. --draw-distance F: everything keeps its detail F times as far and is drawn F times as far. AR_LOG_LOD logs how many objects are at each level.
+PPC_FUNC_IMPL(__imp__sub_82B67C90);
+PPC_FUNC(sub_82B67C90)
+{
+    float factor = gpu::g_videoSettings.drawDistance;
+    uint32_t object = ctx.r3.u32;
+    static const bool logLevels = AR_ENV("AR_LOG_LOD") != nullptr;
+    if (factor == 1.0f)
+        __imp__sub_82B67C90(ctx, base);
+    else
+    {
+        uint32_t saved[4];
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            saved[i] = PPC_LOAD_U32(object + 452 + i * 4);
+            float value;
+            memcpy(&value, &saved[i], 4);
+            value = i == 3 ? value * factor : value / factor;
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            PPC_STORE_U32(object + 452 + i * 4, bits);
+        }
+        __imp__sub_82B67C90(ctx, base);
+        for (uint32_t i = 0; i < 4; i++)
+            PPC_STORE_U32(object + 452 + i * 4, saved[i]);
+    }
+    if (logLevels)
+    {
+        // Each object once, and again when its level changes.
+        {
+            static std::mutex mutex;
+            static std::unordered_map<uint32_t, int> known;
+            int current = int(int8_t(PPC_LOAD_U8(object + 533)));
+            std::lock_guard lock(mutex);
+            auto [entry, added] = known.try_emplace(object, current);
+            if (added || entry->second != current)
+            {
+                entry->second = current;
+                auto number = [&](uint32_t offset)
+                    {
+                        uint32_t bits = PPC_LOAD_U32(object + offset);
+                        float value;
+                        memcpy(&value, &bits, 4);
+                        return value;
+                    };
+                LOGF_INFO("LODOBJ {:08X} frame {} level {} min {} flags {:08X} thresholds {:.4f} {:.4f} {:.4f} cutoff {:.1f} measure {:.4f} parts {}", object, gpu::SubmittedSwaps(), current, int(int8_t(PPC_LOAD_U8(object + 532))),
+                    PPC_LOAD_U32(object + 448), number(452), number(456), number(460), number(464), number(468), PPC_LOAD_U16(object + 508));
+            }
+        }
+        static std::atomic<uint32_t> levels[6];
+        static std::atomic<int64_t> lastLog;
+        int level = int(int8_t(PPC_LOAD_U8(object + 533)));
+        levels[std::clamp(level + 1, 0, 5)]++;
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = lastLog.load();
+        if (now - last >= 5 && lastLog.compare_exchange_strong(last, now))
+        {
+            LOGF_INFO("LOD hidden {} level0 {} level1 {} level2 {} level3 {}", levels[0].exchange(0), levels[1].exchange(0), levels[2].exchange(0), levels[3].exchange(0), levels[4].exchange(0));
+        }
+    }
+}
+
 AR_COUNT_DRAW_HOOK(822351E8)
 AR_COUNT_DRAW_HOOK(82235340)
 AR_COUNT_DRAW_HOOK(8224A558)
@@ -382,10 +461,28 @@ static void RearrangeStunPrompt(uint32_t item, uint8_t* base, int64_t frame)
     bool stickPart = stickIcon || (pulse && isSize(32.0f)) || (disc && (isSize(32.0f) || isSize(27.0f) || isSize(21.0f))) ||
         (stripes && (isSize(32.0f) || isSize(27.0f)));
     bool buttonPart = buttonIcon || (pulse && isSize(18.0f)) || ((disc || stripes) && isSize(13.0f));
+    float tx = floatAt(item + 16 * 4), ty = floatAt(item + 17 * 4);
+    // Their rings come from another atlas, and the HUD has the same ones: those of the prompts are drawn right after the other parts, in the same place.
+    // A pressed button's icon has a second copy that changes size, so it goes by the place too.
+    static float lastStickPartX, lastStickPartY, lastButtonPartX, lastButtonPartY;
+    auto isAt = [&](float x, float y) { return std::abs(tx - x) < 3.0f && std::abs(ty - y) < 3.0f; };
+    if (isSize(32.0f) && (isUv(0.435f, 0.352f) || isUv(0.255f, 0.430f)))
+    {
+        buttonPart = isAt(lastButtonPartX, lastButtonPartY);
+        stickPart = !buttonPart && isAt(lastStickPartX, lastStickPartY);
+    }
+    else if (!stickPart && !buttonPart && half > 8.0f && half < 40.0f)
+    {
+        if (isUv(0.520f, 0.238f) || isUv(0.348f, 0.238f) || isUv(0.473f, 0.004f) || isUv(0.645f, 0.004f) || pulse || disc || stripes)
+            buttonPart = isAt(lastButtonPartX, lastButtonPartY);
+        if (!buttonPart && (isUv(0.246f, 0.004f) || pulse || disc || stripes))
+            stickPart = isAt(lastStickPartX, lastStickPartY);
+    }
     if (!stickPart && !buttonPart)
         return;
+    (stickPart ? lastStickPartX : lastButtonPartX) = tx;
+    (stickPart ? lastStickPartY : lastButtonPartY) = ty;
 
-    float tx = floatAt(item + 16 * 4), ty = floatAt(item + 17 * 4);
     if (stickIcon)
         stickSeen = frame;
     if (disc && isSize(32.0f))
@@ -849,12 +946,46 @@ PPC_FUNC(sub_82B7E680)
     int64_t frame = gpu::SubmittedSwaps();
     if (g_uiTextDumpRequest.exchange(false))
         requestedFrame = frame;
-    if (requestedFrame >= 0 && frame >= requestedFrame && frame < requestedFrame + 1)
+    // AR_LOG_UI_TEXT=<frame>,<count>: in those frames too.
+    static int64_t logFirst = -1, logFrames = 0;
+    static const bool logRange = []
+        {
+            const char* text = AR_ENV("AR_LOG_UI_TEXT");
+            if (!text)
+                return false;
+            logFirst = atoll(text);
+            const char* comma = strchr(text, ',');
+            logFrames = comma ? atoll(comma + 1) : 1;
+            return true;
+        }();
+    if ((requestedFrame >= 0 && frame >= requestedFrame && frame < requestedFrame + 1) || (logRange && frame >= logFirst && frame < logFirst + logFrames))
     {
         std::string text;
         for (uint32_t i = 0; i < 40; i++)
             text += fmt::format(" {:08X}", PPC_LOAD_U32(ctx.r3.u32 + i * 4));
         LOGF_INFO("UIT {} {:08X}:{}", frame, ctx.r3.u32, text);
+    }
+
+    // The loading screen's "LS + RS  Unleash Rampage" is three items in one place: icon, plus sign, icon. With the keyboard in use both stick clicks are Q, so
+    // only the last stays.
+    if (kbm::Active())
+    {
+        uint32_t xBits = PPC_LOAD_U32(ctx.r3.u32 + 16 * 4), yBits = PPC_LOAD_U32(ctx.r3.u32 + 17 * 4);
+        float x, y;
+        memcpy(&x, &xBits, 4);
+        memcpy(&y, &yBits, 4);
+        if (std::abs(x - 598.0f) < 1.0f && std::abs(y - 526.0f) < 1.0f)
+        {
+            static int64_t rampageFrame = -1;
+            static int rampageItems;
+            if (frame != rampageFrame)
+            {
+                rampageFrame = frame;
+                rampageItems = 0;
+            }
+            if (rampageItems++ < 2)
+                return;
+        }
     }
 
     // The title screen's prompt, in black on its strip, which comes in from the left: replaced.

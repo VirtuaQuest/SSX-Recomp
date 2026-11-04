@@ -9,7 +9,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 |---|---|
 | `--game <iso or folder>` | Game files |
 | `--xex`, `--user` | Executable and user data folder overrides |
-| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--sharpen 0-3`, `--ultrawide`, `--vsync`, `--shadows on\|off` | Video settings (what the launcher passes) |
+| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--draw-distance F`, `--sharpen 0-3`, `--ultrawide`, `--vsync`, `--shadows on\|off` | Video settings (what the launcher passes) |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
 
@@ -51,6 +51,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_MARK_DRAWS` | NOP packets before each title draw holding a hash of the guest call chain and the model (MK lines name the chains; IB lines show the marker) |
 | `AR_LOG_MODEL_DRAWS=<frame>,<count>`, `AR_HASH_MODEL_DRAWS` | The engine's model draw calls with guest call chains; per-frame count and hash |
 | `AR_LOG_DRAW_CALLS`, `AR_LOG_QUEUES`, `AR_LOG_QUEUE_ITEMS=<queues>` | The title's draw packet writers per 5 s; render queue executions and their items |
+| `AR_LOG_LOD` | Objects at each detail level per 5 s, and each object's thresholds and level as it changes (LODOBJ lines) |
+| `AR_LOG_UI_TEXT=<frame>,<count>` | The UI's text draw items in those frames (`AR_LOG_UI_ITEMS` is the same for sprites) |
 | `AR_CHECK_VERTEX_MEMO` | Vertex uploads reused within a command list although guest memory changed |
 | `AR_SHADOW_STATS` | With `AR_SHADOW_PIXELS`: per draw pipeline statistics, pixel shader, alpha and depth state, texture 0 and writes to it |
 | `AR_SHADOW_READBACK` | The far cascade copied every frame without waiting, texels written per grid cell logged as SM lines; `smflick.py` counts flicker from them (`shadow_flick.sh`, or `shadow_stats.sh` with the per draw logs) |
@@ -101,6 +103,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_COMPOSITE` | Assembling textures from consecutive resolves |
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
+| `AR_NO_DEPTH_24` | Keeping depth to the guest's precision (see LESSONS) |
 | `AR_NO_DEPTH_CLIP`, `AR_NO_DEPTH_TEST` | Depth clipping (clamps instead), depth testing |
 | `AR_NO_STATE_CACHE`, `AR_FULL_HASH`, `AR_FULL_CONSTANTS`, `AR_FULL_VERTEX_BUFFERS` | Skipping redundant state, sampled hashes, constant and vertex range trimming |
 | `AR_NO_BULK_REGISTERS` | Copying constant and register blocks without side effects in one piece |
@@ -114,7 +117,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 `AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. `AR_KBM_ICONS=1|0`
 forces which icons show, `AR_LOG_INPUT_DEVICE` logs switches, `AR_MOUSE_FULL_SPEED` (counts per second for a full stick, 3000)
 and `AR_MOUSE_DEAD_ZONE` (0.41, just past the title's 0.4) tune the camera. `AR_CLICK_CHORD_MS` (35) is how long a click waits for the other
-button before it attacks on its own. `AR_LOG_BUTTONS` logs the buttons the title gets as they change, `AR_LOG_OPTIONS` the Options screen's state
+button before it attacks on its own. `AR_TAP_HOLD_MS` (150) is how long right click is held before it readies the weapon instead of being a heavy attack (Heavy Attack and Use Killer Weapon can share a key; files saved before this get the weapon moved to right click unless it was changed by hand). `AR_LOG_BUTTONS` logs the buttons and left trigger the title gets as they change and the stun prompts coming and going, `AR_LOG_OPTIONS` the Options screen's state
 and how its highlights grow, `AR_OPTIONS_HIGHLIGHT_SPEED` (4.4 per second) how fast the added rows' grow. `AR_LOG_ATLAS_HASHES` logs atlas hashes if the art stops being recognised.
 The art comes from `tools/mkb_art/make_mkb_art.py`, which writes `ARRecomp/gpu/mkb_art.inl`.
 
@@ -130,7 +133,7 @@ screenshots/<name>.bmp, needs no `--screenshots`), `scan`, `scanwatch`, and `fin
 (writers, for 120 updates), `find readwatch <addresses>` (readers too) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
 frame rate, but walking to a place by timing alone isn't reliable. A connected controller still works alongside it.
 
-`AR_FRAME_TRACE=<file>` writes small copies of the final picture and the resolves to `AR_FRAME_TRACE_BASES` (hex) every frame without waiting on the GPU (`AR_FRAME_TRACE_FROM`, `_FRAMES`, `_STEP`; `_LIST` logs what resolves there are); `tools/test/frametrace.py` reads them. They're about 1 MB a frame at step 2, so keep the range short. `AR_SHADOW_RECEIVER_CONSTANTS=<first>,<count>;...` logs float constants at each frame's first draw that samples the shadow maps (RC lines). `find poke <address> <hex>` sets a word before every update.
+`AR_FRAME_TRACE=<file>` writes small copies of the final picture and the resolves to `AR_FRAME_TRACE_BASES` (hex) every frame without waiting on the GPU (`AR_FRAME_TRACE_FROM`, `_FRAMES`, `_STEP`, `_FINAL_STEP` for the final picture (1 is guest size, about 2 MB a frame); `_LIST` logs what resolves there are); `tools/test/frametrace.py` reads them. They're about 1 MB a frame at step 2, so keep the range short. `AR_SHADOW_RECEIVER_CONSTANTS=<first>,<count>;...` logs float constants at each frame's first draw that samples the shadow maps (RC lines). `find poke <address> <hex>` sets a word before every update.
 
 `AR_KBM=1 AR_KBM_TEST=1` tests the keyboard and mouse without real input, so nothing can land in another window: `key <vk> <0|1>`, `cursor <x> <y>` (on the 1280 x 720 picture) and `mouse <dx> <dy>` lines go to the remote file, and the game acts as if it were in front. Run it in a folder of its own with a copy of `user/` to leave saves and settings alone. `AR_LOG_CAMERA` logs which code sets where the camera looks, as it changes. `AR_LOG_RESULTS` logs the result screens' steps with the time each took; `AR_NO_RESULT_STEP_FIX` and `AR_VIEWER_ZOOM_SPEED` (1 is the original's, default 0.2), `AR_VIEWER_MOUSE_SPEED` go with those fixes.
 

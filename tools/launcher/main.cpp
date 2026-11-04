@@ -38,6 +38,8 @@ namespace
     constexpr const wchar_t* ANISOTROPIC_VALUES[] = { L"0", L"2", L"4", L"8", L"16" };
     constexpr const wchar_t* TEXTURE_LABELS[] = { L"Original", L"High", L"Ultra (may shimmer)" };
     constexpr const wchar_t* TEXTURE_VALUES[] = { L"0", L"-0.5", L"-1" };
+    constexpr const wchar_t* DRAW_DISTANCE_LABELS[] = { L"Original", L"Far (2x)", L"Very far (4x)", L"Extreme (8x)", L"Always full detail" };
+    constexpr const wchar_t* DRAW_DISTANCE_VALUES[] = { L"1", L"2", L"4", L"8", L"1000" };
     constexpr const wchar_t* SHARPEN_LABELS[] = { L"Off", L"Low", L"Medium", L"High" };
     constexpr const wchar_t* ULTRAWIDE_LABELS[] = { L"Off (16:9 with bars)", L"Wider view on ultrawide resolutions" };
     constexpr const wchar_t* VSYNC_LABELS[] = { L"Off", L"On" };
@@ -54,6 +56,7 @@ namespace
         ID_AA,
         ID_ANISOTROPIC,
         ID_TEXTURES,
+        ID_DRAW_DISTANCE,
         ID_SHARPEN,
         ID_ULTRAWIDE,
         ID_VSYNC,
@@ -66,7 +69,7 @@ namespace
         ID_LAUNCH,
     };
 
-    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath;
+    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_drawDistance, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath;
     HFONT g_font;
     std::wstring g_folder, g_iniPath;
 
@@ -136,6 +139,7 @@ namespace
         int aa = int(SendMessageW(g_aa, CB_GETCURSEL, 0, 0));
         int anisotropic = int(SendMessageW(g_anisotropic, CB_GETCURSEL, 0, 0));
         int textures = int(SendMessageW(g_textures, CB_GETCURSEL, 0, 0));
+        int drawDistance = int(SendMessageW(g_drawDistance, CB_GETCURSEL, 0, 0));
         int sharpen = int(SendMessageW(g_sharpen, CB_GETCURSEL, 0, 0));
         int ultrawide = int(SendMessageW(g_ultrawide, CB_GETCURSEL, 0, 0));
         int vsync = int(SendMessageW(g_vsync, CB_GETCURSEL, 0, 0));
@@ -157,6 +161,7 @@ namespace
         WriteSetting(L"AntiAliasing", std::to_wstring(aa));
         WriteSetting(L"Anisotropic", std::to_wstring(anisotropic));
         WriteSetting(L"TextureDetail", std::to_wstring(textures));
+        WriteSetting(L"DrawDistance", std::to_wstring(drawDistance));
         WriteSetting(L"Sharpen", std::to_wstring(sharpen));
         WriteSetting(L"Ultrawide", std::to_wstring(ultrawide));
         WriteSetting(L"VSync", std::to_wstring(vsync));
@@ -171,7 +176,7 @@ namespace
         std::wstring command = L"\"" + exe + L"\" --game \"" + gamePath + L"\" --resolution " + std::to_wstring(r.width) + L"x" +
             std::to_wstring(r.height) + L" --display " + DISPLAY_ARGS[display] + L" --fps " + std::to_wstring(FRAME_RATES[fps]) +
             L" --antialiasing " + std::to_wstring(aa) + L" --anisotropic " + ANISOTROPIC_VALUES[anisotropic] + L" --texture-lod-bias " + TEXTURE_VALUES[textures] +
-            L" --sharpen " + std::to_wstring(sharpen) + (ultrawide == 1 ? L" --ultrawide" : L"") + (vsync == 1 ? L" --vsync" : L"") +
+            L" --draw-distance " + DRAW_DISTANCE_VALUES[drawDistance] + L" --sharpen " + std::to_wstring(sharpen) + (ultrawide == 1 ? L" --ultrawide" : L"") + (vsync == 1 ? L" --vsync" : L"") +
             L" --render-scale " + std::to_wstring(scale + 1) +
             L" --shadows " + (shadows == 0 ? L"on" : L"off") + L" --mouse-sensitivity " + MOUSE_VALUES[mouse] +
             (invert == 1 ? L" --invert-mouse" : L"");
@@ -241,6 +246,9 @@ namespace
             AddLabel(window, L"Texture detail", labelX, y, 120);
             g_textures = AddCombo(window, ID_TEXTURES, controlX, y, width, TEXTURE_LABELS, std::size(TEXTURE_LABELS), ReadIndex(L"TextureDetail", int(std::size(TEXTURE_LABELS))));
             y += 40;
+            AddLabel(window, L"Draw distance", labelX, y, 120);
+            g_drawDistance = AddCombo(window, ID_DRAW_DISTANCE, controlX, y, width, DRAW_DISTANCE_LABELS, std::size(DRAW_DISTANCE_LABELS), ReadIndex(L"DrawDistance", int(std::size(DRAW_DISTANCE_LABELS))));
+            y += 40;
             AddLabel(window, L"Sharpening", labelX, y, 120);
             g_sharpen = AddCombo(window, ID_SHARPEN, controlX, y, width, SHARPEN_LABELS, std::size(SHARPEN_LABELS), ReadIndex(L"Sharpen", int(std::size(SHARPEN_LABELS))));
             y += 40;
@@ -305,7 +313,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.lpszClassName = L"ARLauncher";
     RegisterClassExW(&windowClass);
 
-    RECT rect{ 0, 0, 480, 690 };
+    RECT rect{ 0, 0, 480, 730 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,

@@ -235,6 +235,8 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   what it opens (0000C000 in gameplay). Menus are separate classes in 0x8275-0x8283 that copy the pad state into themselves and
   dispatch on a byte at +177; their text isn't plain text in memory. Row text ids aren't the cursor: 0x4090285C (0x2A + row in
   Options) is the description's text id.
+- The stun prompts also draw rings from another atlas (uv 0.435,0.352 and 0.255,0.43, half size 32, the HUD has the same ones), and the left button's icon has a second copy of changing size (18), so `RearrangeStunPrompt` goes by being drawn in the same place as the other parts. Left behind, they showed as outlines and an "A" under the mouse.
+- The loading screen's "LS + RS Unleash Rampage" is three text draws at (598, 526): icon, plus sign, icon, in `sub_82B7E680`. The loading screen goes on being drawn with the HUD's lists, so finding its items takes `AR_LOG_UI_TEXT` over a range of frames. The row "LT + Y" can't show R without changing the title's icons, so it shows right click twice.
 - Testing: `AR_AUTO_SEQUENCE` drives the menus (see `tools/test/common.sh`); Training > Practice has no enemies.
 
 ## Graphics options (launcher, all off by default)
@@ -245,6 +247,17 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
 - FXAA and sharpening are in the present shader, after the title has drawn its HUD, so they touch the HUD too; the overlay is drawn afterwards. Anisotropic filtering and the texture detail bias apply to samplers that are linear and have mips, which leaves the UI and shadow maps alone.
 - DLSS needs depth, motion vectors and jitter. The title's motion buffer (second resolve of 0x0E75F000) only has objects; camera motion would have to come from depth and matrices, as `tools`-style reprojection does. It also needs splitting the picture before the HUD. DLSS 5 reportedly wants an RTX 50.
 - Ray traced shadows: 292 caster draws, about 290000 triangles per frame, so the size is fine. The blocker is getting world positions from the title's vertex shaders: stream output (`AR_SHADOW_SO`) still captures 0 vertices, and the debug layer says nothing about why. Cut-out casters (mesh grates) would also need their alpha in the rays.
+
+## Detail levels and draw distance
+
+- `sub_82B67C90` (object in r3, camera in r4; only caller `sub_82B5C960`) chooses an object's level. Its measure, stored at +468, is how big it looks: size / (tan(field of view) * distance). The level, at +533, is the first of the thresholds at +452, +456 and +460 the measure beats, with some hysteresis, limited by +532. Beyond the distance at +464 the level is -1 and the object isn't drawn. `sub_82B62E90` copies the level into each part (+369), and the part's table at +879 and +880 gives the batches (first, count) to draw for it.
+- In the Aircraft Carrier mission, of 859 objects logged: 698 have no thresholds at all, 146 only a cutoff at 60, 80 or 100 units, and 13 have real levels (10, or 30 and 10), maybe characters. No object changed level on a walk across the deck, so the pop-in there is the cutoff. Other maps haven't been measured.
+- `--draw-distance F` (launcher: Draw distance, off by default) divides the thresholds and multiplies the cutoff around the title's own call, and puts them back. Standing and turning, objects hidden per 5 s went from about 11300-15400 to 0 at 4x, with no frame rate cost (74.3 and 75.5 fps as it was, 74.1 at 4x, 75.2 at 1000x, one run each, with logging on).
+
+## Depth precision
+
+- The guest's float depth has 20 bits of mantissa and the host's has 23, so surfaces nearly in one plane are equal on the guest and the later one passes its GEQUAL test, while here small differences decide. Pixel shaders now keep only the guest's bits (`xe_depth_24`, `SV_DepthLessEqual`, position `noperspective centroid` as the compiler demands). Xenia has the same idea. `AR_NO_DEPTH_24` turns it off. No frame rate cost measured (74.3 and 75.5 with it, 74.4 without).
+- This was done for the flickering "B-37" wall in the Aircraft Carrier mission, and **isn't proven to fix it**: the flicker wasn't reproduced in tests. From the view tried the letters were steady in 10 consecutive frames of a pan, polygon offset isn't involved (the title asks for none there), and detail levels aren't either (nothing changes level). Spawn points vary between runs, so walking somewhere by timing doesn't work there.
 
 ## Open issues
 

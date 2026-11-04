@@ -20,6 +20,7 @@ namespace gpu
         uint32_t anisotropy = 0;     // 0 what the title asks for; 2, 4, 8, 16 for all filtered textures with mipmaps.
         float textureLodBias = 0.0f; // Below 0 sharper textures, at a distance too (some shimmer at -1).
         uint32_t sharpen = 0;        // 0 off, 1-3 contrast adaptive sharpening.
+        float drawDistance = 1.0f;   // How much farther objects keep their detail and are drawn at all (1 as the game does).
         bool ultrawide = false;      // A wider view for a resolution wider than 16:9, rather than bars at the sides.
         bool vsync = false;          // Waits for the display's refresh: no tearing, some latency.
         uint32_t renderScale = 1;    // Internal resolution: 1 is the game's own (720p), 2 is 1440p, 3 is 2160p.

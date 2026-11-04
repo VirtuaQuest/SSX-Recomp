@@ -42,8 +42,8 @@ namespace kbm
         { "Move Back", 0, 0, 'S' },
         { "Move Left", 0, 0, 'A' },
         { "Move Right", 0, 0, 'D' },
-        { "Use Killer Weapon", TRIGGER_LEFT, TRIGGER_LEFT, VK_LSHIFT },
-        { "Strong Killer Weapon Attack", TRIGGER_LEFT | XINPUT_GAMEPAD_Y, 0 },
+        { "Use Killer Weapon", TRIGGER_LEFT, TRIGGER_LEFT, VK_RBUTTON, VK_LSHIFT, TRIGGER_LEFT },
+        { "Strong Killer Weapon Attack", TRIGGER_LEFT | XINPUT_GAMEPAD_Y, 0, 'R' },
         { "Weak Killer Weapon Attack", TRIGGER_LEFT | XINPUT_GAMEPAD_X, 0 },
         { "Lock-On", XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER, VK_TAB, VK_MBUTTON, XINPUT_GAMEPAD_LEFT_SHOULDER },
         { "Taunt 1", XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP, 'T' },
@@ -76,6 +76,7 @@ namespace kbm
 
     static std::atomic<int> g_keys[ACTION_COUNT][2];
     static const char* KEY_BINDINGS_FILE = "user/key_bindings.txt";
+    static constexpr int BINDINGS_VERSION = 2; // A last line after the bindings; files without it are from before right click readied the weapon.
 
     static void SetDefaultBindings()
     {
@@ -91,6 +92,7 @@ namespace kbm
         std::ofstream file(KEY_BINDINGS_FILE);
         for (int i = 0; i < ACTION_COUNT; i++)
             file << g_keys[i][0].load() << ' ' << g_keys[i][1].load() << '\n';
+        file << BINDINGS_VERSION << " 0\n";
     }
 
     static void LoadBindings()
@@ -103,6 +105,35 @@ namespace kbm
             g_keys[i][0] = std::clamp(first, 0, 255);
             g_keys[i][1] = std::clamp(second, 0, 255);
         }
+        int version = 0;
+        if (!file.is_open() || (file >> version >> second && version >= 2))
+            return;
+        // Saved with the old defaults: the weapon moves to right click, SHIFT goes on working. Anything chosen by hand stays.
+        auto isBound = [](int key)
+            {
+                for (int i = 0; i < ACTION_COUNT; i++)
+                    if (g_keys[i][0] == key || g_keys[i][1] == key)
+                        return true;
+                return false;
+            };
+        if (g_keys[ACT_KILLER][0] == VK_LSHIFT && g_keys[ACT_KILLER][1] == 0 && g_keys[ACT_HEAVY][0] == VK_RBUTTON)
+        {
+            g_keys[ACT_KILLER][0] = VK_RBUTTON;
+            g_keys[ACT_KILLER][1] = VK_LSHIFT;
+        }
+        if (g_keys[ACT_STRONG_KILLER][0] == 0 && !isBound('R'))
+            g_keys[ACT_STRONG_KILLER][0] = 'R';
+    }
+
+    // Heavy Attack and the killer weapon can share a key: tapped it's the attack, held the weapon.
+    static bool CanShareKey(int first, int second)
+    {
+        return (first == ACT_KILLER && second == ACT_HEAVY) || (first == ACT_HEAVY && second == ACT_KILLER);
+    }
+
+    static bool WeaponHeldOnAttackKey()
+    {
+        return g_keys[ACT_KILLER][0] != 0 && g_keys[ACT_KILLER][0] == g_keys[ACT_HEAVY][0];
     }
 
     // The action gets this key. An action that had it as its only one gets the key this one had, so nothing is left without a key
@@ -116,7 +147,7 @@ namespace kbm
                 continue;
             if (g_keys[i][1] == key)
                 g_keys[i][1] = 0;
-            if (g_keys[i][0] == key)
+            if (g_keys[i][0] == key && !CanShareKey(i, action))
             {
                 int second = g_keys[i][1];
                 g_keys[i][0] = second != 0 ? second : previous;
@@ -180,6 +211,8 @@ namespace kbm
             std::string text = KeyName(first);
             if (second != 0)
                 text += " or " + KeyName(second);
+            if (action == ACT_HEAVY && WeaponHeldOnAttackKey())
+                return "Tap " + text;
             return action == ACT_KILLER ? "Hold " + text : text;
         }
         auto name = [](int other) { return KeyName(g_keys[other][0]); };
@@ -236,6 +269,10 @@ namespace kbm
 
     void SetStunPromptVisible(bool visible)
     {
+        // AR_LOG_BUTTONS also logs the stun prompts coming and going, to catch them in tests.
+        static const bool logIt = AR_ENV("AR_LOG_BUTTONS") != nullptr;
+        if (logIt && visible != g_stunPrompt.load())
+            LOGF_INFO("stun prompt {}", visible ? "on" : "off");
         g_stunPrompt = visible;
     }
 
@@ -1533,6 +1570,10 @@ namespace kbm
             keyMenu[second] |= ACTIONS[i].secondGameplay == TRIGGER_RIGHT ? TRIGGER_RIGHT : ACTIONS[i].menu;
         }
         keyGameplay[0] = keyMenu[0] = 0;
+        // The key the weapon shares with Heavy Attack is only its usual self in menus (right click goes back).
+        int weaponAttackKey = WeaponHeldOnAttackKey() ? g_keys[ACT_KILLER][0].load() : 0;
+        if (weaponAttackKey != 0)
+            keyMenu[weaponAttackKey] &= ~TRIGGER_LEFT;
         for (const MenuKey& key : MENU_KEYS)
             keyMenu[key.key] |= key.buttons;
         // The character viewer: W and S zoom (as the left stick, below), T and G move the camera up and down, whatever else they're bound to.
@@ -1550,7 +1591,7 @@ namespace kbm
         static bool clickWaiting; // A click on a row the highlight hasn't reached yet.
         static auto clickUntil = std::chrono::steady_clock::time_point{};
         uint16_t buttons = 0;
-        bool attackLeft = false, attackRight = false;
+        bool attackLeft = false, attackRight = false, weaponAttackDown = false;
         int normalKey = g_keys[ACT_NORMAL][0], heavyKey = g_keys[ACT_HEAVY][0];
         for (int key = 1; key < 256; key++)
         {
@@ -1577,13 +1618,49 @@ namespace kbm
             wasDown[key] = pressed;
             if (pressed)
             {
-                if (key == normalKey && held[key] == XINPUT_GAMEPAD_X)
+                if (key == weaponAttackKey && held[key] == (TRIGGER_LEFT | XINPUT_GAMEPAD_Y))
+                    weaponAttackDown = true;
+                else if (key == normalKey && held[key] == XINPUT_GAMEPAD_X)
                     attackLeft = true;
                 else if (key == heavyKey && held[key] == XINPUT_GAMEPAD_Y)
                     attackRight = true;
                 else
                     buttons |= held[key];
             }
+        }
+        // The key both the weapon and Heavy Attack use. Held, it readies the weapon, at once if the attack key goes down meanwhile (that's firing).
+        // Tapped, it's the attack as it comes back up. With the attack key at the same moment, it's the 360 attack as usual.
+        {
+            static const auto holdTime = std::chrono::milliseconds(AR_ENV("AR_TAP_HOLD_MS") ? atoi(AR_ENV("AR_TAP_HOLD_MS")) : 150);
+            static const auto chordTime = std::chrono::milliseconds(AR_ENV("AR_CLICK_CHORD_MS") ? atoi(AR_ENV("AR_CLICK_CHORD_MS")) : 35);
+            static bool wasDown, wasLeft, weapon, chord;
+            static auto downTime = std::chrono::steady_clock::time_point{}, leftTime = downTime, tapUntil = downTime;
+            if (attackLeft && !wasLeft)
+                leftTime = keyTime;
+            wasLeft = attackLeft;
+            if (weaponAttackDown && !wasDown)
+            {
+                downTime = keyTime;
+                weapon = chord = false;
+            }
+            if (weaponAttackDown && !weapon && !chord)
+            {
+                if (attackLeft)
+                {
+                    auto apart = downTime > leftTime ? downTime - leftTime : leftTime - downTime;
+                    (g_keys[ACT_360][0] == 0 && apart <= chordTime ? chord : weapon) = true;
+                }
+                else if (keyTime - downTime >= holdTime)
+                    weapon = true;
+            }
+            if (wasDown && !weaponAttackDown && !weapon && !chord)
+                tapUntil = keyTime + std::chrono::milliseconds(60); // A press the title sees.
+            wasDown = weaponAttackDown;
+            if (weaponAttackDown && weapon)
+                buttons |= TRIGGER_LEFT;
+            if (keyTime < tapUntil)
+                buttons |= XINPUT_GAMEPAD_Y;
+            attackRight |= weaponAttackDown && chord;
         }
         // Together they're the 360 attack, unless it has a key of its own.
         if (g_keys[ACT_360][0] == 0)
@@ -2045,10 +2122,12 @@ namespace kbm
         // AR_LOG_BUTTONS: what the title gets, as it changes.
         static const bool logButtons = AR_ENV("AR_LOG_BUTTONS") != nullptr;
         static uint16_t lastButtons;
-        if (logButtons && pad.wButtons != lastButtons)
+        static uint8_t lastTrigger;
+        if (logButtons && (pad.wButtons != lastButtons || pad.bLeftTrigger != lastTrigger))
         {
             lastButtons = pad.wButtons;
-            LOGF_INFO("buttons {:04X}", lastButtons);
+            lastTrigger = pad.bLeftTrigger;
+            LOGF_INFO("buttons {:04X} left trigger {}", lastButtons, lastTrigger);
         }
 
         // AR_LOG_OPTIONS: the state of the Options screen as it changes.

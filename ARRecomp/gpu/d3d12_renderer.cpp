@@ -4194,6 +4194,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         static const char* highlightShader = AR_ENV("AR_HIGHLIGHT_PS");
         if (highlightShader && pixelShader && fmt::format("{:016X}", pixelShader->hash).rfind(highlightShader, 0) == 0)
             system.flags |= 16;
+        // AR_NO_DEPTH_24: depth keeps the host's precision (decals fight with the surfaces under them). Shadow maps have no decals.
+        static const bool depth24 = !AR_ENV("AR_NO_DEPTH_24");
+        if (depth24 && key.depthFormat == DXGI_FORMAT_D32_FLOAT_S8X24_UINT && DepthInfo{ registers[RB_DEPTH_INFO] }.Base() != 128)
+            system.flags |= 32;
         if (draw.initiator.PrimType() == PrimitiveType::PointList)
         {
             // PA_SU_POINT_SIZE and PA_SU_POINT_MINMAX hold radii in 12.4 fixed point.
@@ -5834,8 +5838,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         g.list->ClearRenderTargetView(rtv, black, 0, nullptr);
 
+        // AR_FRAME_TRACE_FINAL_STEP: of the final picture's texels at guest size, every how many (default 4).
+        static const uint32_t finalTraceStep = AR_ENV("AR_FRAME_TRACE_FINAL_STEP") ? uint32_t(atoi(AR_ENV("AR_FRAME_TRACE_FINAL_STEP"))) : 4;
         if (FrameTraceFile() && resolved != g.resolvedTextures.end())
-            FrameTraceTexture(resolved->second.texture, 0, 4 * g_scale);
+            FrameTraceTexture(resolved->second.texture, 0, finalTraceStep * g_scale);
 
         static const uint64_t screenshotInterval = AR_ENV("AR_SCREENSHOT_INTERVAL") ? std::max(1, atoi(AR_ENV("AR_SCREENSHOT_INTERVAL"))) : 300;
         if (resolved != g.resolvedTextures.end() && !g_screenshotFolder.empty() && g.frameNumber % screenshotInterval == 0 &&

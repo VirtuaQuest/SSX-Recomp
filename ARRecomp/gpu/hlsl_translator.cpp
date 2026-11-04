@@ -49,6 +49,15 @@ static const uint XE_FLAG_Z_NOT_DIVIDED = 2u;
 static const uint XE_FLAG_W_NOT_RECIPROCAL = 4u;
 static const uint XE_FLAG_POINT = 8u; // Drawing point sprites.
 static const uint XE_FLAG_DEBUG_HIGHLIGHT = 16u; // Debugging: the draw outputs solid magenta.
+static const uint XE_FLAG_DEPTH_24 = 32u; // The guest's depth buffer is 24 bit float (see xe_depth_24).
+
+// The guest's float depth has 20 bits of mantissa and the host's 23, so surfaces almost in the same plane, as decals are, come out equal there and
+// the one drawn later wins, while here the difference survives and which one wins changes with the camera. Keeps only the bits the guest has, rounding down
+// like the guest words made from host depth, so depth restored from those words compares equal too (and early rejection still works: SV_DepthLessEqual).
+float xe_depth_24(float depth)
+{
+    return depth < 6.103515625e-05f ? floor(depth * 17179869184.0f) / 17179869184.0f : asfloat(asuint(depth) & 0xFFFFFFF8u);
+}
 
 // Shader model 3 multiplication: zero times anything (including infinity and NaN) is zero.
 float4 xe_mul(float4 a, float4 b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
@@ -1018,7 +1027,7 @@ float4 xe_cube(float4 a, float4 b)
             out += R"(
 struct XeInput
 {
-    float4 position : SV_Position;
+    noperspective centroid float4 position : SV_Position; // As SV_DepthLessEqual requires.
     float4 interpolators[16] : TEXCOORD0;
     float4 extra : TEXCOORD16; // Vertex shader point diameter (x), point sprite coordinates (zw).
     bool frontFace : SV_IsFrontFace;
@@ -1028,8 +1037,7 @@ struct XeOutput
 {
     float4 color[4] : SV_Target0;
 )";
-            if (current_shader().writes_depth())
-                out += "    float depth : SV_Depth;\n";
+            out += current_shader().writes_depth() ? "    float depth : SV_Depth;\n" : "    float depth : SV_DepthLessEqual;\n";
             out += R"(};
 
 XeOutput main(XeInput input)
@@ -1148,8 +1156,7 @@ XeOutput main(uint vertexId : SV_VertexID)
         output.color[t] = color;
     }
 )";
-            if (current_shader().writes_depth())
-                out += "    output.depth = xe_depth;\n";
+            out += "    output.depth = (xe_flags & XE_FLAG_DEPTH_24) ? xe_depth_24(xe_depth) : xe_depth;\n";
         }
         else
         {

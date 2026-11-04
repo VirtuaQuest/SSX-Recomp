@@ -136,7 +136,10 @@ def icons(menu, viewer=False):
     pill(d, (3, 65, 41, 87), 'CTRL')
     pill(d, (47, 65, 85, 87), 'TAB')
     pill(d, (179, 65, 212, 87), 'C')
-    pill(d, (3, 99, 36, 121), 'SHIFT')
+    if menu:
+        pill(d, (3, 99, 36, 121), 'SHIFT')
+    else:
+        mouse_icon(d, im, (3, 99, 36, 121), 'right')  # Held. (Tapped it's the heavy attack.)
     # Start, back, stick clicks.
     pill(d, (47, 96, 79, 124), 'ENT' if menu else 'ESC')
     pill(d, (129, 142, 158, 170), 'F')
@@ -160,8 +163,8 @@ def icons(menu, viewer=False):
     return im.resize((256, 256), Image.LANCZOS)
 
 
-# The keys the default bindings use in gameplay. (Enter, Backspace, R and the arrow keys only work in menus.)
-DEFAULT_BOUND = {'ESC', '1', '2', 'TAB', 'W', 'E', 'T', 'A', 'S', 'D', 'F', 'Q', 'SHIFT', 'C', 'V', 'CTRL', 'SPACE'}
+# The keys the default bindings use in gameplay. (Enter, Backspace and the arrow keys only work in menus.)
+DEFAULT_BOUND = {'ESC', '1', '2', 'TAB', 'W', 'E', 'T', 'A', 'S', 'D', 'F', 'Q', 'R', 'SHIFT', 'C', 'V', 'CTRL', 'SPACE'}
 BOUND = DEFAULT_BOUND
 KEY_BOXES = {}  # Where each key was last drawn, for the keyboard page.
 

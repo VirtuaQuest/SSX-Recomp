@@ -34,6 +34,7 @@ static void PrintUsage()
         "  --antialiasing N       Anti-aliasing: 0 off (default), 1 FXAA.\n"
         "  --anisotropic N        Anisotropic filtering: 0 as the game asks (default), 2, 4, 8 or 16.\n"
         "  --texture-lod-bias F   Texture detail: 0 default, below 0 sharper.\n"
+        "  --draw-distance F      How much farther objects keep their detail and are drawn: 1 default.\n"
         "  --sharpen N            Sharpening: 0 off (default) to 3.\n"
         "  --ultrawide            A wider view on resolutions wider than 16:9, instead of bars.\n"
         "  --vsync                Wait for the display's refresh.\n"
@@ -101,6 +102,8 @@ int main(int argc, char* argv[])
             gpu::g_videoSettings.anisotropy = std::clamp(atoi(argv[++i]), 0, 16);
         else if (arg == "--texture-lod-bias" && i + 1 < argc)
             gpu::g_videoSettings.textureLodBias = std::clamp(float(atof(argv[++i])), -3.0f, 3.0f);
+        else if (arg == "--draw-distance" && i + 1 < argc)
+            gpu::g_videoSettings.drawDistance = std::clamp(float(atof(argv[++i])), 1.0f, 1000.0f);
         else if (arg == "--sharpen" && i + 1 < argc)
             gpu::g_videoSettings.sharpen = std::clamp(atoi(argv[++i]), 0, 3);
         else if (arg == "--ultrawide")
