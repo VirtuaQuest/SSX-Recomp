@@ -280,6 +280,9 @@ namespace gpu::d3d12
         uint8_t renderTargetCount;
         DXGI_FORMAT renderTargetFormats[4];
         DXGI_FORMAT depthFormat;
+        // Polygon offset, last: the rest of the key hashes as it did for the pipelines without one, which keeps their saved library entries.
+        int32_t depthBias;
+        float slopeBias;
     };
 
     static struct State
@@ -417,6 +420,17 @@ namespace gpu::d3d12
         uint64_t shadowCopyFrame[FRAME_COUNT] = {};
         bool shadowCopied[FRAME_COUNT] = {};
         DXGI_FORMAT shadowCopyFormat = DXGI_FORMAT_UNKNOWN;
+        // AR_FRAME_TRACE: small copies of chosen textures, every frame, without waiting (see FrameTraceTexture).
+        struct FrameTraceCopy
+        {
+            ComPtr<ID3D12Resource> readback;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            uint32_t tag = 0, step = 1;
+            uint64_t frame = 0;
+            DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+            bool pending = false;
+        };
+        std::vector<FrameTraceCopy> frameTrace[FRAME_COUNT];
         ComPtr<ID3D12QueryHeap> statsHeap;
         ComPtr<ID3D12Resource> statsReadback;
         std::vector<std::string> occlusionLabels[FRAME_COUNT];
@@ -648,6 +662,144 @@ namespace gpu::d3d12
     static void CheckOcclusionInputs(uint32_t slot);
     static uint64_t HashMemory(const uint8_t* data, size_t size);
 
+    // Diagnostics (AR_FRAME_TRACE=<file>): small copies of the final picture and of the resolves to AR_FRAME_TRACE_BASES (hex, comma separated),
+    // each frame, without waiting for the GPU: waiting slows the game and hides what's looked for. AR_FRAME_TRACE_LIST logs what resolves there are.
+    // Records: u32 tag (0 the final picture, otherwise the resolve's address), u32 format, u32 width, u32 height, u64 frame, then the texels. 8888 is
+    // two planes of box averages, brightness then alpha; anything else is every step-th texel's first word. Analysed by tools/test/frametrace.py.
+    static std::FILE* FrameTraceFile()
+    {
+        static std::FILE* file = AR_ENV("AR_FRAME_TRACE") ? std::fopen(AR_ENV("AR_FRAME_TRACE"), "wb") : nullptr;
+        return file;
+    }
+
+    static const std::vector<uint32_t>& FrameTraceBases()
+    {
+        static const std::vector<uint32_t> bases = []
+            {
+                std::vector<uint32_t> list;
+                for (const char* text = AR_ENV("AR_FRAME_TRACE_BASES"); text && *text;)
+                {
+                    char* end;
+                    uint32_t value = uint32_t(strtoul(text, &end, 16));
+                    if (end == text)
+                        break;
+                    list.push_back(value);
+                    text = *end == ',' ? end + 1 : end;
+                }
+                return list;
+            }();
+        return bases;
+    }
+
+    static void FlushFrameTrace()
+    {
+        std::FILE* file = FrameTraceFile();
+        if (!file)
+            return;
+        static std::vector<uint8_t> out;
+        for (auto& copy : g.frameTrace[g.frameIndex])
+        {
+            if (!copy.pending)
+                continue;
+            copy.pending = false;
+            const auto& layout = copy.footprint.Footprint;
+            uint8_t* data;
+            if (FAILED(copy.readback->Map(0, nullptr, reinterpret_cast<void**>(&data))))
+                continue;
+            uint32_t step = copy.step, width = layout.Width / step, height = layout.Height / step;
+            out.clear();
+            // (Shadow maps hold raw depth words in that format.)
+            if (copy.format == DXGI_FORMAT_R8G8B8A8_UNORM && copy.tag < 0x0F001000)
+            {
+                out.resize(size_t(width) * height * 2);
+                for (uint32_t y = 0; y < height; y++)
+                {
+                    for (uint32_t x = 0; x < width; x++)
+                    {
+                        uint32_t color = 0, alpha = 0;
+                        for (uint32_t j = 0; j < step; j++)
+                        {
+                            const uint8_t* texel = data + layout.RowPitch * (y * step + j) + size_t(x) * step * 4;
+                            for (uint32_t i = 0; i < step; i++, texel += 4)
+                            {
+                                color += texel[0] + texel[1] + texel[2];
+                                alpha += texel[3];
+                            }
+                        }
+                        out[size_t(y) * width + x] = uint8_t(color / (3 * step * step));
+                        out[size_t(width) * height + size_t(y) * width + x] = uint8_t(alpha / (step * step));
+                    }
+                }
+            }
+            else
+            {
+                out.resize(size_t(width) * height * 4);
+                uint32_t bytes = copy.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+                for (uint32_t y = 0; y < height; y++)
+                {
+                    const uint8_t* row = data + layout.RowPitch * (y * step);
+                    for (uint32_t x = 0; x < width; x++)
+                        memcpy(&out[(size_t(y) * width + x) * 4], row + size_t(x) * step * bytes, 4);
+                }
+            }
+            D3D12_RANGE nothing{ 0, 0 };
+            copy.readback->Unmap(0, &nothing);
+            uint32_t header[4] = { copy.tag, uint32_t(copy.format), width, height };
+            std::fwrite(header, sizeof(header), 1, file);
+            std::fwrite(&copy.frame, sizeof(copy.frame), 1, file);
+            std::fwrite(out.data(), 1, out.size(), file);
+            std::fflush(file);
+        }
+    }
+
+    // Queues a copy of a texture for FlushFrameTrace. The last of a frame for a tag counts.
+    static void FrameTraceTexture(Texture& texture, uint32_t tag, uint32_t step)
+    {
+        // AR_FRAME_TRACE_FROM, AR_FRAME_TRACE_FRAMES: which frames, keeping the file small.
+        static const uint64_t first = AR_ENV("AR_FRAME_TRACE_FROM") ? strtoull(AR_ENV("AR_FRAME_TRACE_FROM"), nullptr, 10) : 0;
+        static const uint64_t count = AR_ENV("AR_FRAME_TRACE_FRAMES") ? strtoull(AR_ENV("AR_FRAME_TRACE_FRAMES"), nullptr, 10) : 1800;
+        if (g.frameNumber < first || g.frameNumber >= first + count)
+            return;
+        auto& copies = g.frameTrace[g.frameIndex];
+        State::FrameTraceCopy* copy = nullptr;
+        for (auto& candidate : copies)
+            copy = candidate.tag == tag ? &candidate : copy;
+        if (!copy)
+        {
+            copies.emplace_back();
+            copy = &copies.back();
+            copy->tag = tag;
+        }
+        D3D12_RESOURCE_DESC desc = texture.resource->GetDesc();
+        UINT64 totalSize;
+        g.device->GetCopyableFootprints(&desc, 0, 1, 0, &copy->footprint, nullptr, nullptr, &totalSize);
+        if (!copy->readback || copy->readback->GetDesc().Width < totalSize)
+        {
+            copy->readback.Reset();
+            D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC bufferDesc{};
+            bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bufferDesc.Width = totalSize;
+            bufferDesc.Height = 1;
+            bufferDesc.DepthOrArraySize = 1;
+            bufferDesc.MipLevels = 1;
+            bufferDesc.SampleDesc.Count = 1;
+            bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&copy->readback));
+        }
+        if (!copy->readback)
+            return;
+        Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION source{ texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        D3D12_TEXTURE_COPY_LOCATION dest{ copy->readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        dest.PlacedFootprint = copy->footprint;
+        g.list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+        copy->pending = true;
+        copy->frame = g.frameNumber;
+        copy->format = texture.format;
+        copy->step = step;
+    }
+
     static void BeginFrame()
     {
         auto& frame = g.frames[g.frameIndex];
@@ -724,6 +876,7 @@ namespace gpu::d3d12
             }
             labels.clear();
         }
+        FlushFrameTrace();
         if (g.shadowCopied[g.frameIndex])
         {
             g.shadowCopied[g.frameIndex] = false;
@@ -1375,15 +1528,129 @@ cbuffer PresentConstants : register(b0)
     uint sourceIndex;
     uint samplerIndex;
     uint swapRedBlue; // The front buffer's fetch constant reads it as BGRA.
+    uint antiAliasing;
+    float sharpen;
+    uint downscale; // Many source texels to a pixel: take several samples.
 };
 
 Texture2D<float4> textures[] : register(t0, space0);
 SamplerState samplers[] : register(s0, space0);
 
+float3 Fetch(float2 uv)
+{
+    return textures[sourceIndex].SampleLevel(samplers[samplerIndex], uv, 0.0f).rgb;
+}
+
+float Luma(float3 color)
+{
+    return dot(color, float3(0.299f, 0.587f, 0.114f));
+}
+
+// Finds edges by brightness, follows them to where they end, and moves the sample across the edge by how close that is.
+float3 Fxaa(float2 uv, float2 texel)
+{
+    float3 center = Fetch(uv);
+    float m = Luma(center);
+    float n = Luma(Fetch(uv + float2(0.0f, -texel.y))), s = Luma(Fetch(uv + float2(0.0f, texel.y)));
+    float w = Luma(Fetch(uv + float2(-texel.x, 0.0f))), e = Luma(Fetch(uv + float2(texel.x, 0.0f)));
+    float high = max(m, max(max(n, s), max(w, e))), low = min(m, min(min(n, s), min(w, e)));
+    float range = high - low;
+    if (range < max(0.0312f, high * 0.125f))
+        return center;
+
+    float nw = Luma(Fetch(uv + float2(-texel.x, -texel.y))), ne = Luma(Fetch(uv + float2(texel.x, -texel.y)));
+    float sw = Luma(Fetch(uv + float2(-texel.x, texel.y))), se = Luma(Fetch(uv + float2(texel.x, texel.y)));
+    float average = (2.0f * (n + s + w + e) + nw + ne + sw + se) / 12.0f;
+    float subpixel = saturate(abs(average - m) / range);
+    subpixel = smoothstep(0.0f, 1.0f, subpixel);
+    subpixel = subpixel * subpixel * 0.75f;
+
+    float horizontalEdge = abs(nw + sw - 2.0f * w) + 2.0f * abs(n + s - 2.0f * m) + abs(ne + se - 2.0f * e);
+    float verticalEdge = abs(nw + ne - 2.0f * n) + 2.0f * abs(w + e - 2.0f * m) + abs(sw + se - 2.0f * s);
+    bool horizontal = verticalEdge >= horizontalEdge;
+    float lumaA = horizontal ? n : w, lumaB = horizontal ? s : e;
+    float gradientA = abs(lumaA - m), gradientB = abs(lumaB - m);
+    float stepLength = horizontal ? texel.y : texel.x;
+    float localAverage;
+    if (gradientA >= gradientB)
+    {
+        stepLength = -stepLength;
+        localAverage = (lumaA + m) * 0.5f;
+    }
+    else
+        localAverage = (lumaB + m) * 0.5f;
+    float gradient = max(gradientA, gradientB) * 0.25f;
+
+    float2 edge = uv;
+    if (horizontal)
+        edge.y += stepLength * 0.5f;
+    else
+        edge.x += stepLength * 0.5f;
+    float2 along = horizontal ? float2(texel.x, 0.0f) : float2(0.0f, texel.y);
+    static const float STEPS[10] = { 1.0f, 1.0f, 1.0f, 1.5f, 2.0f, 2.0f, 2.0f, 4.0f, 8.0f, 8.0f };
+    float2 back = edge - along, forward = edge + along;
+    float endBack = Luma(Fetch(back)) - localAverage, endForward = Luma(Fetch(forward)) - localAverage;
+    bool doneBack = abs(endBack) >= gradient, doneForward = abs(endForward) >= gradient;
+    for (int i = 0; i < 10 && !(doneBack && doneForward); i++)
+    {
+        if (!doneBack)
+        {
+            back -= along * STEPS[i];
+            endBack = Luma(Fetch(back)) - localAverage;
+            doneBack = abs(endBack) >= gradient;
+        }
+        if (!doneForward)
+        {
+            forward += along * STEPS[i];
+            endForward = Luma(Fetch(forward)) - localAverage;
+            doneForward = abs(endForward) >= gradient;
+        }
+    }
+    float distanceBack = horizontal ? uv.x - back.x : uv.y - back.y;
+    float distanceForward = horizontal ? forward.x - uv.x : forward.y - uv.y;
+    bool backNearer = distanceBack < distanceForward;
+    float spread = distanceBack + distanceForward;
+    bool wrong = (m - localAverage < 0.0f) == ((backNearer ? endBack : endForward) < 0.0f);
+    float offset = wrong ? 0.0f : 0.5f - min(distanceBack, distanceForward) / spread;
+    offset = max(offset, subpixel);
+    float2 moved = uv;
+    if (horizontal)
+        moved.y += offset * stepLength;
+    else
+        moved.x += offset * stepLength;
+    return Fetch(moved);
+}
+
 float4 main(float4 position : SV_Position) : SV_Target
 {
     float2 uv = (position.xy - viewportOrigin) / viewportSize;
-    float3 color = textures[sourceIndex].SampleLevel(samplers[samplerIndex], uv, 0.0f).rgb;
+    float3 color;
+    if (antiAliasing == 0u && sharpen == 0.0f && downscale == 0u)
+    {
+        color = Fetch(uv);
+        return float4(swapRedBlue ? color.bgr : color, 1.0f);
+    }
+
+    uint width, height;
+    textures[sourceIndex].GetDimensions(width, height);
+    float2 texel = 1.0f / float2(width, height), pixel = 1.0f / viewportSize;
+    if (antiAliasing != 0u)
+        color = Fxaa(uv, texel);
+    else if (downscale != 0u)
+        color = (Fetch(uv + pixel * float2(-0.125f, -0.375f)) + Fetch(uv + pixel * float2(0.375f, -0.125f)) +
+            Fetch(uv + pixel * float2(-0.375f, 0.125f)) + Fetch(uv + pixel * float2(0.125f, 0.375f))) * 0.25f;
+    else
+        color = Fetch(uv);
+    if (sharpen != 0.0f)
+    {
+        // Contrast adaptive: less where it's already at its limits, so edges don't get halos.
+        float2 step = max(texel, pixel);
+        float3 n = Fetch(uv + float2(0.0f, -step.y)), s = Fetch(uv + float2(0.0f, step.y)), w = Fetch(uv + float2(-step.x, 0.0f)), e = Fetch(uv + float2(step.x, 0.0f));
+        float3 low = min(color, min(min(n, s), min(w, e))), high = max(color, max(max(n, s), max(w, e)));
+        float3 amount = sqrt(saturate(min(low, 1.0f - high) / max(high, 0.001f)));
+        float3 weight = amount * (-1.0f / lerp(8.0f, 5.0f, sharpen));
+        color = saturate((color + (n + s + w + e) * weight) / (1.0f + 4.0f * weight));
+    }
     return float4(swapRedBlue ? color.bgr : color, 1.0f);
 }
 )";
@@ -2144,6 +2411,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 g.list->CopyTextureRegion(&dest, 0, part.destRow * g_scale, 0, &source, &box);
             }
             composite.parts = std::move(versions);
+            if (FrameTraceFile() && fetch.BaseAddress() >= 0x0F001000)
+                FrameTraceTexture(composite.texture, fetch.BaseAddress() | 1, 8 * g_scale);
             if (TraceThisFrame())
                 LOGF_INFO("composite texture 0x{:08X} {}x{} from {} resolves", fetch.BaseAddress(), fetch.Width(), fetch.Height(), parts.size());
         }
@@ -2505,6 +2774,16 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.AddressW = addressModes[clampZ];
         desc.MaxLOD = mip == 2 ? 0.0f : D3D12_FLOAT32_MAX;
         desc.MipLODBias = float(int32_t(fetch.words[4] << 10) >> 22) / 32.0f;
+        // Launcher settings: only what's filtered and has mipmaps to choose from, so not the UI or the shadow maps.
+        if (min == 1 && mag == 1 && mip != 2)
+        {
+            if (g_videoSettings.anisotropy >= 2)
+            {
+                desc.Filter = D3D12_FILTER_ANISOTROPIC;
+                desc.MaxAnisotropy = g_videoSettings.anisotropy;
+            }
+            desc.MipLODBias += g_videoSettings.textureLodBias;
+        }
         desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         float borderValue = border == 1 ? 1.0f : 0.0f;
         desc.BorderColor[0] = desc.BorderColor[1] = desc.BorderColor[2] = borderValue;
@@ -2997,7 +3276,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         bool streamOutput = false)
     {
         uint64_t hash = 0xCBF29CE484222325ull;
-        for (size_t i = 0; i < sizeof(key); i++)
+        size_t hashed = key.depthBias == 0 && key.slopeBias == 0.0f ? offsetof(PipelineKey, depthBias) : sizeof(key);
+        for (size_t i = 0; i < hashed; i++)
             hash = (hash ^ reinterpret_cast<const uint8_t*>(&key)[i]) * 0x100000001B3ull;
         if (streamOutput)
             hash ^= 0x50534F5354524D31ull;
@@ -3038,6 +3318,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         desc.RasterizerState.CullMode = cull == 1 ? D3D12_CULL_MODE_FRONT : cull == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
         desc.RasterizerState.FrontCounterClockwise = ((key.rasterizer >> 2) & 1) == 0;
         desc.RasterizerState.DepthClipEnable = !((key.rasterizer >> 3) & 1) && !AR_ENV("AR_NO_DEPTH_CLIP");
+        desc.RasterizerState.DepthBias = key.depthBias;
+        desc.RasterizerState.SlopeScaledDepthBias = key.slopeBias;
 
         uint32_t depth = key.depthControl;
         auto& depthStencil = desc.DepthStencilState;
@@ -3485,6 +3767,48 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         key.rasterizer = cull | (((modeControl >> 2) & 1) << 2) | (((registers[PA_CL_CLIP_CNTL] >> 16) & 1) << 3);
 
+        // Polygon offset (PA_SU_SC_MODE_CNTL bits 11-13). Shadow casters rely on it to keep surfaces from shadowing themselves: without it, lit walls
+        // get a fine dotted pattern in the shadow mask that crawls whenever the camera moves. As in Xenia's draw_util: the title's slope scale is in
+        // 1/16 pixel units, its constant is absolute, and D3D12's is in steps of the depth format. AR_NO_POLY_OFFSET turns it off.
+        static const bool usePolyOffset = !AR_ENV("AR_NO_POLY_OFFSET");
+        if (usePolyOffset && depthTarget)
+        {
+            float slope = 0.0f, constant = 0.0f;
+            if (topologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && !key.geometryShader)
+            {
+                if ((modeControl & (1u << 11)) && !(modeControl & 1))
+                {
+                    slope = RegisterFloat(registers, PA_SU_POLY_OFFSET_FRONT_SCALE);
+                    constant = RegisterFloat(registers, PA_SU_POLY_OFFSET_FRONT_OFFSET);
+                }
+                if ((modeControl & (1u << 12)) && !(modeControl & 2) && slope == 0.0f && constant == 0.0f)
+                {
+                    slope = RegisterFloat(registers, PA_SU_POLY_OFFSET_BACK_SCALE);
+                    constant = RegisterFloat(registers, PA_SU_POLY_OFFSET_BACK_OFFSET);
+                }
+            }
+            else if (modeControl & (1u << 13))
+            {
+                slope = RegisterFloat(registers, PA_SU_POLY_OFFSET_FRONT_SCALE);
+                constant = RegisterFloat(registers, PA_SU_POLY_OFFSET_FRONT_OFFSET);
+            }
+            if (std::isfinite(slope) && std::isfinite(constant) && (slope != 0.0f || constant != 0.0f))
+            {
+                bool floatDepth = key.depthFormat == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+                int32_t steps = floatDepth ? int32_t(std::ceil(std::abs(constant) * float(1u << 21))) << 3 : int32_t(std::ceil(std::abs(constant) * float((1u << 24) - 1)));
+                key.depthBias = constant < 0.0f ? -steps : steps;
+                key.slopeBias = slope / 16.0f * float(g_scale);
+                static const bool logOffset = AR_ENV("AR_LOG_POLY_OFFSET") != nullptr;
+                if (logOffset)
+                {
+                    static std::set<std::tuple<float, float, uint32_t>> seen;
+                    if (seen.insert({ slope, constant, uint32_t(registers[RB_DEPTH_INFO]) }).second)
+                        LOGF_INFO("POLYOFFSET frame {} slope {} constant {} mode {:08X} depth base {:X} format {} pitch {} -> bias {} slope {}", g.frameNumber, slope, constant, modeControl,
+                            DepthInfo{ registers[RB_DEPTH_INFO] }.Base(), DepthInfo{ registers[RB_DEPTH_INFO] }.Format(), pitch, key.depthBias, key.slopeBias);
+                }
+            }
+        }
+
         // Textures first: their uploads are recorded as they are made, so they survive an upload flush.
         auto bindTextures = [&](const HostShader& shader)
             {
@@ -3514,6 +3838,45 @@ float4 main(float4 position : SV_Position) : SV_Target
                     auto& slot = system.textures[index];
                     uint32_t rawDepth;
                     slot[0] = GetTexture(fetch, hostDimension, system.textureTransforms[index], rawDepth);
+                    // AR_SHADOW_RECEIVER=<frame>: all float constants at the first draw of that frame that samples the shadow maps. With a list of
+                    // constants (AR_SHADOW_RECEIVER_CONSTANTS=<first>,<count>;...), those at the first such draw of every frame (RC lines).
+                    static const int64_t receiverFrame = AR_ENV("AR_SHADOW_RECEIVER") ? atoll(AR_ENV("AR_SHADOW_RECEIVER")) : -1;
+                    static const char* receiverList = AR_ENV("AR_SHADOW_RECEIVER_CONSTANTS");
+                    if ((receiverFrame >= 0 || receiverList) && fetch.Width() >= 1024 && fetch.Height() >= 2048)
+                    {
+                        static uint64_t doneFrame = UINT64_MAX;
+                        if (doneFrame != g.frameNumber)
+                        {
+                            doneFrame = g.frameNumber;
+                            if (int64_t(g.frameNumber) == receiverFrame)
+                            {
+                                std::string text;
+                                for (uint32_t i = 0; i < 512 * 4; i++)
+                                    text += fmt::format(" {}", RegisterFloat(registers, SHADER_CONSTANT_000_X + i));
+                                LOGF_INFO("RCALL {} fetch slot {}{}", g.frameNumber, index, text);
+                            }
+                            if (receiverList)
+                            {
+                                std::string text;
+                                for (const char* list = receiverList; *list;)
+                                {
+                                    uint32_t first = 0, count = 0;
+                                    int used = 0;
+                                    if (sscanf(list, "%u,%u%n", &first, &count, &used) != 2)
+                                        break;
+                                    list += used;
+                                    list += *list == ';' ? 1 : 0;
+                                    for (uint32_t i = 0; i < count * 4; i++)
+                                        text += fmt::format(" {}", RegisterFloat(registers, SHADER_CONSTANT_000_X + first * 4 + i));
+                                }
+                                LOGF_INFO("RC {}{}", g.frameNumber, text);
+                            }
+                        }
+                    }
+                    static const bool listFetches = AR_ENV("AR_FRAME_TRACE_LIST") != nullptr;
+                    if (listFetches && g.frameNumber % 600 < 2 && fetch.Width() >= 1024 && fetch.Height() >= 2048)
+                        LOGF_INFO("SHADOWFETCH {} base {:08X} {}x{} format {} into edram {:X} pitch {} slot {}", g.frameNumber, fetch.BaseAddress(), fetch.Width(), fetch.Height(), fetch.Format(),
+                            ColorInfo{ registers[RB_COLOR_INFO] }.Base(), uint32_t(registers[RB_SURFACE_INFO]) & 0x3FFF, index);
                     if (TraceThisFrame())
                         LOGF_INFO("  texture {} at {:08X} {}x{} format {}", index, fetch.BaseAddress(), fetch.Width(), fetch.Height(), fetch.Format());
                     // Raw depth words can't be filtered.
@@ -3881,6 +4244,20 @@ float4 main(float4 position : SV_Position) : SV_Target
             };
         D3D12_GPU_VIRTUAL_ADDRESS vertexConstants = uploadFloatConstants(registers[0x2307], &vertexShader);
         D3D12_GPU_VIRTUAL_ADDRESS pixelConstants = uploadFloatConstants(registers[0x2308], pixelShader);
+        // The shadow mask's shader takes its depth bias per cascade from c185: x for the middle one, z for the near and far ones, and x is about a quarter of z.
+        // Surfaces therefore change from one cascade to the next at 10 units, a plane the camera sweeps through the world: 9.2 flips per 10000 pixels per frame
+        // just past it against 0.5 around it, 0.22 with x the same as z. AR_NO_SHADOW_BIAS_MATCH keeps the title's; AR_SHADOW_BIAS=<x>,<y>,<z> sets others (testing).
+        if (pixelShader && pixelShader->hash == 0x47A3CAD575529FD8ull)
+        {
+            auto* bias = reinterpret_cast<float*>(g.uploadCpu + (pixelConstants - g.uploadGpu) + 185 * 16);
+            static const char* biasText = AR_ENV("AR_SHADOW_BIAS");
+            static const bool match = !AR_ENV("AR_NO_SHADOW_BIAS_MATCH");
+            float forced[3];
+            if (biasText && sscanf(biasText, "%f,%f,%f", &forced[0], &forced[1], &forced[2]) == 3)
+                memcpy(bias, forced, sizeof(forced));
+            else if (match && std::isfinite(bias[2]) && bias[2] > bias[0])
+                bias[0] = bias[2];
+        }
         D3D12_GPU_VIRTUAL_ADDRESS systemConstants = UploadConstants(system);
         if (CheckUploads() && ((vertexShader.hash >> 32) == 0x741845E2 || (vertexShader.hash >> 32) == 0xDC019066))
         {
@@ -4940,6 +5317,30 @@ float4 main(float4 position : SV_Position) : SV_Target
                         static int sourceIndex;
                         SaveScreenshot(*source, source->width, 1024, fmt::format("screenshots/source_{:02}_{:08X}.bmp", sourceIndex++, destBase));
                     }
+                    if (FrameTraceFile())
+                    {
+                        static const bool listResolves = AR_ENV("AR_FRAME_TRACE_LIST") != nullptr;
+                        if (listResolves && g.frameNumber % 600 < 2)
+                            LOGF_INFO("RESOLVE {} base {:08X} format {} size {}x{} texture {}x{} row {} from edram {:X} depth {}", g.frameNumber, destBase, int(destFormat), destWidth, destHeight,
+                                resolved.texture.width, resolved.texture.height, row, ColorInfo{ registers[RB_COLOR_INFO] }.Base(), depthSource ? 1 : 0);
+                        const auto& bases = FrameTraceBases();
+                        if (std::find(bases.begin(), bases.end(), destBase) != bases.end())
+                        {
+                            // An address can be resolved to more than once in a frame: the low bits of the tag say which time.
+                            static std::map<uint32_t, std::pair<uint64_t, uint32_t>> counts;
+                            auto& [countFrame, count] = counts[destBase];
+                            if (countFrame != g.frameNumber)
+                            {
+                                countFrame = g.frameNumber;
+                                count = 0;
+                            }
+                            {
+                                // AR_FRAME_TRACE_STEP: of the texels kept, every how many (4, and 8 for the shadow maps).
+                                static const uint32_t traceStep = AR_ENV("AR_FRAME_TRACE_STEP") ? uint32_t(atoi(AR_ENV("AR_FRAME_TRACE_STEP"))) : 4;
+                                FrameTraceTexture(resolved.texture, destBase + count++, (destBase >= 0x0F001000 && destBase < 0x10000000 ? 8 : traceStep) * g_scale);
+                            }
+                        }
+                    }
                     // AR_DUMP_ONLY limits the dumps to resolves to the listed addresses (hex, comma separated).
                     static const bool shadowReadback = AR_ENV("AR_SHADOW_READBACK") != nullptr;
                     if (shadowReadback && destBase == 0x0F801000)
@@ -5079,12 +5480,21 @@ float4 main(float4 position : SV_Position) : SV_Target
         return true;
     }
 
-    static void DrawOverlay(float originX, float originY, float scale)
+    static void DrawOverlay(float originX, float originY, float scale, float sideSpace)
     {
         std::vector<OverlayQuad> quads;
         kbm::GetOverlay(quads);
         if (quads.empty())
             return;
+        // Backgrounds as wide as the picture stay so when it's wider than the overlay's 16:9 (ultrawide).
+        for (OverlayQuad& quad : quads)
+        {
+            if (quad.item == -1 && quad.x <= 0.0f && quad.width >= 1280.0f)
+            {
+                quad.x = -sideSpace;
+                quad.width = 1280.0f + sideSpace * 2.0f;
+            }
+        }
         if (!g.overlayPipeline)
         {
             D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -5424,6 +5834,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         g.list->ClearRenderTargetView(rtv, black, 0, nullptr);
 
+        if (FrameTraceFile() && resolved != g.resolvedTextures.end())
+            FrameTraceTexture(resolved->second.texture, 0, 4 * g_scale);
+
         static const uint64_t screenshotInterval = AR_ENV("AR_SCREENSHOT_INTERVAL") ? std::max(1, atoi(AR_ENV("AR_SCREENSHOT_INTERVAL"))) : 300;
         if (resolved != g.resolvedTextures.end() && !g_screenshotFolder.empty() && g.frameNumber % screenshotInterval == 0 &&
             resolved->second.texture.format == DXGI_FORMAT_R8G8B8A8_UNORM)
@@ -5487,8 +5900,10 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             // Scaled to fit the window, keeping the aspect ratio.
             float sourceWidth = float(swap.width ? swap.width : 1280), sourceHeight = float(swap.height ? swap.height : 720);
-            float scale = std::min(float(g.swapWidth) / sourceWidth, float(g.swapHeight) / sourceHeight);
-            float viewWidth = sourceWidth * scale, viewHeight = sourceHeight * scale;
+            // (Ultrawide: the view is wider, shown as wide as the setting says. See sub_82703DF8 in draw_hooks.cpp.)
+            float wider = UltrawideFactor();
+            float scale = std::min(float(g.swapWidth) / (sourceWidth * wider), float(g.swapHeight) / sourceHeight);
+            float viewWidth = sourceWidth * wider * scale, viewHeight = sourceHeight * scale;
             float viewX = (float(g.swapWidth) - viewWidth) * 0.5f, viewY = (float(g.swapHeight) - viewHeight) * 0.5f;
 
             // The source texture can be larger than the displayed area.
@@ -5499,10 +5914,14 @@ float4 main(float4 position : SV_Position) : SV_Target
                 uint32_t sourceIndex;
                 uint32_t samplerIndex;
                 uint32_t swapRedBlue;
+                uint32_t antiAliasing;
+                float sharpen;
+                uint32_t downscale;
             } constants{ { viewX, viewY },
                 { viewWidth * float(resolved->second.texture.width) / (sourceWidth * g_scale),
                     viewHeight * float(resolved->second.texture.height) / (sourceHeight * g_scale) },
-                resolved->second.texture.srv, GetLinearClampSampler(), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2 ? 1u : 0u };
+                resolved->second.texture.srv, GetLinearClampSampler(), fetch.words[1] != 0 && (fetch.Swizzle() & 7) == 2 ? 1u : 0u,
+                g_videoSettings.antiAliasing, float(g_videoSettings.sharpen) / 3.0f, float(g_scale) * sourceHeight / viewHeight > 1.5f ? 1u : 0u };
 
             Transition(resolved->second.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -5515,7 +5934,10 @@ float4 main(float4 position : SV_Position) : SV_Target
             g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
             g.list->DrawInstanced(3, 1, 0, 0);
 
-            DrawOverlay(viewX, viewY, viewWidth / 1280.0f);
+            // The overlay stays in the shape the UI is in: 16:9 in the middle.
+            float overlayScale = viewHeight / 720.0f;
+            float overlaySide = (viewWidth - 1280.0f * overlayScale) * 0.5f;
+            DrawOverlay(viewX + overlaySide, viewY, overlayScale, overlaySide / overlayScale);
         }
 
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
@@ -5542,7 +5964,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         Submit();
         g_slotCursor[g.frameIndex] = g.uploadOffset;
-        g.list->Present(0, g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        g.list->Present(g_videoSettings.vsync ? 1 : 0, !g_videoSettings.vsync && g.tearing && !g.exclusiveFullscreen ? DXGI_PRESENT_ALLOW_TEARING : 0);
         // Experiment (AR_SERIALIZE_FRAMES): the GPU finishes each frame before the next one is recorded.
         static const bool serialize = AR_ENV("AR_SERIALIZE_FRAMES") != nullptr;
         if (serialize)

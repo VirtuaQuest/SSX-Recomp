@@ -31,7 +31,12 @@ static void PrintUsage()
         "  --resolution WxH       Window or display resolution (default 1280x720).\n"
         "  --display MODE         windowed, borderless or fullscreen (default windowed).\n"
         "  --fps N                Frame rate: 30 (default), 60 or 120.\n"
-        "  --antialiasing N       Anti-aliasing samples (not implemented yet).\n"
+        "  --antialiasing N       Anti-aliasing: 0 off (default), 1 FXAA.\n"
+        "  --anisotropic N        Anisotropic filtering: 0 as the game asks (default), 2, 4, 8 or 16.\n"
+        "  --texture-lod-bias F   Texture detail: 0 default, below 0 sharper.\n"
+        "  --sharpen N            Sharpening: 0 off (default) to 3.\n"
+        "  --ultrawide            A wider view on resolutions wider than 16:9, instead of bars.\n"
+        "  --vsync                Wait for the display's refresh.\n"
         "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n"
         "  --shadows on|off       Dynamic shadows (default on).\n"
         "  --mouse-sensitivity N  Camera speed with the mouse (default 1).\n"
@@ -92,6 +97,16 @@ int main(int argc, char* argv[])
             gpu::g_videoSettings.renderScale = std::clamp(atoi(argv[++i]), 1, 4);
         else if (arg == "--antialiasing" && i + 1 < argc)
             gpu::g_videoSettings.antiAliasing = atoi(argv[++i]);
+        else if (arg == "--anisotropic" && i + 1 < argc)
+            gpu::g_videoSettings.anisotropy = std::clamp(atoi(argv[++i]), 0, 16);
+        else if (arg == "--texture-lod-bias" && i + 1 < argc)
+            gpu::g_videoSettings.textureLodBias = std::clamp(float(atof(argv[++i])), -3.0f, 3.0f);
+        else if (arg == "--sharpen" && i + 1 < argc)
+            gpu::g_videoSettings.sharpen = std::clamp(atoi(argv[++i]), 0, 3);
+        else if (arg == "--ultrawide")
+            gpu::g_videoSettings.ultrawide = true;
+        else if (arg == "--vsync")
+            gpu::g_videoSettings.vsync = true;
         else if (arg == "--shadows" && i + 1 < argc)
             gpu::g_videoSettings.shadows = std::string_view(argv[++i]) != "off";
         else if (arg == "--mouse-sensitivity" && i + 1 < argc)

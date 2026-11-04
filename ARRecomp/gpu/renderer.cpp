@@ -30,6 +30,31 @@ namespace gpu
         g_renderingDisabled = true;
     }
 
+    // The title's shadow mask shader stops shadowing at a fixed view depth, c186.w (100 units), all at once. That's a plane
+    // at a fixed distance from the camera, so turning or moving the camera sweeps it through the world, and whatever it crosses pops between shadowed and
+    // lit: 300-380 flips per 10000 pixels per frame at that depth against 0.5 anywhere else out there, whole distant towers at a time. Here the shadow
+    // fades out over the last stretch before it instead. AR_NO_SHADOW_FADE keeps the original.
+    static void FadeShadowsAtTheirEnd(uint64_t hash, std::string& hlsl)
+    {
+        static constexpr uint64_t SHADOW_MASK_SHADER = 0x47A3CAD575529FD8ull;
+        static const bool fade = !AR_ENV("AR_NO_SHADOW_FADE");
+        if (hash != SHADOW_MASK_SHADER || !fade)
+            return;
+        static const std::string DEPTH_READY = "xe_vector = xe_r[0].xxxx + (-xe_c[(186) & 255].xxxx);";
+        static const std::string DECLARATION = "float4 xe_color[4]";
+        static const std::string OUTPUT = "    float alpha = xe_color[0].a;";
+        size_t depthReady = hlsl.find(DEPTH_READY), declaration = hlsl.find(DECLARATION), output = hlsl.find(OUTPUT);
+        if (depthReady == std::string::npos || declaration == std::string::npos || output == std::string::npos)
+        {
+            LOGF_WARNING("shadow mask shader: not what was expected, no fade");
+            return;
+        }
+        // From the end of the text, so the places found stay valid.
+        hlsl.insert(output, "    xe_color[0] = lerp(xe_color[0], float4(1.0f, 1.0f, 1.0f, 1.0f), smoothstep(0.8f, 0.98f, xe_shadow_view_z / xe_c[(186) & 255].w));\n");
+        hlsl.insert(depthReady, "xe_shadow_view_z = xe_r[0].x;\n            ");
+        hlsl.insert(declaration, "float xe_shadow_view_z = 0.0f;\n    ");
+    }
+
     // Analyzes, translates and compiles a shader the first time a draw uses it.
     static bool PrepareShader(ShaderMicrocode& microcode)
     {
@@ -43,6 +68,7 @@ namespace gpu
         microcode.shader->AnalyzeUcode(buffer);
 
         std::string hlsl = TranslateShaderToHlsl(*microcode.shader);
+        FadeShadowsAtTheirEnd(microcode.hash, hlsl);
         for (const auto& error : microcode.shader->GetOrCreateTranslation(0)->errors())
             LOGF_WARNING("shader {:016X}: {}", microcode.hash, error.message);
         if (hlsl.empty())

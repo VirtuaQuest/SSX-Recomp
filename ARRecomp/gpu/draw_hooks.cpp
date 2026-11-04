@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <gpu/video_settings.h>
 #include <kernel/memory.h>
 #include "command_processor.h"
 #include <unordered_set>
@@ -529,6 +530,113 @@ PPC_FUNC(sub_82E29220)
 // The Options screen with the rows added to it (see keyboard_mouse.cpp): what the title draws of its rows moved down, its sprites for
 // a row's background and highlight drawn again for the added rows, so they look the same. Returns whether to draw the item.
 PPC_FUNC_IMPL(__imp__sub_8280FA08);
+
+// Ultrawide (--ultrawide). The picture stays 16:9 inside and is shown wider, so it takes a wider view, and everything drawn flat on it comes out wider too: the
+// UI is narrowed by as much, about the middle, which makes it the right shape in the middle of the screen. A draw's x becomes x * scale + offset.
+static void DrawUiItem(PPCContext& __restrict ctx, uint8_t* base, float scale, float offset, void (*draw)(PPCContext& __restrict, uint8_t*))
+{
+    if (scale == 1.0f && offset == 0.0f)
+    {
+        draw(ctx, base);
+        return;
+    }
+    uint32_t item = ctx.r3.u32;
+    static constexpr uint32_t COLUMN[4] = { 4, 8, 12, 16 };
+    uint32_t saved[4];
+    for (int i = 0; i < 4; i++)
+    {
+        saved[i] = PPC_LOAD_U32(item + COLUMN[i] * 4);
+        float value;
+        memcpy(&value, &saved[i], 4);
+        value = value * scale + (i == 3 ? offset : 0.0f);
+        uint32_t bits;
+        memcpy(&bits, &value, 4);
+        PPC_STORE_U32(item + COLUMN[i] * 4, bits);
+    }
+    draw(ctx, base);
+    for (int i = 0; i < 4; i++)
+        PPC_STORE_U32(item + COLUMN[i] * 4, saved[i]);
+}
+
+static void DrawUiSprite(PPCContext& __restrict ctx, uint8_t* base)
+{
+    float wider = gpu::UltrawideFactor();
+    if (wider == 1.0f)
+    {
+        __imp__sub_8280FA08(ctx, base);
+        return;
+    }
+    float scale = 1.0f / wider, offset = 640.0f - 640.0f / wider;
+    // Its vertices (x and y first, stride in bytes at word 34, count at 35, address at 36) and transform.
+    uint32_t item = ctx.r3.u32;
+    uint32_t vertices = PPC_LOAD_U32(item + 36 * 4), stride = PPC_LOAD_U32(item + 34 * 4), count = PPC_LOAD_U32(item + 35 * 4);
+    auto loadFloat = [&](uint32_t address)
+        {
+            uint32_t bits = PPC_LOAD_U32(address);
+            float value;
+            memcpy(&value, &bits, 4);
+            return value;
+        };
+    if (vertices != 0 && stride >= 8 && count != 0 && count <= 256)
+    {
+        float lowX = FLT_MAX, highX = -FLT_MAX, lowY = FLT_MAX, highY = -FLT_MAX;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            float x = loadFloat(vertices + i * stride), y = loadFloat(vertices + i * stride + 4);
+            lowX = std::min(lowX, x);
+            highX = std::max(highX, x);
+            lowY = std::min(lowY, y);
+            highY = std::max(highY, y);
+        }
+        float scaleX = loadFloat(item + 4 * 4), scaleY = loadFloat(item + 9 * 4), translate = loadFloat(item + 16 * 4);
+        float left = translate + std::min(lowX * scaleX, highX * scaleX), right = translate + std::max(lowX * scaleX, highX * scaleX);
+        float height = std::abs(highY - lowY) * std::abs(scaleY);
+        bool reachesLeft = left <= 1.0f, reachesRight = right >= 1279.0f;
+        if (right > left)
+        {
+            if (right - left >= 1180.0f || ((reachesLeft || reachesRight) && right - left >= 400.0f && height >= 300.0f))
+            {
+                // A background (dimming and vignettes come in halves): as wide as the screen stays so.
+                scale = 1.0f;
+                offset = 0.0f;
+            }
+            else if (reachesLeft != reachesRight)
+            {
+                // A strip from the edge of the screen goes on reaching it, its other end where the UI is.
+                float newLeft = reachesLeft ? left : 640.0f + (left - 640.0f) / wider;
+                float newRight = reachesRight ? right : 640.0f + (right - 640.0f) / wider;
+                scale = (newRight - newLeft) / (right - left);
+                offset = newLeft - scale * left;
+            }
+        }
+    }
+    DrawUiItem(ctx, base, scale, offset, __imp__sub_8280FA08);
+}
+
+// Builds a camera's projection (f1 the field of view, f2 the shape, from the screen's size). A wider shape for a wider view.
+static std::atomic<int64_t> g_cameraBuiltTime{ -100000 };
+
+static int64_t NowMilliseconds()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+float gpu::UltrawideFactor()
+{
+    float setting = gpu::UltrawideSetting();
+    return setting != 1.0f && NowMilliseconds() - g_cameraBuiltTime.load() < 300 ? setting : 1.0f;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82703DF8);
+PPC_FUNC(sub_82703DF8)
+{
+    if (std::abs(float(ctx.f2.f64) - 16.0f / 9.0f) < 0.01f)
+    {
+        g_cameraBuiltTime = NowMilliseconds();
+        ctx.f2.f64 = double(float(ctx.f2.f64) * gpu::UltrawideSetting());
+    }
+    __imp__sub_82703DF8(ctx, base);
+}
 static bool OptionsSprite(PPCContext& __restrict ctx, uint8_t* base, int64_t frame)
 {
     if (!kbm::OptionsLayoutActive())
@@ -587,7 +695,7 @@ static bool OptionsSprite(PPCContext& __restrict ctx, uint8_t* base, int64_t fra
             setFloat(item + 17 * 4, centerY);
             setFloat(item + 4 * 4, scale);
             ctx.r3.u64 = item;
-            __imp__sub_8280FA08(ctx, base);
+            DrawUiSprite(ctx, base);
         };
     static int64_t backgroundFrame = -1, highlightFrame = -1;
     if (background)
@@ -595,7 +703,7 @@ static bool OptionsSprite(PPCContext& __restrict ctx, uint8_t* base, int64_t fra
         if (backgroundFrame == frame)
             return true;
         backgroundFrame = frame;
-        __imp__sub_8280FA08(ctx, base);
+        DrawUiSprite(ctx, base);
         for (int i = 0; i < 4; i++)
         {
             bool opened = mouseOpen && extra == i;
@@ -619,7 +727,7 @@ static bool OptionsSprite(PPCContext& __restrict ctx, uint8_t* base, int64_t fra
     if (highlightFrame == frame)
         return true;
     highlightFrame = frame;
-    __imp__sub_8280FA08(ctx, base);
+    DrawUiSprite(ctx, base);
     for (int i = 0; i < 4; i++)
     {
         float grown = kbm::OptionsExtraHighlight(i);
@@ -730,7 +838,7 @@ PPC_FUNC(sub_8280FA08)
         }
     }
     if (OptionsSprite(ctx, base, frame))
-        __imp__sub_8280FA08(ctx, base);
+        DrawUiSprite(ctx, base);
 }
 
 // A UI text item's draw (r3 = item). Diagnostics: dumped with the sprites.
@@ -762,7 +870,8 @@ PPC_FUNC(sub_82B7E680)
     }
     if (!OptionsText(ctx.r3.u32, base))
         return;
-    __imp__sub_82B7E680(ctx, base);
+    float wider = gpu::UltrawideFactor();
+    DrawUiItem(ctx, base, 1.0f / wider, 640.0f - 640.0f / wider, __imp__sub_82B7E680);
 }
 
 void WatchGuestWords(const std::vector<uint32_t>& addresses, bool reads = false);

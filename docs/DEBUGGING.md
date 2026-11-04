@@ -9,7 +9,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 |---|---|
 | `--game <iso or folder>` | Game files |
 | `--xex`, `--user` | Executable and user data folder overrides |
-| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing N`, `--shadows on\|off` | Video settings (what the launcher passes) |
+| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--sharpen 0-3`, `--ultrawide`, `--vsync`, `--shadows on\|off` | Video settings (what the launcher passes) |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
 
@@ -129,6 +129,8 @@ connected controller.
 screenshots/<name>.bmp, needs no `--screenshots`), `scan`, `scanwatch`, and `find new|changed|same|list`, `find watch <addresses>`
 (writers, for 120 updates), `find readwatch <addresses>` (readers too) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
 frame rate, but walking to a place by timing alone isn't reliable. A connected controller still works alongside it.
+
+`AR_FRAME_TRACE=<file>` writes small copies of the final picture and the resolves to `AR_FRAME_TRACE_BASES` (hex) every frame without waiting on the GPU (`AR_FRAME_TRACE_FROM`, `_FRAMES`, `_STEP`; `_LIST` logs what resolves there are); `tools/test/frametrace.py` reads them. They're about 1 MB a frame at step 2, so keep the range short. `AR_SHADOW_RECEIVER_CONSTANTS=<first>,<count>;...` logs float constants at each frame's first draw that samples the shadow maps (RC lines). `find poke <address> <hex>` sets a word before every update.
 
 `AR_KBM=1 AR_KBM_TEST=1` tests the keyboard and mouse without real input, so nothing can land in another window: `key <vk> <0|1>`, `cursor <x> <y>` (on the 1280 x 720 picture) and `mouse <dx> <dy>` lines go to the remote file, and the game acts as if it were in front. Run it in a folder of its own with a copy of `user/` to leave saves and settings alone. `AR_LOG_CAMERA` logs which code sets where the camera looks, as it changes. `AR_LOG_RESULTS` logs the result screens' steps with the time each took; `AR_NO_RESULT_STEP_FIX` and `AR_VIEWER_ZOOM_SPEED` (1 is the original's, default 0.2), `AR_VIEWER_MOUSE_SPEED` go with those fixes.
 

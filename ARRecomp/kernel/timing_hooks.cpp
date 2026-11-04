@@ -305,6 +305,8 @@ void RequestFind(const std::string& request)
     g_findRequests.push_back(request);
 }
 
+static std::mutex g_pokeMutex;
+static std::map<uint32_t, uint32_t> g_pokes;
 static std::vector<std::pair<uint32_t, uint32_t>> g_intCandidates;
 static bool g_intFresh;
 
@@ -515,6 +517,20 @@ static void RunFind(uint8_t* base)
     {
         for (size_t i = 0; i < g_intCandidates.size() && i < 60; i++)
             LOGF_INFO("FINDINT {:08X} = {}", g_intCandidates[i].first, PPC_LOAD_U32(g_intCandidates[i].first));
+        return;
+    }
+    if (request.rfind("poke ", 0) == 0)
+    {
+        // "find poke <address> <hex word>": that word is set before every update from now on ("find poke <address> off" stops it). Testing only.
+        char word[32] = {};
+        unsigned address = 0;
+        sscanf(request.c_str() + 5, "%x %31s", &address, word);
+        std::lock_guard lock(g_pokeMutex);
+        if (strcmp(word, "off") == 0)
+            g_pokes.erase(address);
+        else
+            g_pokes[address] = uint32_t(strtoul(word, nullptr, 16));
+        LOGF_INFO("POKE {:08X} {}", address, word);
         return;
     }
     if (request == "uidump")
@@ -1058,6 +1074,12 @@ PPC_FUNC(sub_82BD7EC8)
         uint32_t bits;
         memcpy(&bits, &minimum, 4);
         PPC_STORE_U32(0x820A4130 + 2176, bits);
+    }
+
+    {
+        std::lock_guard lock(g_pokeMutex);
+        for (auto [address, value] : g_pokes)
+            PPC_STORE_U32(address, value);
     }
 
     __imp__sub_82BD7EC8(ctx, base);

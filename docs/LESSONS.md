@@ -130,6 +130,9 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   CPU use before benchmarking.
 - Dumps are big: always limit them (`AR_DUMP_ONLY`, `AR_DUMP_FRAME/FRAMES`) and clear old ones. They filled a disk once.
 - To find which code uses an input, watch who reads it: the stick values are floats at 0x832151D0 + 16 to + 28 (pad 0), and `find readwatch` on them named the class that copies them for the screen showing. From there the copy's offsets lead to the code that acts on them. Searching for the camera's values had found only UI text.
+- To tell a shadow really changing from the camera moving, reproject: map each pixel to where its world point was on the previous frame, with the game's own matrices, and compare there. Filtering on "depth didn't change" hides whatever characters do, and counts on a downsampled mask hide fine patterns. Plot the rate per distance from the camera: planes at fixed distances then stand out by a factor of hundreds.
+- A clean test needs a positive control. `AR_DEPTH_ONLY_PS=1` brings the old flicker back; that the measure saw it (10x as many shadows going lit for a frame, at 120 fps) is what made its "nothing else" mean something. And repeat before believing a change: one band read 2.1 before and 8.9 after, then 6.2 and 50 before, 6.1 and 5.8 after. A fight makes those numbers noisy.
+- Compare at equal frame rates. Render scale 2 looked 14x worse until both ran at 30 fps: it had only been running at half the frame rate.
 - A `shot` is taken before the overlay is drawn, so anything added by `kbm::GetOverlay` is missing from it (rows looked gone that weren't). `PrintWindow` with full content (flag 3) gets the window as shown, even behind other windows.
 - To find what runs too fast at high frame rates, scan memory for values that change by exactly 1 per update at
   120 fps (`AR_SCAN_TIMERS=@<seconds>`): anything following the time step changes by 0.25-0.5 there, and the scan's
@@ -197,6 +200,9 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   casters export no coordinates, so one texel of whichever texture the last cut-out caster bound decided all or nothing for
   the whole draw. Draw order changes per frame, so buildings dropped out for single frames. `AR_DEPTH_ONLY_PS` restores it.
   Large one frame changes of the far cascade: 26 and 19 per run before, 3, 0 and 0 after.
+- Shadows popping as the camera moves (November 2026): after the flicker above was fixed, what was left came from two planes at fixed distances from the camera, in the shadow mask's shader (47A3CAD5..., resolved to 0x0E75F000 first, alpha; the second resolve there each frame is object motion). It stops shadowing at view depth c186.w = 100 all at once, and turning the camera sweeps that plane through the world: 358-458 flips per 10000 pixels per frame at 98-102 units against about 1 elsewhere that far out, whole towers at a time. `FadeShadowsAtTheirEnd` (`gpu/renderer.cpp`) fades over the last fifth instead: 0, 0, 0. And the bias per cascade (c185.x for the middle one, z for near and far) differs by a factor of 3.5, so surfaces change at the near/middle switch at 10 units: 10-21 there, 1.2-1.9 with them equal, with a clean dose response (9.2, 4.5, 0.22 for 0.00078, 0.0016, 0.00273). Off with `AR_NO_SHADOW_FADE`, `AR_NO_SHADOW_BIAS_MATCH`.
+- Ruled out for that with measurements, so don't chase them again: the receiver's matrices lagging the casters' (4500 of 4500 the same frame), cascades moving by fractions of a texel (they snap to whole ones; the scale steps on about 7% of frames while moving, with no spike in changes), render scale (at equal frame rates 2x is no worse), polygon offset (the title turns it off for its casters; now implemented anyway, `AR_NO_POLY_OFFSET`). The light is fixed and the far cascade is fine.
+- What's left is near the characters (92% of the flips, within 8 units), mostly their shadows really moving. Characters moving can't be told from flicker there by this measure.
 - D3D's `IDirect3DQuery9::GetData` is `sub_8223F950` (device fence progress at device + 11036, completed value at
   *(device + 11024)); the title's QueryPerformanceCounter is `sub_8245B458`.
 - Effects pass depth is restored by drawing saved depth words as colour at EDRAM 0x5B7; the shadow map depth buffer is
@@ -231,6 +237,15 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   Options) is the description's text id.
 - Testing: `AR_AUTO_SEQUENCE` drives the menus (see `tools/test/common.sh`); Training > Practice has no enemies.
 
+## Graphics options (launcher, all off by default)
+
+- Ultrawide: `sub_82BB8AB0` makes a camera's aspect from two screen size integers and passes it to `sub_82703DF8`, which builds the projection, so changing it there widens the view, and the frustum and every shader that reconstructs positions follow. The 13 copies of 16:9 found in memory aren't what it reads. The render targets stay 16:9 and are shown wider, so horizontal detail is spread out: use a higher internal resolution with it.
+- The UI goes through the same sprite and text draws, so narrowing their x (`DrawUiItem`) puts it in the right shape in the middle 16:9. Whole-width items and big pieces reaching an edge (dimming comes in halves) stay wide; strips from an edge stay anchored to it. Movies have no camera, so while `sub_82703DF8` hasn't run for 300 ms the picture is plain 16:9 with bars.
+- Not corrected: markers placed from a 3D position (lock-on, name tags) are computed in the widened picture and then narrowed with the rest, so they may sit off their targets away from the middle. Not checked in play.
+- FXAA and sharpening are in the present shader, after the title has drawn its HUD, so they touch the HUD too; the overlay is drawn afterwards. Anisotropic filtering and the texture detail bias apply to samplers that are linear and have mips, which leaves the UI and shadow maps alone.
+- DLSS needs depth, motion vectors and jitter. The title's motion buffer (second resolve of 0x0E75F000) only has objects; camera motion would have to come from depth and matrices, as `tools`-style reprojection does. It also needs splitting the picture before the HUD. DLSS 5 reportedly wants an RTX 50.
+- Ray traced shadows: 292 caster draws, about 290000 triangles per frame, so the size is fine. The blocker is getting world positions from the title's vertex shaders: stream output (`AR_SHADOW_SO`) still captures 0 vertices, and the debug layer says nothing about why. Cut-out casters (mesh grates) would also need their alpha in the rays.
+
 ## Open issues
 
 - Short bursts (about 2 s) where the GPU thread is uniformly ~4x slower, mostly with other games running.
@@ -238,4 +253,4 @@ show where time goes; idle time in the GPU thread means the title is the bottlen
   thread is saturated, and the title's render thread is close behind).
 - Angular light patches around characters in tiled deferred lighting (pixel shader E9891C vs 57FBD2), possibly a
   translation bug; thin vertical ticks under ledge edges in the Foundry.
-- Anti-aliasing is a placeholder in the launcher.
+- Bright washed-out frames while fighting or facing the sun: not looked into, may be the title's own bloom and hit flashes.

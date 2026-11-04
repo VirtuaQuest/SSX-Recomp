@@ -32,8 +32,15 @@ namespace
     constexpr const wchar_t* DISPLAY_ARGS[] = { L"windowed", L"borderless", L"fullscreen" };
     constexpr int FRAME_RATES[] = { 30, 60, 120 };
     constexpr const wchar_t* FRAME_RATE_LABELS[] = { L"30 FPS (original)", L"60 FPS (experimental)", L"120 FPS (experimental)" };
-    constexpr const wchar_t* SCALE_LABELS[] = { L"1x (1280 x 720, original)", L"2x (2560 x 1440)", L"3x (3840 x 2160)" };
-    constexpr const wchar_t* AA_LABELS[] = { L"Off", L"2x MSAA (not implemented yet)", L"4x MSAA (not implemented yet)" };
+    constexpr const wchar_t* SCALE_LABELS[] = { L"1x (1280 x 720, original)", L"2x (2560 x 1440)", L"3x (3840 x 2160)", L"4x (5120 x 2880)" };
+    constexpr const wchar_t* AA_LABELS[] = { L"Off", L"FXAA" };
+    constexpr const wchar_t* ANISOTROPIC_LABELS[] = { L"As the game asks (original)", L"2x", L"4x", L"8x", L"16x" };
+    constexpr const wchar_t* ANISOTROPIC_VALUES[] = { L"0", L"2", L"4", L"8", L"16" };
+    constexpr const wchar_t* TEXTURE_LABELS[] = { L"Original", L"High", L"Ultra (may shimmer)" };
+    constexpr const wchar_t* TEXTURE_VALUES[] = { L"0", L"-0.5", L"-1" };
+    constexpr const wchar_t* SHARPEN_LABELS[] = { L"Off", L"Low", L"Medium", L"High" };
+    constexpr const wchar_t* ULTRAWIDE_LABELS[] = { L"Off (16:9 with bars)", L"Wider view on ultrawide resolutions" };
+    constexpr const wchar_t* VSYNC_LABELS[] = { L"Off", L"On" };
     constexpr const wchar_t* SHADOW_LABELS[] = { L"On", L"Off" };
     constexpr const wchar_t* MOUSE_LABELS[] = { L"Low", L"Medium", L"High", L"Very high" };
     constexpr const wchar_t* MOUSE_VALUES[] = { L"0.5", L"1", L"2", L"4" };
@@ -45,6 +52,11 @@ namespace
         ID_DISPLAY,
         ID_FPS,
         ID_AA,
+        ID_ANISOTROPIC,
+        ID_TEXTURES,
+        ID_SHARPEN,
+        ID_ULTRAWIDE,
+        ID_VSYNC,
         ID_SCALE,
         ID_SHADOWS,
         ID_MOUSE,
@@ -54,7 +66,7 @@ namespace
         ID_LAUNCH,
     };
 
-    HWND g_resolution, g_display, g_fps, g_aa, g_scale, g_shadows, g_mouse, g_invert, g_gamePath;
+    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath;
     HFONT g_font;
     std::wstring g_folder, g_iniPath;
 
@@ -122,6 +134,11 @@ namespace
         int display = int(SendMessageW(g_display, CB_GETCURSEL, 0, 0));
         int fps = int(SendMessageW(g_fps, CB_GETCURSEL, 0, 0));
         int aa = int(SendMessageW(g_aa, CB_GETCURSEL, 0, 0));
+        int anisotropic = int(SendMessageW(g_anisotropic, CB_GETCURSEL, 0, 0));
+        int textures = int(SendMessageW(g_textures, CB_GETCURSEL, 0, 0));
+        int sharpen = int(SendMessageW(g_sharpen, CB_GETCURSEL, 0, 0));
+        int ultrawide = int(SendMessageW(g_ultrawide, CB_GETCURSEL, 0, 0));
+        int vsync = int(SendMessageW(g_vsync, CB_GETCURSEL, 0, 0));
         int scale = int(SendMessageW(g_scale, CB_GETCURSEL, 0, 0));
         int shadows = int(SendMessageW(g_shadows, CB_GETCURSEL, 0, 0));
         int mouse = int(SendMessageW(g_mouse, CB_GETCURSEL, 0, 0));
@@ -138,6 +155,11 @@ namespace
         WriteSetting(L"Display", std::to_wstring(display));
         WriteSetting(L"FrameRate", std::to_wstring(fps));
         WriteSetting(L"AntiAliasing", std::to_wstring(aa));
+        WriteSetting(L"Anisotropic", std::to_wstring(anisotropic));
+        WriteSetting(L"TextureDetail", std::to_wstring(textures));
+        WriteSetting(L"Sharpen", std::to_wstring(sharpen));
+        WriteSetting(L"Ultrawide", std::to_wstring(ultrawide));
+        WriteSetting(L"VSync", std::to_wstring(vsync));
         WriteSetting(L"RenderScale", std::to_wstring(scale));
         WriteSetting(L"Shadows", std::to_wstring(shadows));
         WriteSetting(L"MouseSensitivity", std::to_wstring(mouse));
@@ -148,7 +170,9 @@ namespace
         std::wstring exe = g_folder + L"\\ARRecomp.exe";
         std::wstring command = L"\"" + exe + L"\" --game \"" + gamePath + L"\" --resolution " + std::to_wstring(r.width) + L"x" +
             std::to_wstring(r.height) + L" --display " + DISPLAY_ARGS[display] + L" --fps " + std::to_wstring(FRAME_RATES[fps]) +
-            L" --antialiasing " + std::to_wstring(aa == 0 ? 0 : 1 << aa) + L" --render-scale " + std::to_wstring(scale + 1) +
+            L" --antialiasing " + std::to_wstring(aa) + L" --anisotropic " + ANISOTROPIC_VALUES[anisotropic] + L" --texture-lod-bias " + TEXTURE_VALUES[textures] +
+            L" --sharpen " + std::to_wstring(sharpen) + (ultrawide == 1 ? L" --ultrawide" : L"") + (vsync == 1 ? L" --vsync" : L"") +
+            L" --render-scale " + std::to_wstring(scale + 1) +
             L" --shadows " + (shadows == 0 ? L"on" : L"off") + L" --mouse-sensitivity " + MOUSE_VALUES[mouse] +
             (invert == 1 ? L" --invert-mouse" : L"");
 
@@ -209,8 +233,22 @@ namespace
                 ReadIndex(L"InvertMouse", int(std::size(INVERT_LABELS))));
             y += 40;
             AddLabel(window, L"Anti-aliasing", labelX, y, 120);
-            g_aa = AddCombo(window, ID_AA, controlX, y, width, AA_LABELS, std::size(AA_LABELS), 0);
-            EnableWindow(g_aa, FALSE);
+            g_aa = AddCombo(window, ID_AA, controlX, y, width, AA_LABELS, std::size(AA_LABELS), ReadIndex(L"AntiAliasing", int(std::size(AA_LABELS))));
+            y += 40;
+            AddLabel(window, L"Anisotropic filtering", labelX, y, 125);
+            g_anisotropic = AddCombo(window, ID_ANISOTROPIC, controlX, y, width, ANISOTROPIC_LABELS, std::size(ANISOTROPIC_LABELS), ReadIndex(L"Anisotropic", int(std::size(ANISOTROPIC_LABELS))));
+            y += 40;
+            AddLabel(window, L"Texture detail", labelX, y, 120);
+            g_textures = AddCombo(window, ID_TEXTURES, controlX, y, width, TEXTURE_LABELS, std::size(TEXTURE_LABELS), ReadIndex(L"TextureDetail", int(std::size(TEXTURE_LABELS))));
+            y += 40;
+            AddLabel(window, L"Sharpening", labelX, y, 120);
+            g_sharpen = AddCombo(window, ID_SHARPEN, controlX, y, width, SHARPEN_LABELS, std::size(SHARPEN_LABELS), ReadIndex(L"Sharpen", int(std::size(SHARPEN_LABELS))));
+            y += 40;
+            AddLabel(window, L"Ultrawide", labelX, y, 120);
+            g_ultrawide = AddCombo(window, ID_ULTRAWIDE, controlX, y, width, ULTRAWIDE_LABELS, std::size(ULTRAWIDE_LABELS), ReadIndex(L"Ultrawide", int(std::size(ULTRAWIDE_LABELS))));
+            y += 40;
+            AddLabel(window, L"V-Sync", labelX, y, 120);
+            g_vsync = AddCombo(window, ID_VSYNC, controlX, y, width, VSYNC_LABELS, std::size(VSYNC_LABELS), ReadIndex(L"VSync", int(std::size(VSYNC_LABELS))));
             y += 50;
 
             AddLabel(window, L"Game image", labelX, y, 120);
@@ -267,7 +305,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.lpszClassName = L"ARLauncher";
     RegisterClassExW(&windowClass);
 
-    RECT rect{ 0, 0, 480, 490 };
+    RECT rect{ 0, 0, 480, 690 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,
