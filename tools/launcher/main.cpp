@@ -1,11 +1,12 @@
 // Launcher: a window to choose display options, which then starts ARRecomp.exe with them. The choices (and the
-// game image path) are kept in launcher.ini next to the launcher.
+// game image path) are kept in launcher.ini next to the launcher, with paths relative to it.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -86,6 +87,30 @@ namespace
         return buffer;
     }
 
+    // Paths in launcher.ini are relative to the launcher's folder, so the file works wherever the folders are on a PC. A path on another drive can't be
+    // relative and stays absolute. Absolute paths are still read, and saved as relative ones at the next launch.
+    std::wstring ToAbsolute(const std::wstring& path)
+    {
+        return path.empty() ? path : (std::filesystem::path(g_folder) / path).lexically_normal().wstring();
+    }
+
+    std::wstring ToRelative(const std::wstring& path)
+    {
+        if (path.empty())
+            return path;
+        std::filesystem::path relative = std::filesystem::path(ToAbsolute(path)).lexically_relative(g_folder);
+        return relative.empty() ? path : relative.wstring();
+    }
+
+    // The game keeps its saves and caches in "user" next to where it runs: the folder set in launcher.ini (WorkingFolder), or the launcher's own if
+    // that isn't on this PC.
+    std::wstring WorkingFolder()
+    {
+        std::wstring folder = ToAbsolute(ReadSetting(L"WorkingFolder", L"."));
+        DWORD attributes = GetFileAttributesW(folder.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) ? folder : g_folder;
+    }
+
     int ReadIndex(const wchar_t* key, int count, int fallback = 0)
     {
         int value = GetPrivateProfileIntW(L"Launcher", key, fallback, g_iniPath.c_str());
@@ -126,15 +151,15 @@ namespace
     void Browse(HWND window)
     {
         wchar_t path[MAX_PATH * 2] = {};
-        wcsncpy_s(path, GetText(g_gamePath).c_str(), _TRUNCATE);
+        wcsncpy_s(path, ToAbsolute(GetText(g_gamePath)).c_str(), _TRUNCATE);
         OPENFILENAMEW dialog{ sizeof(dialog) };
         dialog.hwndOwner = window;
         dialog.lpstrFilter = L"Xbox 360 disc image (*.iso)\0*.iso\0All files\0*.*\0";
         dialog.lpstrFile = path;
         dialog.nMaxFile = DWORD(std::size(path));
-        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetOpenFileNameW(&dialog))
-            SetWindowTextW(g_gamePath, path);
+            SetWindowTextW(g_gamePath, ToRelative(path).c_str());
     }
 
     void Launch(HWND window)
@@ -153,7 +178,7 @@ namespace
         int shadows = int(SendMessageW(g_shadows, CB_GETCURSEL, 0, 0));
         int mouse = int(SendMessageW(g_mouse, CB_GETCURSEL, 0, 0));
         int invert = int(SendMessageW(g_invert, CB_GETCURSEL, 0, 0));
-        std::wstring gamePath = GetText(g_gamePath);
+        std::wstring gamePath = ToAbsolute(GetText(g_gamePath));
         int online = int(SendMessageW(g_online, CB_GETCURSEL, 0, 0));
         int controller = int(SendMessageW(g_controller, CB_GETCURSEL, 0, 0));
         std::wstring onlinePeer = GetText(g_onlinePeer), playerName = GetText(g_playerName);
@@ -178,7 +203,7 @@ namespace
         WriteSetting(L"Shadows", std::to_wstring(shadows));
         WriteSetting(L"MouseSensitivity", std::to_wstring(mouse));
         WriteSetting(L"InvertMouse", std::to_wstring(invert));
-        WriteSetting(L"Game", gamePath);
+        WriteSetting(L"Game", ToRelative(gamePath));
         WriteSetting(L"Online", std::to_wstring(online));
         WriteSetting(L"Controller", std::to_wstring(controller));
         WriteSetting(L"OnlinePeer", onlinePeer);
@@ -204,9 +229,9 @@ namespace
                 command += L" --player-name \"" + playerName + L"\"";
         }
 
-        // The game keeps its saves and caches in "user" next to where it runs: the folder set in launcher.ini
-        // (WorkingFolder), or the launcher's own.
-        std::wstring workingFolder = ReadSetting(L"WorkingFolder", g_folder.c_str());
+        std::wstring workingFolder = WorkingFolder();
+        if (workingFolder != g_folder) // Otherwise the setting is left alone: it may be a drive that's only away for now.
+            WriteSetting(L"WorkingFolder", ToRelative(workingFolder));
 
         STARTUPINFOW startup{ sizeof(startup) };
         PROCESS_INFORMATION process{};
@@ -301,7 +326,7 @@ namespace
             y += 10;
 
             AddLabel(window, L"Game image", labelX, y, 120);
-            g_gamePath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ReadSetting(L"Game", L"").c_str(),
+            g_gamePath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ToRelative(ReadSetting(L"Game", L"")).c_str(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, controlX, y, width - 80, 24, window,
                 HMENU(INT_PTR(ID_GAME_PATH)), nullptr, nullptr);
             SendMessageW(g_gamePath, WM_SETFONT, WPARAM(g_font), TRUE);
@@ -353,7 +378,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.hbrBackground = HBRUSH(COLOR_BTNFACE + 1);
     windowClass.lpszClassName = L"ARLauncher";
     // The icon the game cut from its own logo the first time it ran, if it has.
-    std::wstring iconPath = ReadSetting(L"WorkingFolder", g_folder.c_str()) + L"\\user\\game_icon.ico";
+    std::wstring iconPath = WorkingFolder() + L"\\user\\game_icon.ico";
     windowClass.hIcon = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
     windowClass.hIconSm = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
     RegisterClassExW(&windowClass);

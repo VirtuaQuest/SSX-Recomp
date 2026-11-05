@@ -24,7 +24,8 @@ things are the way they are) and `docs/DEBUGGING.md` for the switches and test s
   `C:\Downloads\Repos\_tools\llvm`), VS 2022 Build Tools, RelWithDebInfo, into `out\build`. DXC comes from the
   Windows SDK and is copied next to the exe.
 - Run from `run\`: `..\out\build\ARRecomp\ARRecomp.exe --game "C:\Downloads\Repos\Anarchy Reigns\Anarchy Reigns.iso"`,
-  or `out\build\ARRecomp\ARLauncher.exe` (settings in `launcher.ini` next to it).
+  or `out\build\ARRecomp\ARLauncher.exe` (settings in `launcher.ini` next to it, with paths relative to it; the defaults in `tools/launcher/launcher.ini` are
+  copied there only if it has none).
 - If the exe is locked because the game is running, rename it (`ARRecomp.running.exe`) instead of closing the game.
 
 ## Working rules
