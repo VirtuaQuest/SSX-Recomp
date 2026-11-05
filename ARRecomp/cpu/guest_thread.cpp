@@ -265,9 +265,9 @@ void DumpGuestThreads()
             thread->finished ? " (finished)" : "", cpuSeconds, last != nullptr ? last : "-", thread->lastImportCaller.load(),
             waiting != 0 ? fmt::format(", waiting on 0x{:08X}", waiting) : "");
 
-        // Threads that are running guest code: show where.
-        if (!thread->finished && waiting == 0)
-            PrintThreadStack(thread->hostThread, 12);
+        // Threads that are running guest code: show where. AR_DUMP_THREADS_FILE: all of them, as a stopped game is usually waiting.
+        if (!thread->finished && (waiting == 0 || AR_ENV("AR_DUMP_THREADS_FILE")))
+            PrintThreadStack(thread->hostThread, 26);
     }
 }
 

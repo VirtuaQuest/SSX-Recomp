@@ -1,5 +1,6 @@
 #include <stdafx.h>
 #include <gpu/video_settings.h>
+#include <kernel/function.h>
 #include <kernel/memory.h>
 #include "command_processor.h"
 #include <unordered_set>
@@ -1032,6 +1033,56 @@ PPC_FUNC(sub_8280FA08)
         DrawUiSprite(ctx, base);
 }
 
+// Multiplayer's first menu: Ranked Match, Player Match, Private Match, Leaderboards. There's no Xbox Live service for ranks or leaderboards here, so those two are greyed out
+// and the selection goes past them. AR_KEEP_RANKED_MENU: as on the console.
+static constexpr uint32_t ONLINE_MENU_STATE = 9, ROW_RANKED = 0, ROW_PLAYER = 1, ROW_PRIVATE = 2, ROW_LEADERBOARDS = 3;
+static constexpr float ONLINE_MENU_RANKED_Y = 241.0f, ONLINE_MENU_LEADERBOARDS_Y = 349.0f, ONLINE_MENU_TEXT_X = 1187.0f;
+static constexpr uint32_t DIM_ALPHA = 0x3E99999A; // 0.3, as the title draws the menu it came from.
+static std::atomic<int64_t> g_onlineMenuFrame{ -100 };
+
+static bool KeepRankedMenu()
+{
+    static const bool keep = AR_ENV("AR_KEEP_RANKED_MENU") != nullptr;
+    return keep;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82E2FA18);
+PPC_FUNC(sub_82E2FA18)
+{
+    uint32_t menu = ctx.r3.u32;
+    __imp__sub_82E2FA18(ctx, base);
+    if (KeepRankedMenu() || PPC_LOAD_U32(menu + 316) != ONLINE_MENU_STATE)
+        return;
+    g_onlineMenuFrame = gpu::SubmittedSwaps();
+
+    static uint32_t before = ROW_PLAYER;
+    uint32_t row = PPC_LOAD_U32(menu + 336);
+    if (row == ROW_RANKED || row == ROW_LEADERBOARDS)
+    {
+        // On from where it was, in the direction it was going; there are only two rows left, and it wraps.
+        uint32_t next = row == ROW_RANKED ? (before == ROW_PLAYER ? ROW_PRIVATE : ROW_PLAYER) : (before == ROW_PRIVATE ? ROW_PLAYER : ROW_PRIVATE);
+        PPC_STORE_U32(menu + 336, next);
+        // What the menu calls after moving, for the highlight.
+        uint32_t owner = PPC_LOAD_U32(menu + 204);
+        uint32_t list = PPC_LOAD_U32(owner + (uint32_t(int8_t(PPC_LOAD_U8(owner + 216))) + 49) * 4);
+        if (list != 0 && int32_t(PPC_LOAD_U32(list + 204)) > int32_t(next))
+            GuestToHostFunction<void>(0x827B0F88, list, next);
+        row = next;
+    }
+    before = row;
+}
+
+static bool OnlineMenuRowToDim(uint32_t item, uint8_t* base)
+{
+    if (gpu::SubmittedSwaps() - g_onlineMenuFrame.load(std::memory_order_relaxed) > 4)
+        return false;
+    uint32_t xBits = PPC_LOAD_U32(item + 16 * 4), yBits = PPC_LOAD_U32(item + 17 * 4);
+    float x, y;
+    memcpy(&x, &xBits, 4);
+    memcpy(&y, &yBits, 4);
+    return std::abs(x - ONLINE_MENU_TEXT_X) < 40.0f && (std::abs(y - ONLINE_MENU_RANKED_Y) < 3.0f || std::abs(y - ONLINE_MENU_LEADERBOARDS_Y) < 3.0f);
+}
+
 // A UI text item's draw (r3 = item). Diagnostics: dumped with the sprites.
 PPC_FUNC_IMPL(__imp__sub_82B7E680);
 PPC_FUNC(sub_82B7E680)
@@ -1095,8 +1146,15 @@ PPC_FUNC(sub_82B7E680)
     }
     if (!OptionsText(ctx.r3.u32, base))
         return;
+    uint32_t textItem = ctx.r3.u32;
+    bool dim = OnlineMenuRowToDim(textItem, base);
+    uint32_t alphaBefore = PPC_LOAD_U32(textItem + 25 * 4);
+    if (dim)
+        PPC_STORE_U32(textItem + 25 * 4, DIM_ALPHA);
     float wider = gpu::UltrawideFactor();
     DrawUiItem(ctx, base, 1.0f / wider, 640.0f - 640.0f / wider, __imp__sub_82B7E680);
+    if (dim)
+        PPC_STORE_U32(textItem + 25 * 4, alphaBefore);
 }
 
 void WatchGuestWords(const std::vector<uint32_t>& addresses, bool reads = false);

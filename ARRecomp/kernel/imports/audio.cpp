@@ -22,9 +22,19 @@ constexpr uint32_t MAX_QUEUED_FRAMES = 4;
 // Buffers in flight are taken from a ring larger than the queue, so a buffer is never reused while queued.
 constexpr uint32_t BUFFER_RING_SIZE = 16;
 
-static std::atomic<uint32_t> g_clientCallback;
-// The callback receives the address of a guest word holding the client's context, not the context itself.
-static std::atomic<uint32_t> g_clientContext;
+// The title can have more than one audio engine at a time: multiplayer starts a second for voices, and each registers as a client. Every one needs its ticks, or
+// its voices never finish stopping and scene shutdown waits for them forever. What they hand back is mixed.
+constexpr uint32_t MAX_CLIENTS = 8;
+constexpr uint32_t DRIVER_HANDLE = 0x41550000;
+
+struct AudioClient
+{
+    std::atomic<uint32_t> callback;
+    // The callback receives the address of a guest word holding the client's context, not the context itself.
+    std::atomic<uint32_t> context;
+};
+
+static AudioClient g_clients[MAX_CLIENTS];
 
 class AudioOutput : public IXAudio2VoiceCallback
 {
@@ -72,12 +82,12 @@ public:
     }
 
     // Downmix weights per source channel (front left/right, center, LFE, back left/right), as in Unleashed Recompiled.
-    void Submit(const be<float>* samples)
+    void Add(const be<float>* samples)
     {
-        auto& buffer = m_buffers[m_nextBuffer];
-        m_nextBuffer = (m_nextBuffer + 1) % BUFFER_RING_SIZE;
-        bool skipping = kbm::MovieSkipping();
-
+        std::lock_guard lock(m_mixMutex);
+        if (!m_mixUsed)
+            m_mix.fill(0.0f);
+        m_mixUsed = true;
         for (uint32_t i = 0; i < AUDIO_FRAME_SAMPLES; i++)
         {
             float frontLeft = samples[0 * AUDIO_FRAME_SAMPLES + i];
@@ -85,11 +95,29 @@ public:
             float center = samples[2 * AUDIO_FRAME_SAMPLES + i];
             float backLeft = samples[4 * AUDIO_FRAME_SAMPLES + i];
             float backRight = samples[5 * AUDIO_FRAME_SAMPLES + i];
+            m_mix[i * 2 + 0] += frontLeft + center * 0.75f + backLeft;
+            m_mix[i * 2 + 1] += frontRight + center * 0.75f + backRight;
+        }
+    }
 
+    // What the clients handed back since the last time, to the device. False if they haven't handed back anything.
+    bool Send()
+    {
+        std::lock_guard lock(m_mixMutex);
+        if (!m_mixUsed)
+            return false;
+        m_mixUsed = false;
+
+        auto& buffer = m_buffers[m_nextBuffer];
+        m_nextBuffer = (m_nextBuffer + 1) % BUFFER_RING_SIZE;
+        bool skipping = kbm::MovieSkipping();
+
+        for (uint32_t i = 0; i < AUDIO_FRAME_SAMPLES; i++)
+        {
             // Going quiet quickly while a cutscene is being skipped.
             m_gain = skipping ? std::max(m_gain - 1.0f / (AUDIO_SAMPLE_RATE * 0.15f), 0.0f) : std::min(m_gain + 1.0f / (AUDIO_SAMPLE_RATE * 0.05f), 1.0f);
-            buffer[i * 2 + 0] = (frontLeft + center * 0.75f + backLeft) * m_gain;
-            buffer[i * 2 + 1] = (frontRight + center * 0.75f + backRight) * m_gain;
+            buffer[i * 2 + 0] = m_mix[i * 2 + 0] * m_gain;
+            buffer[i * 2 + 1] = m_mix[i * 2 + 1] * m_gain;
             m_peak = std::max({ m_peak, std::abs(buffer[i * 2 + 0]), std::abs(buffer[i * 2 + 1]) });
         }
 
@@ -104,6 +132,7 @@ public:
         submission.AudioBytes = sizeof(buffer);
         submission.pAudioData = reinterpret_cast<const BYTE*>(buffer.data());
         m_source->SubmitSourceBuffer(&submission);
+        return true;
     }
 
     // IXAudio2VoiceCallback
@@ -121,6 +150,9 @@ private:
     IXAudio2SourceVoice* m_source{};
     HANDLE m_bufferDone{};
     std::array<std::array<float, AUDIO_FRAME_SAMPLES * OUTPUT_CHANNELS>, BUFFER_RING_SIZE> m_buffers{};
+    std::array<float, AUDIO_FRAME_SAMPLES * OUTPUT_CHANNELS> m_mix{};
+    std::mutex m_mixMutex;
+    bool m_mixUsed{};
     uint32_t m_nextBuffer{};
     uint64_t m_framesSubmitted{};
     float m_peak{};
@@ -130,10 +162,13 @@ private:
 static AudioOutput g_output;
 static std::atomic<bool> g_outputAvailable;
 
-static void CallClient()
+static void CallClients()
 {
-    if (uint32_t callback = g_clientCallback)
-        GuestToHostFunction<void>(callback, g_clientContext.load());
+    for (AudioClient& client : g_clients)
+    {
+        if (uint32_t callback = client.callback)
+            GuestToHostFunction<void>(callback, client.context.load());
+    }
 }
 
 static void RunAudioDriver()
@@ -145,7 +180,11 @@ static void RunAudioDriver()
         while (true)
         {
             if (g_output.QueuedFrames() < MAX_QUEUED_FRAMES)
-                CallClient();
+            {
+                CallClients();
+                if (!g_output.Send())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1)); // No client yet, or one that answers later.
+            }
             else
                 g_output.WaitForBuffer();
         }
@@ -158,7 +197,7 @@ static void RunAudioDriver()
     {
         next += std::chrono::microseconds(1000000 * AUDIO_FRAME_SAMPLES / AUDIO_SAMPLE_RATE);
         std::this_thread::sleep_until(next);
-        CallClient();
+        CallClients();
     }
 }
 
@@ -167,11 +206,20 @@ namespace imports
     // The client is a pointer to { callback, context }.
     uint32_t XAudioRegisterRenderDriverClient(be<uint32_t>* client, be<uint32_t>* driver)
     {
+        uint32_t index = 0;
+        while (index < MAX_CLIENTS && g_clients[index].callback != 0)
+            index++;
+        if (index == MAX_CLIENTS)
+        {
+            LOGF_WARNING("audio: no room for another client");
+            return X_STATUS_UNSUCCESSFUL;
+        }
         uint32_t context = g_runtimeHeap.AllocGuest(4);
         *GuestPtr<be<uint32_t>>(context) = client[1].get();
-        g_clientContext = context;
-        g_clientCallback = client[0];
-        *driver = 0x41550000; // Driver handle, checked only for being nonzero.
+        g_clients[index].context = context;
+        g_clients[index].callback = client[0];
+        *driver = DRIVER_HANDLE | index;
+        LOGF_INFO("audio: client {} registered", index);
 
         static std::once_flag once;
         std::call_once(once, []
@@ -187,14 +235,19 @@ namespace imports
 
     uint32_t XAudioUnregisterRenderDriverClient(uint32_t driver)
     {
-        g_clientCallback = 0;
+        uint32_t index = driver & 0xFF;
+        if ((driver & 0xFFFF0000) == DRIVER_HANDLE && index < MAX_CLIENTS)
+        {
+            g_clients[index].callback = 0;
+            LOGF_INFO("audio: client {} unregistered", index);
+        }
         return X_STATUS_SUCCESS;
     }
 
     uint32_t XAudioSubmitRenderDriverFrame(uint32_t driver, be<float>* samples)
     {
         if (g_outputAvailable && samples != nullptr)
-            g_output.Submit(samples);
+            g_output.Add(samples);
 
         return X_STATUS_SUCCESS;
     }

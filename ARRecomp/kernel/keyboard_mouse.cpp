@@ -241,6 +241,8 @@ namespace kbm
     static HWND g_window;
     static std::atomic<bool> g_captured;
     static std::atomic<bool> g_ignoreLeftButton; // The click that captured the mouse isn't an attack.
+    static std::atomic<bool> g_clipped;          // The cursor is being kept in the window.
+    static std::atomic<bool> g_moving;           // The player is dragging the window.
     static std::atomic<int32_t> g_mouseX, g_mouseY, g_wheel;
     static std::atomic<bool> g_active;
     static float g_sensitivity = 1.0f;
@@ -1199,13 +1201,29 @@ namespace kbm
         ClipCursor(&area);
     }
 
-    static void SetCaptured(HWND window, bool captured)
+    // In a window the cursor is only kept in during play, where it's hidden and turns the camera. In menus it's free to go to the title bar and move the window.
+    static bool ClipWanted()
     {
-        g_captured = captured;
-        if (captured)
+        bool windowed = gpu::g_videoSettings.mode == gpu::DisplayMode::Windowed;
+        return g_captured && !g_moving && (!windowed || !InMenu() || ViewerActive());
+    }
+
+    static void UpdateClip(HWND window)
+    {
+        bool wanted = ClipWanted();
+        if (wanted == g_clipped)
+            return;
+        g_clipped = wanted;
+        if (wanted)
             ClipToWindow(window);
         else
             ClipCursor(nullptr);
+    }
+
+    static void SetCaptured(HWND window, bool captured)
+    {
+        g_captured = captured;
+        UpdateClip(window);
         // Hides or shows the cursor (WM_SETCURSOR).
         POINT point;
         GetCursorPos(&point);
@@ -1266,9 +1284,24 @@ namespace kbm
             }
             return false;
 
+        case WM_NCLBUTTONDOWN:
+            // On the title bar: not a click in the game, though the game's own check of the button would see it.
+            g_ignoreLeftButton = true;
+            return false;
+
+        case WM_ENTERSIZEMOVE:
+            g_moving = true;
+            UpdateClip(window);
+            return false;
+
+        case WM_EXITSIZEMOVE:
+            g_moving = false;
+            UpdateClip(window);
+            return false;
+
         case WM_SIZE:
         case WM_MOVE:
-            if (g_captured)
+            if (g_clipped)
                 ClipToWindow(window);
             return false;
 
@@ -1693,6 +1726,8 @@ namespace kbm
             g_wheel = 0;
             return;
         }
+        if (!g_testInput)
+            UpdateClip(g_window);
 
         // Reading the settings once.
         static bool settingsLoaded;

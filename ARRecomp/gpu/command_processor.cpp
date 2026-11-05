@@ -164,7 +164,7 @@ namespace gpu
         const int64_t interval = 1000000 / (int64_t(g_videoSettings.frameRate) * 2);
         const int64_t consoleInterval = 1000000 / (30 * 2);
         // The Tutorial's target can't be caught above 30 fps. Not understood yet, so the Tutorial runs at the console's rate (AR_NO_SIM_FPS_CAP: at the chosen one).
-        // So do multiplayer matches, as above 30 a whole match hasn't been seen to work. All of these have no value in these two words of the state the time steps
+        // So do multiplayer matches, for now: one whole Dogfight between two copies has worked above 30 (see LESSONS), other game types and real networks not yet. All of these have no value in these two words of the state the time steps
         // are in, as does Training, and the menus are told apart by the title's flags. Training has more than 0x100 in the mode word 0x83214D50 (0xC0100).
         static const bool capRooms = !AR_ENV("AR_NO_SIM_FPS_CAP") && g_videoSettings.frameRate > 30;
         auto next = std::chrono::steady_clock::now();

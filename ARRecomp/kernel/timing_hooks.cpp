@@ -1,5 +1,7 @@
 #include <stdafx.h>
 #include <kernel/keyboard_mouse.h>
+#include <kernel/function.h>
+#include <kernel/net_session.h>
 #include <kernel/memory.h>
 #include <gpu/video_settings.h>
 #include <gpu/d3d12_renderer.h>
@@ -530,6 +532,14 @@ static void RunFind(uint8_t* base)
     {
         for (size_t i = 0; i < g_intCandidates.size() && i < 60; i++)
             LOGF_INFO("FINDINT {:08X} = {}", g_intCandidates[i].first, PPC_LOAD_U32(g_intCandidates[i].first));
+        return;
+    }
+    if (request.rfind("addcpu ", 0) == 0)
+    {
+        // "find addcpu <count>": the title's own function adding CPU players to the session.
+        int count = atoi(request.c_str() + 7);
+        LOGF_INFO("adding {} CPU players", count);
+        GuestToHostFunction<void>(0x8271D6B8, 0x832AF7A8, count);
         return;
     }
     if (request.rfind("poke ", 0) == 0)
@@ -1065,6 +1075,61 @@ PPC_FUNC(sub_82C5BD28)
         LOGF_INFO("GLOW {} frame {} {:08X}{}", update, gpu::d3d12::GetFrameNumber(), o, words);
     }
     __imp__sub_82C5BD28(ctx, base);
+}
+
+// Diagnostics (AR_LOG_PLAYER_WAIT): a media player's state from its counters of work in hand. Scene shutdown waits for this to reach 0 (sub_824C9908).
+PPC_FUNC_IMPL(__imp__sub_824C8188);
+PPC_FUNC(sub_824C8188)
+{
+    static const bool log = AR_ENV("AR_LOG_PLAYER_WAIT") != nullptr;
+    uint32_t o = ctx.r3.u32;
+    __imp__sub_824C8188(ctx, base);
+    if (!log)
+        return;
+    static std::mutex mutex;
+    static std::map<uint32_t, std::chrono::steady_clock::time_point> seen;
+    std::lock_guard lock(mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto& last = seen[o];
+    if (now - last < std::chrono::seconds(2))
+        return;
+    last = now;
+    uint32_t parent = PPC_LOAD_U32(o + 16);
+    LOGF_INFO("PLAYER {:08X} lr {:08X} vt {:08X} parent {:08X} vt {:08X} state {} counts {} {} {} {} flag {} +1932 {:08X} +1936 {:08X} +1940 {:08X}", o, uint32_t(ctx.lr), PPC_LOAD_U32(o), parent,
+        parent ? PPC_LOAD_U32(parent) : 0, PPC_LOAD_U32(o + 1928), PPC_LOAD_U32(o + 1968), PPC_LOAD_U32(o + 1972), PPC_LOAD_U32(o + 1976), PPC_LOAD_U32(o + 1980), PPC_LOAD_U32(o + 1952),
+        PPC_LOAD_U32(o + 1932), PPC_LOAD_U32(o + 1936), PPC_LOAD_U32(o + 1940));
+}
+
+// The lobby of a match, each update. A Player Match waits for its mode's minimum of real players, 12 for Battle Royale, which only made sense with all of Xbox Live to draw
+// on. So with everyone here ready, the host makes up the numbers with CPU players, with the function a Private Match uses, and the title goes on to its countdown. Until
+// then it's an ordinary lobby that others can join. AR_NO_MATCH_CPUS: as on Xbox Live.
+PPC_FUNC_IMPL(__imp__sub_82E40230);
+PPC_FUNC(sub_82E40230)
+{
+    static const bool fill = !AR_ENV("AR_NO_MATCH_CPUS");
+    constexpr uint32_t SESSION = 0x832AF7A8;
+    uint32_t flags = PPC_LOAD_U32(SESSION + 20);
+    bool host = PPC_LOAD_U8(SESSION + 2802) != 0, cpusAlready = (flags & 8) != 0;
+    if (fill && net::Online() && host && !cpusAlready)
+    {
+        uint32_t players = PPC_LOAD_U8(SESSION + 2801), ready = 0;
+        for (uint32_t i = 0; i < 16; i++)
+            ready += PPC_LOAD_U8(SESSION + 1428 + i) != 0;
+        uint32_t mode = (flags >> 7) & 0xF;
+        if (players != 0 && ready >= players)
+        {
+            // As the title works it out in this function.
+            uint32_t minimum = mode >= 1 && mode <= 13 ? GuestToHostFunction<uint32_t>(0x827110E0, mode - 1) : 16;
+            if (mode == 2)
+                minimum = 12;
+            if (players < minimum)
+            {
+                LOGF_INFO("online: everyone is ready: {} players of {}, adding CPU players", players, minimum);
+                GuestToHostFunction<void>(0x8271D6B8, SESSION, minimum - players);
+            }
+        }
+    }
+    __imp__sub_82E40230(ctx, base);
 }
 
 // Diagnostics (AR_LOG_CAMERA): which code sets where the camera looks, to find what moves it in a scene.

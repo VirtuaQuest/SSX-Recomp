@@ -65,7 +65,8 @@ namespace gpu::window
                         RegisterClassExW(&windowClass);
 
                         const auto& settings = g_videoSettings;
-                        DWORD style = WS_OVERLAPPEDWINDOW;
+                        // A size of its own, from the launcher. Without a sizing frame, moving it near a screen's edge can't snap or resize it.
+                        DWORD style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
                         int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
                         RECT rect{ 0, 0, LONG(settings.width), LONG(settings.height) };
 
@@ -90,8 +91,16 @@ namespace gpu::window
                         else
                         {
                             AdjustWindowRect(&rect, style, FALSE);
-                            // Centered in the work area.
                             const RECT& work = monitor.rcWork;
+                            // All of it on the screen, or the title bar ends up at the very edge and the rest beyond it: smaller, in the same shape.
+                            LONG frameWidth = (rect.right - rect.left) - LONG(settings.width), frameHeight = (rect.bottom - rect.top) - LONG(settings.height);
+                            double fit = std::min({ 1.0, double(work.right - work.left - frameWidth) / settings.width, double(work.bottom - work.top - frameHeight) / settings.height });
+                            if (fit < 1.0)
+                            {
+                                rect = { 0, 0, LONG(settings.width * fit), LONG(settings.height * fit) };
+                                AdjustWindowRect(&rect, style, FALSE);
+                            }
+                            // Centered in the work area.
                             x = std::max<LONG>(work.left, work.left + ((work.right - work.left) - (rect.right - rect.left)) / 2);
                             y = std::max<LONG>(work.top, work.top + ((work.bottom - work.top) - (rect.bottom - rect.top)) / 2);
                         }

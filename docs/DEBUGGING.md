@@ -92,6 +92,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_D3D12_DEBUG`, `AR_D3D12_GBV` | D3D12 debug layer with its messages in the log; GPU-based validation (very slow) |
 | `AR_CHECK_UPLOADS` | Upload memory static shadow casters read, checked again once the GPU is done with the frame |
 | `AR_LOG_WAIT_TIMEOUTS` | Kernel waits with a timeout that time out, per thread and object (5 s summary) |
+| `AR_DUMP_THREADS_FILE=<file>` | When that file appears, what every guest thread is doing, waiting ones too, with stacks: for a game that has stopped |
+| `AR_LOG_PLAYER_WAIT` | A media player's state as scene shutdown waits for it (`sub_824C8188`) |
 
 ## Turning features off (bisecting)
 
@@ -108,6 +110,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
 | `AR_NO_DEPTH_24` | Keeping depth to the guest's precision (see LESSONS) |
 | `AR_NO_MOVIE_SKIP`, `AR_NO_SIM_FPS_CAP`, `AR_NO_CLICK_FIRE` | Skipping movies; 30 fps in the Tutorial and multiplayer matches; left click firing while aiming |
+| `AR_NO_MATCH_CPUS`, `AR_KEEP_RANKED_MENU` | The host adding CPU players once everyone in a Player Match lobby is Ready; greying out Ranked Match and Leaderboards |
 | `AR_NO_DEPTH_CLIP`, `AR_NO_DEPTH_TEST` | Depth clipping (clamps instead), depth testing |
 | `AR_NO_STATE_CACHE`, `AR_FULL_HASH`, `AR_FULL_CONSTANTS`, `AR_FULL_VERTEX_BUFFERS` | Skipping redundant state, sampled hashes, constant and vertex range trimming |
 | `AR_NO_BULK_REGISTERS` | Copying constant and register blocks without side effects in one piece |
@@ -134,7 +137,7 @@ connected controller.
 `AR_REMOTE=<file>` drives the game live instead: lines appended to the file run in order. A line lists buttons, `L<degrees>` and
 `R<degrees>` for the sticks and a duration in ms (`L0 A 400`); a bare number waits. Also `shot <name>` (saves
 screenshots/<name>.bmp, needs no `--screenshots`), `scan`, `scanwatch`, and `find new|changed|same|list`, `find watch <addresses>`
-(writers, for 120 updates), `find readwatch <addresses>` (readers too) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
+(writers, for 120 updates), `find readwatch <addresses>` (readers too), `find addcpu <count>` (adds CPU players to the session) and `track <address> [floats]` to search and log memory. It steers by real time, so it doesn't depend on
 frame rate, but walking to a place by timing alone isn't reliable. A connected controller still works alongside it.
 
 `AR_FRAME_TRACE=<file>` writes small copies of the final picture and the resolves to `AR_FRAME_TRACE_BASES` (hex) every frame without waiting on the GPU (`AR_FRAME_TRACE_FROM`, `_FRAMES`, `_STEP`, `_FINAL_STEP` for the final picture (1 is guest size, about 2 MB a frame); `_LIST` logs what resolves there are); `tools/test/frametrace.py` reads them. They're about 1 MB a frame at step 2, so keep the range short. `AR_SHADOW_RECEIVER_CONSTANTS=<first>,<count>;...` logs float constants at each frame's first draw that samples the shadow maps (RC lines). `find poke <address> <hex>` sets a word before every update.

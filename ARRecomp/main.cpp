@@ -230,6 +230,21 @@ int main(int argc, char* argv[])
             }).detach();
     }
 
+    // Diagnostics (AR_DUMP_THREADS_FILE=<file>): when that file appears, what every guest thread is doing, for looking into a game that has stopped.
+    if (const char* dumpFile = AR_ENV("AR_DUMP_THREADS_FILE"))
+    {
+        std::thread([dumpFile]
+            {
+                while (true)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    std::error_code ec;
+                    if (std::filesystem::remove(dumpFile, ec))
+                        DumpGuestThreads();
+                }
+            }).detach();
+    }
+
     XDISPATCHER_HEADER* header = mainThread->Header();
     WaitForDispatcherObjects({ &header, 1 }, false, std::nullopt, false);
 
