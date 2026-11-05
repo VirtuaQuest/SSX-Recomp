@@ -58,6 +58,10 @@ namespace gpu::window
                         // The window's and the taskbar's icon, once it has been taken from the game (game_icon.cpp).
                         windowClass.hIcon = HICON(LoadImageW(nullptr, L"user/game_icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
                         windowClass.hIconSm = HICON(LoadImageW(nullptr, L"user/game_icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
+                        if (windowClass.hIcon == nullptr)
+                            windowClass.hIcon = LoadIconW(windowClass.hInstance, MAKEINTRESOURCEW(1));
+                        if (windowClass.hIconSm == nullptr)
+                            windowClass.hIconSm = LoadIconW(windowClass.hInstance, MAKEINTRESOURCEW(1));
                         RegisterClassExW(&windowClass);
 
                         const auto& settings = g_videoSettings;
@@ -101,7 +105,8 @@ namespace gpu::window
                         g_width = std::max<LONG>(client.right - client.left, 1);
                         g_height = std::max<LONG>(client.bottom - client.top, 1);
                         kbm::AttachWindow(hwnd);
-                        ShowWindow(hwnd, SW_SHOW);
+                        // --make-icon runs unseen.
+                        ShowWindow(hwnd, getenv("AR_MAKE_ICON") ? SW_HIDE : SW_SHOW);
                         {
                             std::lock_guard lock(mutex);
                             g_window = hwnd;

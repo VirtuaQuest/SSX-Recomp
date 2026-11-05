@@ -1,4 +1,5 @@
-add_executable(ARLauncher WIN32 main.cpp)
+add_executable(ARLauncher WIN32 main.cpp ../ui/theme.cpp)
+target_include_directories(ARLauncher PRIVATE ../ui)
 target_compile_definitions(ARLauncher PRIVATE UNICODE _UNICODE)
 target_link_libraries(ARLauncher PRIVATE comctl32 comdlg32)
 # Built next to ARRecomp.exe, which it starts.

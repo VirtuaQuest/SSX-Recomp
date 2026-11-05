@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "theme.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -77,7 +78,7 @@ namespace
     };
 
     HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_drawDistance, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath, g_online, g_onlinePeer, g_playerName, g_controller;
-    HFONT g_font;
+    theme::Form g_form;
     std::wstring g_folder, g_iniPath;
 
     std::wstring ReadSetting(const wchar_t* key, const wchar_t* fallback)
@@ -128,24 +129,6 @@ namespace
         GetWindowTextW(control, text.data(), int(text.size()));
         text.resize(wcslen(text.c_str()));
         return text;
-    }
-
-    HWND AddLabel(HWND parent, const wchar_t* text, int x, int y, int width)
-    {
-        HWND label = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y + 4, width, 20, parent, nullptr, nullptr, nullptr);
-        SendMessageW(label, WM_SETFONT, WPARAM(g_font), TRUE);
-        return label;
-    }
-
-    HWND AddCombo(HWND parent, int id, int x, int y, int width, const wchar_t* const* items, size_t count, int selected)
-    {
-        HWND combo = CreateWindowExW(0, WC_COMBOBOXW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-            x, y, width, 300, parent, HMENU(INT_PTR(id)), nullptr, nullptr);
-        SendMessageW(combo, WM_SETFONT, WPARAM(g_font), TRUE);
-        for (size_t i = 0; i < count; i++)
-            SendMessageW(combo, CB_ADDSTRING, 0, LPARAM(items[i]));
-        SendMessageW(combo, CB_SETCURSEL, selected, 0);
-        return combo;
     }
 
     void Browse(HWND window)
@@ -245,8 +228,14 @@ namespace
         DestroyWindow(window);
     }
 
+    constexpr int WINDOW_WIDTH = 860, WINDOW_HEIGHT = 650;
+
     LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
     {
+        LRESULT handled;
+        if (g_form.Handle(message, wParam, lParam, handled))
+            return handled;
+
         switch (message)
         {
         case WM_CREATE:
@@ -255,89 +244,65 @@ namespace
             for (const auto& r : RESOLUTIONS)
                 resolutionLabels.push_back(r.label);
 
-            constexpr int labelX = 20, controlX = 150, width = 300;
-            int y = 20;
-            AddLabel(window, L"Resolution", labelX, y, 120);
-            g_resolution = AddCombo(window, ID_RESOLUTION, controlX, y, width, resolutionLabels.data(), resolutionLabels.size(),
-                ReadIndex(L"Resolution", int(std::size(RESOLUTIONS))));
-            y += 40;
-            AddLabel(window, L"Display mode", labelX, y, 120);
-            g_display = AddCombo(window, ID_DISPLAY, controlX, y, width, DISPLAY_MODES, std::size(DISPLAY_MODES),
-                ReadIndex(L"Display", int(std::size(DISPLAY_MODES))));
-            y += 40;
-            AddLabel(window, L"Frame rate", labelX, y, 120);
-            g_fps = AddCombo(window, ID_FPS, controlX, y, width, FRAME_RATE_LABELS, std::size(FRAME_RATE_LABELS),
-                ReadIndex(L"FrameRate", int(std::size(FRAME_RATES))));
-            y += 40;
-            AddLabel(window, L"Internal resolution", labelX, y, 125);
-            g_scale = AddCombo(window, ID_SCALE, controlX, y, width, SCALE_LABELS, std::size(SCALE_LABELS),
-                ReadIndex(L"RenderScale", int(std::size(SCALE_LABELS))));
-            y += 40;
-            AddLabel(window, L"Shadows", labelX, y, 120);
-            g_shadows = AddCombo(window, ID_SHADOWS, controlX, y, width, SHADOW_LABELS, std::size(SHADOW_LABELS),
-                ReadIndex(L"Shadows", int(std::size(SHADOW_LABELS))));
-            y += 40;
-            AddLabel(window, L"Mouse sensitivity", labelX, y, 120);
-            g_mouse = AddCombo(window, ID_MOUSE, controlX, y, width, MOUSE_LABELS, std::size(MOUSE_LABELS),
-                ReadIndex(L"MouseSensitivity", int(std::size(MOUSE_LABELS)), 1));
-            y += 40;
-            AddLabel(window, L"Mouse look", labelX, y, 120);
-            g_invert = AddCombo(window, ID_INVERT, controlX, y, width, INVERT_LABELS, std::size(INVERT_LABELS),
-                ReadIndex(L"InvertMouse", int(std::size(INVERT_LABELS))));
-            y += 40;
-            AddLabel(window, L"Anti-aliasing", labelX, y, 120);
-            g_aa = AddCombo(window, ID_AA, controlX, y, width, AA_LABELS, std::size(AA_LABELS), ReadIndex(L"AntiAliasing", int(std::size(AA_LABELS))));
-            y += 40;
-            AddLabel(window, L"Anisotropic filtering", labelX, y, 125);
-            g_anisotropic = AddCombo(window, ID_ANISOTROPIC, controlX, y, width, ANISOTROPIC_LABELS, std::size(ANISOTROPIC_LABELS), ReadIndex(L"Anisotropic", int(std::size(ANISOTROPIC_LABELS))));
-            y += 40;
-            AddLabel(window, L"Texture detail", labelX, y, 120);
-            g_textures = AddCombo(window, ID_TEXTURES, controlX, y, width, TEXTURE_LABELS, std::size(TEXTURE_LABELS), ReadIndex(L"TextureDetail", int(std::size(TEXTURE_LABELS))));
-            y += 40;
-            AddLabel(window, L"Draw distance", labelX, y, 120);
-            g_drawDistance = AddCombo(window, ID_DRAW_DISTANCE, controlX, y, width, DRAW_DISTANCE_LABELS, std::size(DRAW_DISTANCE_LABELS), ReadIndex(L"DrawDistance", int(std::size(DRAW_DISTANCE_LABELS))));
-            y += 40;
-            AddLabel(window, L"Sharpening", labelX, y, 120);
-            g_sharpen = AddCombo(window, ID_SHARPEN, controlX, y, width, SHARPEN_LABELS, std::size(SHARPEN_LABELS), ReadIndex(L"Sharpen", int(std::size(SHARPEN_LABELS))));
-            y += 40;
-            AddLabel(window, L"Ultrawide", labelX, y, 120);
-            g_ultrawide = AddCombo(window, ID_ULTRAWIDE, controlX, y, width, ULTRAWIDE_LABELS, std::size(ULTRAWIDE_LABELS), ReadIndex(L"Ultrawide", int(std::size(ULTRAWIDE_LABELS))));
-            y += 40;
-            AddLabel(window, L"V-Sync", labelX, y, 120);
-            g_vsync = AddCombo(window, ID_VSYNC, controlX, y, width, VSYNC_LABELS, std::size(VSYNC_LABELS), ReadIndex(L"VSync", int(std::size(VSYNC_LABELS))));
-            y += 40;
-            AddLabel(window, L"Controller", labelX, y, 120);
-            g_controller = AddCombo(window, ID_CONTROLLER, controlX, y, width, CONTROLLER_LABELS, std::size(CONTROLLER_LABELS), ReadIndex(L"Controller", int(std::size(CONTROLLER_LABELS))));
-            y += 40;
-            AddLabel(window, L"Multiplayer", labelX, y, 120);
-            g_online = AddCombo(window, ID_ONLINE, controlX, y, width, ONLINE_LABELS, std::size(ONLINE_LABELS), ReadIndex(L"Online", int(std::size(ONLINE_LABELS))));
-            y += 40;
-            auto addEdit = [&](const wchar_t* label, int id, const wchar_t* key)
+            g_form.Attach(window, WINDOW_WIDTH, WINDOW_HEIGHT, L"Launcher", L"Anarchy Reigns Recompiled");
+
+            constexpr int ROW = 36, SECTION_TOP = 30, LABEL_WIDTH = 132;
+            constexpr int left = 24, right = 442, columnWidth = 394;
+            int x = left, y = 96;
+            auto section = [&](int rows, const wchar_t* title)
                 {
-                    AddLabel(window, label, labelX, y, 125);
-                    HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ReadSetting(key, L"").c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                        controlX, y, width, 24, window, HMENU(INT_PTR(id)), nullptr, nullptr);
-                    SendMessageW(edit, WM_SETFONT, WPARAM(g_font), TRUE);
-                    y += 40;
-                    return edit;
+                    g_form.AddSection(x, y, columnWidth, SECTION_TOP + rows * ROW + 4, title);
+                    y += SECTION_TOP;
                 };
-            g_playerName = addEdit(L"Player name", ID_PLAYER_NAME, L"PlayerName");
-            g_onlinePeer = addEdit(L"Host's IP (to join)", ID_ONLINE_PEER, L"OnlinePeer");
-            y += 10;
+            auto combo = [&](const wchar_t* label, int id, const wchar_t* const* items, size_t count, const wchar_t* key, int fallback = 0)
+                {
+                    g_form.AddLabel(x + 2, y, LABEL_WIDTH, 28, label);
+                    HWND control = g_form.AddCombo(id, x + LABEL_WIDTH + 4, y, columnWidth - LABEL_WIDTH - 12, items, count, ReadIndex(key, int(count), fallback));
+                    y += ROW;
+                    return control;
+                };
+            auto edit = [&](const wchar_t* label, int id, const wchar_t* key)
+                {
+                    g_form.AddLabel(x + 2, y, LABEL_WIDTH, 28, label);
+                    HWND control = g_form.AddEdit(id, x + LABEL_WIDTH + 4, y, columnWidth - LABEL_WIDTH - 12, ReadSetting(key, L""));
+                    y += ROW;
+                    return control;
+                };
 
-            AddLabel(window, L"Game image", labelX, y, 120);
-            g_gamePath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ToRelative(ReadSetting(L"Game", L"")).c_str(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, controlX, y, width - 80, 24, window,
-                HMENU(INT_PTR(ID_GAME_PATH)), nullptr, nullptr);
-            SendMessageW(g_gamePath, WM_SETFONT, WPARAM(g_font), TRUE);
-            HWND browse = CreateWindowExW(0, L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                controlX + width - 74, y, 74, 24, window, HMENU(INT_PTR(ID_BROWSE)), nullptr, nullptr);
-            SendMessageW(browse, WM_SETFONT, WPARAM(g_font), TRUE);
-            y += 50;
+            section(6, L"Display");
+            g_resolution = combo(L"Resolution", ID_RESOLUTION, resolutionLabels.data(), resolutionLabels.size(), L"Resolution");
+            g_display = combo(L"Display mode", ID_DISPLAY, DISPLAY_MODES, std::size(DISPLAY_MODES), L"Display");
+            g_fps = combo(L"Frame rate", ID_FPS, FRAME_RATE_LABELS, std::size(FRAME_RATE_LABELS), L"FrameRate");
+            g_scale = combo(L"Internal resolution", ID_SCALE, SCALE_LABELS, std::size(SCALE_LABELS), L"RenderScale");
+            g_vsync = combo(L"V-Sync", ID_VSYNC, VSYNC_LABELS, std::size(VSYNC_LABELS), L"VSync");
+            g_ultrawide = combo(L"Ultrawide", ID_ULTRAWIDE, ULTRAWIDE_LABELS, std::size(ULTRAWIDE_LABELS), L"Ultrawide");
+            y += 12;
+            section(6, L"Graphics");
+            g_aa = combo(L"Anti-aliasing", ID_AA, AA_LABELS, std::size(AA_LABELS), L"AntiAliasing");
+            g_anisotropic = combo(L"Anisotropic filtering", ID_ANISOTROPIC, ANISOTROPIC_LABELS, std::size(ANISOTROPIC_LABELS), L"Anisotropic");
+            g_textures = combo(L"Texture detail", ID_TEXTURES, TEXTURE_LABELS, std::size(TEXTURE_LABELS), L"TextureDetail");
+            g_drawDistance = combo(L"Draw distance", ID_DRAW_DISTANCE, DRAW_DISTANCE_LABELS, std::size(DRAW_DISTANCE_LABELS), L"DrawDistance");
+            g_sharpen = combo(L"Sharpening", ID_SHARPEN, SHARPEN_LABELS, std::size(SHARPEN_LABELS), L"Sharpen");
+            g_shadows = combo(L"Shadows", ID_SHADOWS, SHADOW_LABELS, std::size(SHADOW_LABELS), L"Shadows");
 
-            HWND launch = CreateWindowExW(0, L"BUTTON", L"Launch", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                controlX + width - 120, y, 120, 32, window, HMENU(INT_PTR(ID_LAUNCH)), nullptr, nullptr);
-            SendMessageW(launch, WM_SETFONT, WPARAM(g_font), TRUE);
+            x = right;
+            y = 96;
+            section(3, L"Controls");
+            g_controller = combo(L"Controller", ID_CONTROLLER, CONTROLLER_LABELS, std::size(CONTROLLER_LABELS), L"Controller");
+            g_mouse = combo(L"Mouse sensitivity", ID_MOUSE, MOUSE_LABELS, std::size(MOUSE_LABELS), L"MouseSensitivity", 1);
+            g_invert = combo(L"Mouse look", ID_INVERT, INVERT_LABELS, std::size(INVERT_LABELS), L"InvertMouse");
+            y += 12;
+            section(3, L"Multiplayer");
+            g_online = combo(L"Multiplayer", ID_ONLINE, ONLINE_LABELS, std::size(ONLINE_LABELS), L"Online");
+            g_playerName = edit(L"Player name", ID_PLAYER_NAME, L"PlayerName");
+            g_onlinePeer = edit(L"Host's IP (to join)", ID_ONLINE_PEER, L"OnlinePeer");
+            y += 12;
+            section(1, L"Game");
+            g_form.AddLabel(x + 2, y, 90, 28, L"Game image");
+            g_gamePath = g_form.AddEdit(ID_GAME_PATH, x + 92, y, columnWidth - 92 - 86, ToRelative(ReadSetting(L"Game", L"")));
+            g_form.AddButton(ID_BROWSE, x + columnWidth - 80, y, 74, 28, L"Browse");
+
+            g_form.AddButton(ID_LAUNCH, x + columnWidth - 200, WINDOW_HEIGHT - 64, 200, 44, L"Launch", true);
             return 0;
         }
 
@@ -367,23 +332,29 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
 
     INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&controls);
-    NONCLIENTMETRICSW metrics{ sizeof(metrics) };
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
-    g_font = CreateFontIndirectW(&metrics.lfMessageFont);
 
     WNDCLASSEXW windowClass{ sizeof(windowClass) };
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = HBRUSH(COLOR_BTNFACE + 1);
+    windowClass.hbrBackground = nullptr;
     windowClass.lpszClassName = L"ARLauncher";
-    // The icon the game cut from its own logo the first time it ran, if it has.
+    // The icon the game cut from its own logo the first time it ran, if it has. Otherwise a plain one.
     std::wstring iconPath = WorkingFolder() + L"\\user\\game_icon.ico";
     windowClass.hIcon = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
     windowClass.hIconSm = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
+    // What setup stamped into this program, on a PC where the game hasn't run.
+    if (windowClass.hIcon == nullptr)
+        windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
+    if (windowClass.hIconSm == nullptr)
+        windowClass.hIconSm = LoadIconW(instance, MAKEINTRESOURCEW(1));
+    if (windowClass.hIcon == nullptr)
+        windowClass.hIcon = theme::MakeIcon(GetSystemMetrics(SM_CXICON));
+    if (windowClass.hIconSm == nullptr)
+        windowClass.hIconSm = theme::MakeIcon(GetSystemMetrics(SM_CXSMICON));
     RegisterClassExW(&windowClass);
 
-    RECT rect{ 0, 0, 480, 890 };
+    RECT rect{ 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,

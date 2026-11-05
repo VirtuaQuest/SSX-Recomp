@@ -153,6 +153,8 @@ namespace gpu::window
         output.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
         output.close();
         LOGF_INFO("window icon taken from the title's logo: {} bytes", file.size());
+        if (AR_ENV("AR_MAKE_ICON")) // --make-icon: that was all it came for. At once, as the title's threads are still running.
+            TerminateProcess(GetCurrentProcess(), 0);
         ApplyGameIcon();
     }
 

@@ -11,6 +11,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 | `--xex`, `--user` | Executable and user data folder overrides |
 | `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--draw-distance F`, `--sharpen 0-3`, `--ultrawide`, `--vsync`, `--shadows on\|off` | Video settings (what the launcher passes) |
 | `--online`, `--online-peer <IPs>`, `--player-name <name>`, `--controller <1-4>` | Multiplayer between copies (see LESSONS); which controller this copy reads |
+| `--make-icon` | Takes the icon from the game, unseen and silent, into `user/game_icon.ico`, then exits (Setup uses this) |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
 

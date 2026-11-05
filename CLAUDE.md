@@ -18,8 +18,9 @@ things are the way they are) and `docs/DEBUGGING.md` for the switches and test s
 
 ## Build and run
 
-- The build uses the XenonRecomp fork checked out next to this folder (`../XenonRecomp`, branch `main` of the same
+- The build uses the XenonRecomp fork checked out next to this folder (`../XenonRecomp`, tested with branch `xenon-doax2` of the same
   GitHub repository; `XENONRECOMP_ROOT` overrides the path).
+- `Setup.bat` opens Setup, which does a whole build from a player's copy of the game, for anyone without this PC's layout. `tools/ui` is the look it shares with the launcher.
 - `tools\build.bat [ARRecomp|ARLauncher|ARShaderTool]` — Ninja, clang-cl (portable LLVM 19 at
   `C:\Downloads\Repos\_tools\llvm`), VS 2022 Build Tools, RelWithDebInfo, into `out\build`. DXC comes from the
   Windows SDK and is copied next to the exe.

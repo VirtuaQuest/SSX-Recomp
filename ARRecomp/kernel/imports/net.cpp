@@ -661,6 +661,10 @@ namespace imports
         return net::Online() ? 0 : X_WSAENETDOWN;
     }
 
+    // What was handed out, as the title also releases things that didn't come from here (seen from Custom Match).
+    static std::mutex g_qosMutex;
+    static std::set<uint32_t> g_qosBlocks;
+
     uint32_t NetDll_XNetQosLookup(uint32_t caller, uint32_t count, uint32_t xnaddrs, uint32_t keyIds, uint32_t keys,
         uint32_t securityGatewayCount, uint32_t securityGateways, uint32_t serviceIds, uint32_t probes, uint32_t bitsPerSecond, uint32_t flags, uint32_t event, uint32_t result)
     {
@@ -683,6 +687,11 @@ namespace imports
             *reinterpret_cast<be<uint32_t>*>(info + 16) = 10000000;
             *reinterpret_cast<be<uint32_t>*>(info + 20) = 10000000;
         }
+        {
+            std::lock_guard lock(g_qosMutex);
+            g_qosBlocks.insert(guest);
+        }
+        LOGF_INFO("online: quality of service lookup of {} addresses: {:08X}, kept at {:08X}", count, guest, result);
         if (result != 0)
             *g_memory.Translate<be<uint32_t>>(result) = guest;
         return 0;
@@ -690,8 +699,13 @@ namespace imports
 
     uint32_t NetDll_XNetQosRelease(uint32_t caller, uint32_t qos)
     {
-        if (net::Online() && qos != 0)
+        if (!net::Online() || qos == 0)
+            return 0;
+        std::lock_guard lock(g_qosMutex);
+        if (g_qosBlocks.erase(qos) != 0)
             g_runtimeHeap.FreeGuest(qos);
+        else
+            LOGF_WARNING("online: quality of service release of {:08X}, which didn't come from here", qos);
         return 0;
     }
 }

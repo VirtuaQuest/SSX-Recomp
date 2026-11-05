@@ -40,6 +40,9 @@ public:
         if (FAILED(m_xaudio->CreateMasteringVoice(&m_master, OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE)))
             return false;
 
+        if (getenv("AR_MAKE_ICON")) // --make-icon runs unheard.
+            m_master->SetVolume(0.0f);
+
         WAVEFORMATEX format{};
         format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
         format.nChannels = OUTPUT_CHANNELS;

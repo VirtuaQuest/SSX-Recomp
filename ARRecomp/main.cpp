@@ -45,7 +45,8 @@ static void PrintUsage()
         "  --online               Multiplayer between copies of the game, experimental (ports 36000-36127).\n"
         "  --online-peer IP       Also look for games at these addresses (comma separated).\n"
         "  --player-name NAME     Your name in multiplayer.\n"
-        "  --controller N         Which controller this copy reads, 1 to 4 (default 1).\n");
+        "  --controller N         Which controller this copy reads, 1 to 4 (default 1).\n"
+        "  --make-icon            Takes the icon from the game, unseen and silent, then exits (setup uses this).\n");
 }
 
 int main(int argc, char* argv[])
@@ -98,6 +99,19 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--controller" && i + 1 < argc)
             _putenv_s("AR_CONTROLLER", argv[++i]);
+        else if (arg == "--make-icon")
+        {
+            _putenv_s("AR_MAKE_ICON", "1");
+            gpu::g_videoSettings.mode = gpu::DisplayMode::Windowed;
+            gpu::g_videoSettings.width = 640;
+            gpu::g_videoSettings.height = 360;
+            // If the title screen doesn't come, this doesn't wait forever.
+            std::thread([]
+                {
+                    std::this_thread::sleep_for(std::chrono::minutes(5));
+                    ExitProcess(2);
+                }).detach();
+        }
         else if (arg == "--online")
             _putenv_s("AR_ONLINE", "1");
         else if (arg == "--online-peer" && i + 1 < argc)

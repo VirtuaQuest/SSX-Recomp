@@ -589,7 +589,8 @@ namespace imports
                 std::string fileName = entry.path().filename().string();
                 data->deviceId = CONTENT_DEVICE_ID;
                 data->contentType = contentType;
-                strncpy(data->fileName, fileName.c_str(), sizeof(data->fileName) - 1);
+                // The field has no room for a terminator when full: marketplace packages' names are all 42 characters.
+                strncpy(data->fileName, fileName.c_str(), sizeof(data->fileName));
                 for (size_t i = 0; i < fileName.size() && i < 127; i++)
                     data->displayName[i] = uint16_t(uint8_t(fileName[i]));
 
