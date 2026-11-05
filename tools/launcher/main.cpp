@@ -47,6 +47,8 @@ namespace
     constexpr const wchar_t* MOUSE_LABELS[] = { L"Low", L"Medium", L"High", L"Very high" };
     constexpr const wchar_t* MOUSE_VALUES[] = { L"0.5", L"1", L"2", L"4" };
     constexpr const wchar_t* INVERT_LABELS[] = { L"Normal", L"Inverted" };
+    constexpr const wchar_t* CONTROLLER_LABELS[] = { L"1", L"2", L"3", L"4" };
+    constexpr const wchar_t* ONLINE_LABELS[] = { L"Off (original, no Xbox Live)", L"On (experimental: host and join)" };
 
     enum Control
     {
@@ -64,12 +66,16 @@ namespace
         ID_SHADOWS,
         ID_MOUSE,
         ID_INVERT,
+        ID_CONTROLLER,
+        ID_ONLINE,
+        ID_ONLINE_PEER,
+        ID_PLAYER_NAME,
         ID_GAME_PATH,
         ID_BROWSE,
         ID_LAUNCH,
     };
 
-    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_drawDistance, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath;
+    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_drawDistance, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath, g_online, g_onlinePeer, g_playerName, g_controller;
     HFONT g_font;
     std::wstring g_folder, g_iniPath;
 
@@ -148,6 +154,9 @@ namespace
         int mouse = int(SendMessageW(g_mouse, CB_GETCURSEL, 0, 0));
         int invert = int(SendMessageW(g_invert, CB_GETCURSEL, 0, 0));
         std::wstring gamePath = GetText(g_gamePath);
+        int online = int(SendMessageW(g_online, CB_GETCURSEL, 0, 0));
+        int controller = int(SendMessageW(g_controller, CB_GETCURSEL, 0, 0));
+        std::wstring onlinePeer = GetText(g_onlinePeer), playerName = GetText(g_playerName);
 
         if (GetFileAttributesW(gamePath.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
@@ -170,6 +179,10 @@ namespace
         WriteSetting(L"MouseSensitivity", std::to_wstring(mouse));
         WriteSetting(L"InvertMouse", std::to_wstring(invert));
         WriteSetting(L"Game", gamePath);
+        WriteSetting(L"Online", std::to_wstring(online));
+        WriteSetting(L"Controller", std::to_wstring(controller));
+        WriteSetting(L"OnlinePeer", onlinePeer);
+        WriteSetting(L"PlayerName", playerName);
 
         const Resolution& r = RESOLUTIONS[resolution];
         std::wstring exe = g_folder + L"\\ARRecomp.exe";
@@ -180,6 +193,16 @@ namespace
             L" --render-scale " + std::to_wstring(scale + 1) +
             L" --shadows " + (shadows == 0 ? L"on" : L"off") + L" --mouse-sensitivity " + MOUSE_VALUES[mouse] +
             (invert == 1 ? L" --invert-mouse" : L"");
+        if (controller != 0)
+            command += L" --controller " + std::to_wstring(controller + 1);
+        if (online == 1)
+        {
+            command += L" --online";
+            if (!onlinePeer.empty())
+                command += L" --online-peer \"" + onlinePeer + L"\"";
+            if (!playerName.empty())
+                command += L" --player-name \"" + playerName + L"\"";
+        }
 
         // The game keeps its saves and caches in "user" next to where it runs: the folder set in launcher.ini
         // (WorkingFolder), or the launcher's own.
@@ -257,7 +280,25 @@ namespace
             y += 40;
             AddLabel(window, L"V-Sync", labelX, y, 120);
             g_vsync = AddCombo(window, ID_VSYNC, controlX, y, width, VSYNC_LABELS, std::size(VSYNC_LABELS), ReadIndex(L"VSync", int(std::size(VSYNC_LABELS))));
-            y += 50;
+            y += 40;
+            AddLabel(window, L"Controller", labelX, y, 120);
+            g_controller = AddCombo(window, ID_CONTROLLER, controlX, y, width, CONTROLLER_LABELS, std::size(CONTROLLER_LABELS), ReadIndex(L"Controller", int(std::size(CONTROLLER_LABELS))));
+            y += 40;
+            AddLabel(window, L"Multiplayer", labelX, y, 120);
+            g_online = AddCombo(window, ID_ONLINE, controlX, y, width, ONLINE_LABELS, std::size(ONLINE_LABELS), ReadIndex(L"Online", int(std::size(ONLINE_LABELS))));
+            y += 40;
+            auto addEdit = [&](const wchar_t* label, int id, const wchar_t* key)
+                {
+                    AddLabel(window, label, labelX, y, 125);
+                    HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ReadSetting(key, L"").c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                        controlX, y, width, 24, window, HMENU(INT_PTR(id)), nullptr, nullptr);
+                    SendMessageW(edit, WM_SETFONT, WPARAM(g_font), TRUE);
+                    y += 40;
+                    return edit;
+                };
+            g_playerName = addEdit(L"Player name", ID_PLAYER_NAME, L"PlayerName");
+            g_onlinePeer = addEdit(L"Host's IP (to join)", ID_ONLINE_PEER, L"OnlinePeer");
+            y += 10;
 
             AddLabel(window, L"Game image", labelX, y, 120);
             g_gamePath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ReadSetting(L"Game", L"").c_str(),
@@ -311,9 +352,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
     windowClass.hbrBackground = HBRUSH(COLOR_BTNFACE + 1);
     windowClass.lpszClassName = L"ARLauncher";
+    // The icon the game cut from its own logo the first time it ran, if it has.
+    std::wstring iconPath = ReadSetting(L"WorkingFolder", g_folder.c_str()) + L"\\user\\game_icon.ico";
+    windowClass.hIcon = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
+    windowClass.hIconSm = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
     RegisterClassExW(&windowClass);
 
-    RECT rect{ 0, 0, 480, 730 };
+    RECT rect{ 0, 0, 480, 890 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,

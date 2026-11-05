@@ -55,9 +55,9 @@ namespace gpu::window
                         windowClass.hInstance = GetModuleHandleW(nullptr);
                         windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
                         windowClass.lpszClassName = L"ARRecomp";
-                        // The window's and the taskbar's icon, if there is one with the user's files.
-                        windowClass.hIcon = HICON(LoadImageW(nullptr, L"user/icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
-                        windowClass.hIconSm = HICON(LoadImageW(nullptr, L"user/icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
+                        // The window's and the taskbar's icon, once it has been taken from the game (game_icon.cpp).
+                        windowClass.hIcon = HICON(LoadImageW(nullptr, L"user/game_icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
+                        windowClass.hIconSm = HICON(LoadImageW(nullptr, L"user/game_icon.ico", IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
                         RegisterClassExW(&windowClass);
 
                         const auto& settings = g_videoSettings;

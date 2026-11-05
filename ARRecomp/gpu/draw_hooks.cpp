@@ -319,8 +319,87 @@ static void NoteMenuSprite(uint32_t item, uint8_t* base, int64_t frame)
     };
     static std::vector<Selector> selectors;
     static int64_t rowsFrame = -1;
+    // The Gallery's grids: a dark tile for each entry, with a bar at its left, except on the one selected. Sliding in, they're off the screen.
+    struct Place
+    {
+        float x, y;
+    };
+    static std::vector<Place> tiles, tileBars, pageArrows;
+    // The Tutorial's list of levels: a dark panel per row, and a frame of two long lines around the row selected. (The title doesn't count that screen as a menu.)
+    static std::vector<Place> levelPanels, levelFrames;
     if (frame != rowsFrame)
     {
+        if (tiles.size() >= 4)
+        {
+            float lowX = FLT_MAX, lowY = FLT_MAX, highX = -FLT_MAX, highY = -FLT_MAX;
+            for (const Place& tile : tiles)
+            {
+                lowX = std::min(lowX, tile.x);
+                lowY = std::min(lowY, tile.y);
+                highX = std::max(highX, tile.x);
+                highY = std::max(highY, tile.y);
+            }
+            static constexpr float STEP_X = 69.0f, STEP_Y = 60.0f;
+            kbm::MenuGrid grid;
+            grid.x = lowX;
+            grid.y = lowY;
+            grid.stepX = STEP_X;
+            grid.stepY = STEP_Y;
+            grid.width = STEP_X;
+            grid.height = STEP_Y;
+            grid.columns = int((highX - lowX) / STEP_X + 0.5f) + 1;
+            grid.rows = int((highY - lowY) / STEP_Y + 0.5f) + 1;
+            if (lowX >= 0.0f && highX < 1280.0f && size_t(grid.columns * grid.rows) == tiles.size())
+            {
+                std::vector<bool> barred(tiles.size());
+                for (const Place& bar : tileBars)
+                {
+                    int column = int((bar.x - 8.0f - lowX) / STEP_X + 0.5f), row = int((bar.y - 10.0f - lowY) / STEP_Y + 0.5f);
+                    if (column >= 0 && column < grid.columns && row >= 0 && row < grid.rows)
+                        barred[row * grid.columns + column] = true;
+                }
+                int free = 0;
+                for (size_t i = 0; i < barred.size(); i++)
+                {
+                    if (!barred[i])
+                    {
+                        free++;
+                        grid.selected = int(i);
+                    }
+                }
+                if (free != 1)
+                    grid.selected = -1;
+                for (const Place& arrow : pageArrows)
+                {
+                    grid.arrowY = arrow.y + 9.0f;
+                    (arrow.x < lowX ? grid.arrowLeftX : grid.arrowRightX) = arrow.x + 7.5f;
+                }
+                kbm::SetMenuGrid(grid);
+            }
+        }
+        tiles.clear();
+        tileBars.clear();
+        pageArrows.clear();
+        if (levelPanels.size() >= 3 && !levelFrames.empty())
+        {
+            // The frame flies over other rows on its way to one: it only tells the selection once it has stopped.
+            float top = FLT_MAX;
+            for (const Place& line : levelFrames)
+                top = std::min(top, line.y);
+            static float frameBefore;
+            static auto frameMoved = std::chrono::steady_clock::now();
+            auto frameNow = std::chrono::steady_clock::now();
+            if (std::abs(top - frameBefore) > 0.25f)
+            {
+                frameBefore = top;
+                frameMoved = frameNow;
+            }
+            bool stopped = frameNow - frameMoved >= std::chrono::milliseconds(70);
+            for (const Place& panel : levelPanels)
+                rows.push_back({ panel.x, panel.y, panel.x + 478.0f, panel.y + 60.0f, stopped && std::abs(top - panel.y) < 4.0f, true, true });
+        }
+        levelPanels.clear();
+        levelFrames.clear();
         for (const Selector& selector : selectors)
         {
             for (LineList& list : lists)
@@ -373,6 +452,21 @@ static void NoteMenuSprite(uint32_t item, uint8_t* base, int64_t frame)
         y1 = std::max(y1, y);
     }
     float tx = floatAt(item + 16 * 4), ty = floatAt(item + 17 * 4), scale = floatAt(item + 4 * 4);
+    {
+        float alpha = floatAt(vertices + 8 * 4), width = x1 - x0, height = y1 - y0;
+        auto about = [](float value, float wanted) { return std::abs(value - wanted) < 0.02f; };
+        bool dark = red < 0.06f && green < 0.06f && blue < 0.06f;
+        if (dark && about(alpha, 0.85f) && std::abs(width - 77.0f) < 1.0f && std::abs(height - 62.0f) < 1.0f)
+            tiles.push_back({ tx + x0, ty + y0 });
+        else if (about(red, 0.341f) && about(green, 0.678f) && std::abs(width - 10.0f) < 1.0f && std::abs(height - 42.0f) < 1.0f)
+            tileBars.push_back({ tx + x0, ty + y0 });
+        else if (about(red, 0.463f) && about(green, 0.88f) && std::abs(width - 15.0f) < 1.0f && std::abs(height - 18.0f) < 1.0f)
+            pageArrows.push_back({ tx + x0, ty + y0 });
+        else if (dark && about(alpha, 0.4f) && std::abs(width - 246.0f) < 2.0f && std::abs(height - 62.0f) < 2.0f)
+            levelPanels.push_back({ tx + x0, ty + y0 });
+        else if (about(red, 0.463f) && about(green, 0.88f) && alpha > 0.9f && std::abs(width - 480.0f) < 2.0f && std::abs(height - 4.0f) < 1.0f)
+            levelFrames.push_back({ tx + x0, ty + y0 });
+    }
     if (x1 - x0 >= 80.0f && std::abs(y1 - y0 - 42.0f) < 2.0f)
         selectors.push_back({ tx, ty, x1 - x0 });
     bool highlightColor = std::abs(red - 0.341f) <= 0.01f && std::abs(green - 0.678f) <= 0.01f && blue == 0.0f;

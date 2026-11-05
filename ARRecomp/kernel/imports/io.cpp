@@ -2,6 +2,7 @@
 #include <stdafx.h>
 #include <kernel/imports.h>
 #include <kernel/vfs.h>
+#include <kernel/keyboard_mouse.h>
 
 struct FileObject : KernelObject
 {
@@ -15,9 +16,23 @@ struct FileObject : KernelObject
     std::vector<vfs::DirectoryEntry> entries;
     size_t nextEntry{};
     bool listed{};
+    bool movie{}; // A cutscene's movie file (see kbm::NoteMovieOpen).
 
     FileObject() : KernelObject(ObjectType::File) {}
+    ~FileObject()
+    {
+        if (movie)
+            kbm::NoteMovieOpen(false);
+    }
 };
+
+static bool IsMoviePath(const std::string& path)
+{
+    std::string lower = path;
+    for (char& c : lower)
+        c = char(tolower(uint8_t(c)));
+    return lower.find("\\movie\\") != std::string::npos && lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".sfd") == 0;
+}
 
 constexpr uint32_t X_FILE_ATTRIBUTE_READONLY = 0x01;
 constexpr uint32_t X_FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -161,6 +176,11 @@ namespace imports
         object->synchronous = (options & 0x30) != 0;
         object->file = std::move(file);
         object->path = path;
+        if (!write && IsMoviePath(path))
+        {
+            object->movie = true;
+            kbm::NoteMovieOpen(true);
+        }
         *handle = CreateHandle(object);
         return X_STATUS_SUCCESS;
     }

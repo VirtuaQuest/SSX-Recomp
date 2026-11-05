@@ -41,7 +41,11 @@ static void PrintUsage()
         "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n"
         "  --shadows on|off       Dynamic shadows (default on).\n"
         "  --mouse-sensitivity N  Camera speed with the mouse (default 1).\n"
-        "  --invert-mouse         Mouse down looks up.\n");
+        "  --invert-mouse         Mouse down looks up.\n"
+        "  --online               Multiplayer between copies of the game, experimental (ports 36000-36127).\n"
+        "  --online-peer IP       Also look for games at these addresses (comma separated).\n"
+        "  --player-name NAME     Your name in multiplayer.\n"
+        "  --controller N         Which controller this copy reads, 1 to 4 (default 1).\n");
 }
 
 int main(int argc, char* argv[])
@@ -92,6 +96,14 @@ int main(int argc, char* argv[])
             gpu::g_videoSettings.mode = mode == "fullscreen" ? gpu::DisplayMode::Fullscreen :
                 mode == "borderless" ? gpu::DisplayMode::Borderless : gpu::DisplayMode::Windowed;
         }
+        else if (arg == "--controller" && i + 1 < argc)
+            _putenv_s("AR_CONTROLLER", argv[++i]);
+        else if (arg == "--online")
+            _putenv_s("AR_ONLINE", "1");
+        else if (arg == "--online-peer" && i + 1 < argc)
+            _putenv_s("AR_ONLINE_PEER", argv[++i]);
+        else if (arg == "--player-name" && i + 1 < argc)
+            _putenv_s("AR_PLAYER_NAME", argv[++i]);
         else if (arg == "--fps" && i + 1 < argc)
             gpu::g_videoSettings.frameRate = std::clamp(atoi(argv[++i]), 30, 120);
         else if (arg == "--render-scale" && i + 1 < argc)

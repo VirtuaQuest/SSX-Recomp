@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <kernel/keyboard_mouse.h>
 #include <kernel/memory.h>
 #include <gpu/video_settings.h>
 #include <gpu/d3d12_renderer.h>
@@ -298,6 +299,18 @@ static void ScanTimers(uint8_t* base)
 // lines. "track <address> [floats]" logs that many floats (3) there every 6 updates as TRACK lines ("track 0" stops).
 static std::mutex g_findMutex;
 static std::deque<std::string> g_findRequests;
+
+// CRI's mwPlyGetStat (r3 = the player): 0 stopped, 1 preparing, 2 playing, 3 played to the end, 4 error. A cutscene being skipped has played to the end.
+PPC_FUNC_IMPL(__imp__sub_82507700);
+PPC_FUNC(sub_82507700)
+{
+    __imp__sub_82507700(ctx, base);
+    if (ctx.r3.u32 == 1 || ctx.r3.u32 == 2)
+    {
+        if (kbm::MovieSkippingOpen())
+            ctx.r3.u64 = 3;
+    }
+}
 
 void RequestFind(const std::string& request)
 {
@@ -1018,6 +1031,42 @@ void MotionCapHook(PPCRegister& limit)
         limit.f64 = double(float(limit.f64) * step);
 }
 
+// Diagnostics (AR_LOG_QUADS=<update>): every effect sprite queued for drawing during 60 updates from that one, with its class and fields.
+static std::atomic<int64_t> g_updateNumber;
+
+PPC_FUNC_IMPL(__imp__sub_82C478A0);
+PPC_FUNC(sub_82C478A0)
+{
+    static const int64_t from = AR_ENV("AR_LOG_QUADS") ? atoll(AR_ENV("AR_LOG_QUADS")) : -1;
+    int64_t update = g_updateNumber.load(std::memory_order_relaxed);
+    if (from >= 0 && update >= from && update < from + 60)
+    {
+        uint32_t o = ctx.r3.u32;
+        auto f = [&](uint32_t offset) { uint32_t bits = PPC_LOAD_U32(o + offset); float value; memcpy(&value, &bits, 4); return value; };
+        LOGF_INFO("QUAD {} frame {} {:08X} vt {:08X} kind {} flags {:08X} {:08X} {:08X} parent {:08X} a300 {} a944 {} rgb {} {} {} blend {} cells {} {} size {} {} v1148 {} lr {:08X}", update, gpu::d3d12::GetFrameNumber(), o,
+            PPC_LOAD_U32(o), PPC_LOAD_U16(o + 82), PPC_LOAD_U32(o + 60), PPC_LOAD_U32(o + 64), PPC_LOAD_U32(o + 124), PPC_LOAD_U32(o + 92), f(300), f(944), f(932), f(936), f(940), PPC_LOAD_U32(o + 1116),
+            PPC_LOAD_U32(o + 1120), PPC_LOAD_U32(o + 1124), f(1136), f(1140), f(1148), uint32_t(ctx.lr));
+    }
+    __imp__sub_82C478A0(ctx, base);
+}
+
+// Diagnostics (AR_LOG_GLOW=<update>): the effect objects drawn by sub_82C5BD28, during 40 updates from that one.
+PPC_FUNC_IMPL(__imp__sub_82C5BD28);
+PPC_FUNC(sub_82C5BD28)
+{
+    static const int64_t from = AR_ENV("AR_LOG_GLOW") ? atoll(AR_ENV("AR_LOG_GLOW")) : -1;
+    int64_t update = g_updateNumber.load(std::memory_order_relaxed);
+    if (from >= 0 && update >= from && update < from + 40)
+    {
+        uint32_t o = ctx.r3.u32;
+        std::string words;
+        for (uint32_t i = 0; i < 96; i++)
+            words += fmt::format(" {:08X}", PPC_LOAD_U32(o + i * 4));
+        LOGF_INFO("GLOW {} frame {} {:08X}{}", update, gpu::d3d12::GetFrameNumber(), o, words);
+    }
+    __imp__sub_82C5BD28(ctx, base);
+}
+
 // Diagnostics (AR_LOG_CAMERA): which code sets where the camera looks, to find what moves it in a scene.
 static void LogCameraCaller(const char* what, uint32_t caller)
 {
@@ -1083,6 +1132,7 @@ PPC_FUNC(sub_82BD7EC8)
     }
 
     __imp__sub_82BD7EC8(ctx, base);
+    g_updateNumber.fetch_add(1, std::memory_order_relaxed);
 
     ScanTimers(base);
     RunFind(base);

@@ -793,6 +793,8 @@ namespace kbm
         }
     }
 
+    static void AddMovieOverlay(std::vector<gpu::d3d12::OverlayQuad>& quads);
+
     void GetOverlay(std::vector<gpu::d3d12::OverlayQuad>& quads)
     {
         static constexpr float LABEL_X = 97.5f, LONGEST_LABEL = 260.0f; // The values on the camera rows start after that.
@@ -802,6 +804,7 @@ namespace kbm
 
         if (TitlePromptShowing())
             AddTitlePrompt(quads);
+        AddMovieOverlay(quads);
 
         int page = g_controlsPage;
         if (page == 2)
@@ -961,6 +964,16 @@ namespace kbm
     static std::mutex g_rowsMutex;
     static std::vector<MenuRow> g_rows;
     static std::chrono::steady_clock::time_point g_rowsTime;
+    static MenuGrid g_grid;
+    static std::chrono::steady_clock::time_point g_gridTime;
+
+    void SetMenuGrid(const MenuGrid& grid)
+    {
+        g_windowTime = Milliseconds(); // A menu, whatever the title's flags say.
+        std::lock_guard lock(g_rowsMutex);
+        g_grid = grid;
+        g_gridTime = std::chrono::steady_clock::now();
+    }
 
     static std::atomic<int> g_optionsSelected{ -1 };
 
@@ -974,7 +987,7 @@ namespace kbm
         // A window popping up, its selection showing.
         bool windowShowing = false;
         for (const MenuRow& row : rows)
-            windowShowing |= row.window && row.selected;
+            windowShowing |= (row.window && row.selected) || row.alwaysMenu;
         if (windowShowing)
             g_windowTime = Milliseconds();
         // AR_LOG_OPTIONS: when they come and go, and the state the title is in then.
@@ -1045,6 +1058,8 @@ namespace kbm
         bool options = false;  // The Options screen's rows, in the order shown, or the lines of a row opened.
         int closeRow = -1;     // A window the title takes no Back on: the row that Back means. No when it asks to confirm, the only row otherwise.
         int arrow = 0;         // On the selected line of a row opened: over the arrow that lowers (-1) or raises (1) its value.
+        int columns = 0;       // A grid: selected and target count along its rows, this many to a row.
+        uint16_t pageButton = 0; // Over an arrow turning a grid's pages: what a click presses.
     };
 
     // The picture is 1280 x 720 scaled to fit the window, keeping its shape.
@@ -1072,9 +1087,13 @@ namespace kbm
         if (g_controlsPage != 0)
             return hover;
         std::vector<MenuRow> rows;
+        MenuGrid grid;
         {
             std::lock_guard lock(g_rowsMutex);
-            if (std::chrono::steady_clock::now() - g_rowsTime > std::chrono::milliseconds(300))
+            auto now = std::chrono::steady_clock::now();
+            if (now - g_gridTime <= std::chrono::milliseconds(300))
+                grid = g_grid;
+            if (now - g_rowsTime > std::chrono::milliseconds(300) && grid.columns == 0)
                 return hover;
             rows = g_rows;
         }
@@ -1130,7 +1149,26 @@ namespace kbm
             }
         }
         if (!found)
+        {
+            // Not a list: a grid, if there's one.
+            if (grid.columns > 0 && grid.selected >= 0)
+            {
+                hover.hasRows = true;
+                hover.columns = grid.columns;
+                hover.selected = grid.selected;
+                int gridColumn = int(std::floor((x - grid.x) / grid.stepX)), gridRow = int(std::floor((y - grid.y) / grid.stepY));
+                if (gridColumn >= 0 && gridColumn < grid.columns && gridRow >= 0 && gridRow < grid.rows)
+                    hover.target = gridRow * grid.columns + gridColumn;
+                if (std::abs(y - grid.arrowY) < 20.0f)
+                {
+                    if (grid.arrowLeftX >= 0.0f && std::abs(x - grid.arrowLeftX) < 16.0f)
+                        hover.pageButton = XINPUT_GAMEPAD_LEFT_SHOULDER;
+                    if (grid.arrowRightX >= 0.0f && std::abs(x - grid.arrowRightX) < 16.0f)
+                        hover.pageButton = XINPUT_GAMEPAD_RIGHT_SHOULDER;
+                }
+            }
             return hover;
+        }
         size_t allRows = rows.size();
         std::erase_if(rows, [&](const MenuRow& row) { return std::abs(row.x0 - column) > 1.0f; });
         if (rows.size() == 2 && rows.size() < allRows && std::abs(column - 777.0f) < 3.0f)
@@ -1508,7 +1546,128 @@ namespace kbm
         }
     }
 
+    // Skipping cutscenes.
+    static std::atomic<int> g_moviesOpen;
+    static std::atomic<bool> g_movieSkip;
+    static std::atomic<bool> g_moviePromptKeyboard;
+    static std::atomic<int64_t> g_moviePromptUntil, g_movieSkipTime, g_movieBlackSince, g_movieClosedTime;
+    static constexpr int64_t MOVIE_FADE_MS = 250, MOVIE_PROMPT_MS = 4000, MOVIE_CHAIN_MS = 2500, MOVIE_BLACK_LIMIT_MS = 10000;
+
+    void NoteMovieOpen(bool open)
+    {
+        static const bool enabled = !AR_ENV("AR_NO_MOVIE_SKIP");
+        if (!enabled)
+            return;
+        int64_t now = Milliseconds();
+        if (open)
+        {
+            // A cutscene can be several movies in a row: skipping goes on through them.
+            if (g_moviesOpen.fetch_add(1) == 0 && now - g_movieClosedTime.load() > MOVIE_CHAIN_MS)
+                g_movieSkip = false;
+            if (g_movieSkip)
+                g_movieBlackSince = now;
+            LOGF_INFO("movie opened, skipping {}, {} ms after skipping", g_movieSkip.load(), now - g_movieSkipTime.load());
+        }
+        else if (g_moviesOpen.fetch_sub(1) == 1)
+        {
+            g_movieClosedTime = now;
+            g_moviePromptUntil = 0;
+            LOGF_INFO("movie closed, {} ms after skipping", now - g_movieSkipTime.load());
+        }
+    }
+
+    bool MovieSkipping()
+    {
+        return g_movieSkip && Milliseconds() - g_movieBlackSince.load() < MOVIE_BLACK_LIMIT_MS;
+    }
+
+    bool MovieSkippingOpen()
+    {
+        return MovieSkipping() && g_moviesOpen > 0;
+    }
+
+    static void AddMovieOverlay(std::vector<gpu::d3d12::OverlayQuad>& quads)
+    {
+        int64_t now = Milliseconds();
+        if (MovieSkipping())
+        {
+            // Black until the title has moved on, a moment after the last movie closes.
+            bool done = g_moviesOpen == 0 && now - g_movieClosedTime.load() > MOVIE_CHAIN_MS;
+            if (done)
+                g_movieSkip = false;
+            else
+            {
+                float alpha = std::min(float(now - g_movieSkipTime.load()) / float(MOVIE_FADE_MS), 1.0f);
+                quads.push_back({ 0.0f, 0.0f, 1280.0f, 720.0f, -1, { 0.0f, 0.0f, 0.0f, alpha } });
+                return;
+            }
+        }
+        if (g_moviesOpen > 0 && now < g_moviePromptUntil.load())
+        {
+            float alpha = std::min(float(g_moviePromptUntil.load() - now) / 400.0f, 1.0f);
+            const float color[4] = { 1.0f, 1.0f, 1.0f, alpha }, shadow[4] = { 0.0f, 0.0f, 0.0f, alpha };
+            const char* text = g_moviePromptKeyboard ? "Press ESC to skip" : "Press START to skip";
+            AddPageText(quads, 1241.0f, 667.0f, text, 1, shadow, true);
+            AddPageText(quads, 1240.0f, 666.0f, text, 1, color, true);
+        }
+    }
+
+    // Before the rest of the input: what's pressed during a movie. Returns the buttons not to pass on.
+    static uint16_t HandleMovieInput(const XINPUT_GAMEPAD& pad)
+    {
+        bool front = g_window != nullptr && (g_testInput || GetForegroundWindow() == g_window);
+        bool keyboard = Enabled() && front;
+        bool escape = keyboard && KeyIsDown(VK_ESCAPE);
+        bool start = (pad.wButtons & XINPUT_GAMEPAD_START) != 0;
+        static bool escapeBefore, startBefore, holding;
+        bool escapePressed = escape && !escapeBefore, startPressed = start && !startBefore;
+        escapeBefore = escape;
+        startBefore = start;
+        if (g_moviesOpen > 0)
+        {
+            bool padUsed = pad.wButtons != 0 || pad.bLeftTrigger > 30 || pad.bRightTrigger > 30;
+            bool keyUsed = false;
+            if (keyboard)
+            {
+                for (int i = 0; i < ACTION_COUNT; i++)
+                {
+                    for (int j = 0; j < 2; j++)
+                    {
+                        int key = g_keys[i][j];
+                        keyUsed |= key != 0 && KeyIsDown(key) && (!IsMouseKey(key) || g_captured);
+                    }
+                }
+            }
+            if (padUsed || keyUsed)
+            {
+                g_moviePromptKeyboard = keyUsed && !padUsed;
+                g_moviePromptUntil = Milliseconds() + MOVIE_PROMPT_MS;
+            }
+            if ((escapePressed || startPressed) && !g_movieSkip)
+            {
+                g_movieSkipTime = Milliseconds();
+                g_movieBlackSince = g_movieSkipTime.load();
+                g_movieSkip = true;
+                LOGF_INFO("skipping the movie");
+            }
+            if (escapePressed || startPressed)
+                holding = true;
+        }
+        // Not also the title's Pause or Back, for as long as it's held.
+        holding = holding && (escape || start);
+        return holding ? uint16_t(XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_B) : uint16_t(0);
+    }
+
+    static void ApplyKeysAndMouse(XINPUT_STATE& state, bool padConnected);
+
     void Apply(XINPUT_STATE& state, bool padConnected)
+    {
+        uint16_t blocked = HandleMovieInput(state.Gamepad);
+        ApplyKeysAndMouse(state, padConnected);
+        state.Gamepad.wButtons &= ~blocked;
+    }
+
+    static void ApplyKeysAndMouse(XINPUT_STATE& state, bool padConnected)
     {
         auto& pad = state.Gamepad;
         // Without a controller the keyboard and mouse's icons show from the start.
@@ -1604,7 +1763,9 @@ namespace kbm
                 // Left click on a list: on a row, or nothing happens. On another row than the selected one, once it's selected.
                 if (key == VK_LBUTTON && menu && hover.hasRows)
                 {
-                    if (hover.target < 0)
+                    if (hover.pageButton != 0)
+                        held[key] = hover.pageButton;
+                    else if (hover.target < 0)
                         held[key] = 0;
                     else if (hover.target != hover.selected)
                     {
@@ -1657,7 +1818,16 @@ namespace kbm
                 tapUntil = keyTime + std::chrono::milliseconds(60); // A press the title sees.
             wasDown = weaponAttackDown;
             if (weaponAttackDown && weapon)
+            {
                 buttons |= TRIGGER_LEFT;
+                // Aiming, the title fires on the right trigger: left click, while right click holds the aim. (Away from aiming, it's a weapon's attacks: X.)
+                static const bool fireFix = !AR_ENV("AR_NO_CLICK_FIRE");
+                if (fireFix && attackLeft && !menu && (CameraPlayerFlags() & 0x0A000000) != 0)
+                {
+                    buttons |= TRIGGER_RIGHT;
+                    attackLeft = false;
+                }
+            }
             if (keyTime < tapUntil)
                 buttons |= XINPUT_GAMEPAD_Y;
             attackRight |= weaponAttackDown && chord;
@@ -1692,6 +1862,20 @@ namespace kbm
         }
         if ((buttons & (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN)) != 0 || actionDown(ACT_MOVE_FORWARD) || actionDown(ACT_MOVE_BACK) || std::abs(pad.sThumbLY) > 8000)
             hoverActive = clickWaiting = false;
+        if (hover.columns > 0 && ((buttons & (XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT)) != 0 || actionDown(ACT_MOVE_LEFT) || actionDown(ACT_MOVE_RIGHT) || std::abs(pad.sThumbLX) > 8000))
+            hoverActive = clickWaiting = false;
+
+        // AR_LOG_BUTTONS: where the mouse is in a list or grid, as it changes.
+        {
+            static const bool logHover = AR_ENV("AR_LOG_BUTTONS") != nullptr;
+            static int hoverBefore[4];
+            int hoverNow[4] = { hover.selected, hover.target, hover.columns, hoverActive ? 1 : 0 };
+            if (logHover && memcmp(hoverNow, hoverBefore, sizeof(hoverNow)) != 0)
+            {
+                memcpy(hoverBefore, hoverNow, sizeof(hoverNow));
+                LOGF_INFO("hover selected {} target {} columns {} active {}", hoverNow[0], hoverNow[1], hoverNow[2], hoverNow[3]);
+            }
+        }
 
         static bool closingWindow, backBefore;
         bool back = (buttons & XINPUT_GAMEPAD_B) != 0;
@@ -1711,6 +1895,19 @@ namespace kbm
         static auto pressedUntil = std::chrono::steady_clock::time_point{};
         static uint16_t hoverButton;
         static auto hoverUntil = std::chrono::steady_clock::time_point{};
+        // A row that can't be selected (locked levels are skipped by the title): the selection jumps past it, and that's the end of trying.
+        static int unreachable = -1, tryingFrom = -1, tryingFor = -1, tryingWay = 0;
+        if (hover.target != unreachable)
+            unreachable = -1;
+        if (tryingWay != 0 && hover.selected >= 0 && hover.selected != tryingFrom)
+        {
+            bool passed = tryingWay > 0 ? (hover.selected > tryingFor || hover.selected < tryingFrom) : (hover.selected < tryingFor || hover.selected > tryingFrom);
+            if (passed && hover.columns == 0 && hover.target == tryingFor)
+                unreachable = tryingFor;
+            tryingWay = 0;
+        }
+        if (unreachable >= 0)
+            clickWaiting = false;
         if (keyTime >= hoverUntil)
         {
             if (hoverButton != 0)
@@ -1733,13 +1930,23 @@ namespace kbm
                     hoverUntil = keyTime + std::chrono::milliseconds(50);
                 }
             }
-            else if ((hoverActive || clickWaiting) && hover.target >= 0 && hover.selected >= 0 && hover.target != hover.selected &&
+            else if ((hoverActive || clickWaiting) && hover.target >= 0 && hover.selected >= 0 && hover.target != hover.selected && hover.target != unreachable &&
                 (!hover.options || OptionsGameEditing()) && (hover.selected != pressedFrom || keyTime >= pressedUntil))
             {
+                tryingFrom = hover.selected;
+                tryingFor = hover.target;
+                tryingWay = hover.target > hover.selected ? 1 : -1;
                 // One press, then wait for the selection to follow before the next.
                 pressedFrom = hover.selected;
                 pressedUntil = keyTime + std::chrono::milliseconds(350);
                 hoverButton = hover.target > hover.selected ? XINPUT_GAMEPAD_DPAD_DOWN : XINPUT_GAMEPAD_DPAD_UP;
+                if (hover.columns > 0)
+                {
+                    // Along the row first, then along the column.
+                    int fromColumn = hover.selected % hover.columns, toColumn = hover.target % hover.columns;
+                    if (fromColumn != toColumn)
+                        hoverButton = toColumn > fromColumn ? XINPUT_GAMEPAD_DPAD_RIGHT : XINPUT_GAMEPAD_DPAD_LEFT;
+                }
                 hoverUntil = keyTime + std::chrono::milliseconds(50);
             }
             else if (clickWaiting && hover.target >= 0 && hover.target == hover.selected)
@@ -2127,7 +2334,7 @@ namespace kbm
         {
             lastButtons = pad.wButtons;
             lastTrigger = pad.bLeftTrigger;
-            LOGF_INFO("buttons {:04X} left trigger {}", lastButtons, lastTrigger);
+            LOGF_INFO("buttons {:04X} left trigger {} camera flags {:08X}", lastButtons, lastTrigger, CameraPlayerFlags());
         }
 
         // AR_LOG_OPTIONS: the state of the Options screen as it changes.

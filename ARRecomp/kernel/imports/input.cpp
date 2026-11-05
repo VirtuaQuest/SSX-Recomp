@@ -19,6 +19,13 @@ static void WriteGamepad(XAMINPUT_GAMEPAD* guest, const XINPUT_GAMEPAD& host)
     guest->sThumbRY = int16_t(ByteSwap(uint16_t(host.sThumbRY)));
 }
 
+// Which real controller a guest's controller is: AR_CONTROLLER (--controller N, 1 to 4) makes that one the first, so that two copies of the game on one machine can each have their own.
+static DWORD HostPad(uint32_t user)
+{
+    static const DWORD chosen = AR_ENV("AR_CONTROLLER") ? DWORD(std::clamp(atoi(AR_ENV("AR_CONTROLLER")), 1, 4) - 1) : 0;
+    return user == 0 ? chosen : user == chosen ? 0 : user;
+}
+
 // Watches for controllers connecting and disconnecting, which titles learn about through a notification.
 static std::atomic<uint32_t> g_connectedMask{ 0xFFFFFFFF };
 
@@ -28,7 +35,7 @@ static uint32_t QueryConnectedMask()
     for (DWORD user = 0; user < XUSER_MAX_COUNT; user++)
     {
         XINPUT_CAPABILITIES capabilities;
-        if (XInputGetCapabilities(user, XINPUT_FLAG_GAMEPAD, &capabilities) == ERROR_SUCCESS)
+        if (XInputGetCapabilities(HostPad(user), XINPUT_FLAG_GAMEPAD, &capabilities) == ERROR_SUCCESS)
             mask |= 1u << user;
     }
 
@@ -355,7 +362,7 @@ static bool RemoteControl(XINPUT_STATE& state)
 
 static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
 {
-    bool connected = XInputGetState(user, &state) == ERROR_SUCCESS;
+    bool connected = XInputGetState(HostPad(user), &state) == ERROR_SUCCESS;
     if (!connected)
         memset(&state, 0, sizeof(state));
 
@@ -487,7 +494,7 @@ namespace imports
         StartConnectionMonitor();
 
         XINPUT_CAPABILITIES host;
-        if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(userIndex & 0xFF, XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
+        if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(HostPad(userIndex & 0xFF), XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
         {
             if ((userIndex & 0xFF) != 0 || !(AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled()))
                 return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -527,7 +534,7 @@ namespace imports
         XINPUT_VIBRATION host;
         host.wLeftMotorSpeed = ByteSwap(vibration->wLeftMotorSpeed);
         host.wRightMotorSpeed = ByteSwap(vibration->wRightMotorSpeed);
-        return XInputSetState(userIndex & 0xFF, &host) == ERROR_SUCCESS ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+        return XInputSetState(HostPad(userIndex & 0xFF), &host) == ERROR_SUCCESS ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
     }
 
     // X_INPUT_KEYSTROKE: VirtualKey, Unicode, Flags (big endian 16 bit), UserIndex, HidCode. A user index of 0xFF

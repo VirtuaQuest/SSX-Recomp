@@ -2,14 +2,9 @@ project(ARRecomp CXX)
 
 file(GLOB_RECURSE AR_RUNTIME_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
-# The name Windows shows for the program, and its icon if the user has one (kept with their files: it isn't part of this project).
+# The name Windows shows for the program. Its icon isn't built in: it comes from the player's copy of the game while running (gpu/game_icon.cpp).
 enable_language(RC)
 set(AR_RESOURCES "${CMAKE_CURRENT_SOURCE_DIR}/version.rc")
-set(AR_ICON_FILE "${CMAKE_SOURCE_DIR}/run/user/icon.ico")
-if(EXISTS "${AR_ICON_FILE}")
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/icon.rc" "1 ICON \"${AR_ICON_FILE}\"\n")
-    list(APPEND AR_RESOURCES "${CMAKE_CURRENT_BINARY_DIR}/icon.rc")
-endif()
 
 add_executable(ARRecomp ${AR_RUNTIME_SOURCES} ${AR_RESOURCES})
 

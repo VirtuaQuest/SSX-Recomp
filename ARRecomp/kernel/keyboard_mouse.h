@@ -30,8 +30,19 @@ namespace kbm
         float x0, y0, x1, y1;
         bool selected;
         bool window = false; // In a list of the kind windows popping up have, between thin lines with a selector moving over them.
+        bool alwaysMenu = false; // On screen means in a menu, even with nothing selected for the moment (its selection is on its way to a row).
     };
     void SetMenuRows(const std::vector<MenuRow>& rows);
+
+    // A grid of tiles on screen (the Gallery's screens), drawn each frame: the first tile's place, the distance between tiles, the size of one and the
+    // one selected. The arrows at its sides turn its pages.
+    struct MenuGrid
+    {
+        int columns = 0, rows = 0, selected = -1;
+        float x = 0.0f, y = 0.0f, stepX = 0.0f, stepY = 0.0f, width = 0.0f, height = 0.0f;
+        float arrowY = 0.0f, arrowLeftX = -1.0f, arrowRightX = -1.0f;
+    };
+    void SetMenuGrid(const MenuGrid& grid);
 
     // The prompts for breaking out of a stun: with the keyboard and mouse in use, the UI's sprite draw rearranges them.
     void SetStunPromptVisible(bool visible);
@@ -76,6 +87,12 @@ namespace kbm
     // The title sets its camera's settings from what it saves, the speeds last. While the mouse is turning the camera: sets them to the
     // mouse's settings instead, and gives the speed to use.
     bool MouseCameraSpeed(bool aiming, float& speed);
+
+    // Cutscenes that are movie files can be skipped. The file system says when one is open. Once skipping, the movie player's status says it has played
+    // to the end, so the title moves on as it does after a whole movie, while the picture fades to black and the sound goes quiet. AR_NO_MOVIE_SKIP turns it off.
+    void NoteMovieOpen(bool open);
+    bool MovieSkipping();
+    bool MovieSkippingOpen(); // With a movie still open.
 
     // Mouse sensitivity (--mouse-sensitivity, 1 is the default) and looking up with the mouse going down.
     void SetMouseOptions(float sensitivity, bool invertY);

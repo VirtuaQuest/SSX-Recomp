@@ -6,6 +6,11 @@ namespace gpu::window
     // Creates the window (once), as g_videoSettings asks, and returns its handle.
     HWND Create(const char* title);
 
+    // The window's icon, cut from the title's logo (game_icon.cpp): whether it's still to be made; makes it from the logo's texture (BC3); puts it on the window.
+    bool NeedsGameIcon();
+    void SaveGameIcon(const uint8_t* bc3, uint32_t rowPitch);
+    void ApplyGameIcon();
+
     // Client area size; changes when the user resizes the window.
     void GetClientSize(uint32_t& width, uint32_t& height);
 

@@ -10,6 +10,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 | `--game <iso or folder>` | Game files |
 | `--xex`, `--user` | Executable and user data folder overrides |
 | `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--draw-distance F`, `--sharpen 0-3`, `--ultrawide`, `--vsync`, `--shadows on\|off` | Video settings (what the launcher passes) |
+| `--online`, `--online-peer <IPs>`, `--player-name <name>`, `--controller <1-4>` | Multiplayer between copies (see LESSONS); which controller this copy reads |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
 
@@ -78,6 +79,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_THREAD_PROFILE` | Samples guest threads (slows the game; don't judge frame rates with it) |
 | `AR_LOG_SWAP_LATENCY`, `AR_LOG_FENCES`, `AR_LOG_GPU_WAITS`, `AR_LOG_IBS` | Swap latency, fences, waits, indirect buffers |
 | `AR_LOG_QUERIES`, `AR_LOG_QUERY_RESULTS` | Occlusion query waits (5 s summary) and results |
+| `AR_LOG_QUADS=<update>`, `AR_LOG_GLOW=<update>` | Effect sprites queued (`sub_82C478A0`, 60 updates) and objects drawn by `sub_82C5BD28` (40 updates) from that update on |
 | `AR_LOG_TIMEBASE`, `AR_LOG_QPC`, `AR_LOG_TIMESTEP` | Who reads the clock; the game's time step |
 | `AR_LOG_UI_TIME`, `AR_LOG_UI_TIMESTEP` | How fast UI time runs per real second (1 is right); calls per UI step hook |
 | `AR_LOG_ANIM_STEP`, `AR_LOG_INPUT_REPEAT` | Objects getting the time step for their animation; each menu input repeat |
@@ -104,6 +106,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
 | `AR_NO_DEPTH_24` | Keeping depth to the guest's precision (see LESSONS) |
+| `AR_NO_MOVIE_SKIP`, `AR_NO_SIM_FPS_CAP`, `AR_NO_CLICK_FIRE` | Skipping movies; 30 fps in the Tutorial and multiplayer matches; left click firing while aiming |
 | `AR_NO_DEPTH_CLIP`, `AR_NO_DEPTH_TEST` | Depth clipping (clamps instead), depth testing |
 | `AR_NO_STATE_CACHE`, `AR_FULL_HASH`, `AR_FULL_CONSTANTS`, `AR_FULL_VERTEX_BUFFERS` | Skipping redundant state, sampled hashes, constant and vertex range trimming |
 | `AR_NO_BULK_REGISTERS` | Copying constant and register blocks without side effects in one piece |
@@ -113,11 +116,11 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 
 ## Keyboard and mouse
 
-`kernel/keyboard_mouse.cpp` merges them into controller 0. Bindings are in `user/key_bindings.txt` (delete it for the defaults), the window's icon in `user/icon.ico`. `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
+`kernel/keyboard_mouse.cpp` merges them into controller 0. Bindings are in `user/key_bindings.txt` (delete it for the defaults), the window's icon, cut from the title's logo, in `user/game_icon.ico` (`AR_NO_GAME_ICON` leaves it out). `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
 `AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. `AR_KBM_ICONS=1|0`
 forces which icons show, `AR_LOG_INPUT_DEVICE` logs switches, `AR_MOUSE_FULL_SPEED` (counts per second for a full stick, 3000)
 and `AR_MOUSE_DEAD_ZONE` (0.41, just past the title's 0.4) tune the camera. `AR_CLICK_CHORD_MS` (35) is how long a click waits for the other
-button before it attacks on its own. `AR_TAP_HOLD_MS` (150) is how long right click is held before it readies the weapon instead of being a heavy attack (Heavy Attack and Use Killer Weapon can share a key; files saved before this get the weapon moved to right click unless it was changed by hand). `AR_LOG_BUTTONS` logs the buttons and left trigger the title gets as they change and the stun prompts coming and going, `AR_LOG_OPTIONS` the Options screen's state
+button before it attacks on its own. `AR_TAP_HOLD_MS` (150) is how long right click is held before it readies the weapon instead of being a heavy attack (Heavy Attack and Use Killer Weapon can share a key; files saved before this get the weapon moved to right click unless it was changed by hand). `AR_LOG_BUTTONS` logs the buttons, left trigger and camera flags the title gets as they change, where the mouse is in a list or grid, and the stun prompts coming and going, `AR_LOG_OPTIONS` the Options screen's state
 and how its highlights grow, `AR_OPTIONS_HIGHLIGHT_SPEED` (4.4 per second) how fast the added rows' grow. `AR_LOG_ATLAS_HASHES` logs atlas hashes if the art stops being recognised.
 The art comes from `tools/mkb_art/make_mkb_art.py`, which writes `ARRecomp/gpu/mkb_art.inl`.
 
@@ -139,6 +142,10 @@ frame rate, but walking to a place by timing alone isn't reliable. A connected c
 
 `tools/test/world_speed.sh <name> --fps <n>` continues the campaign and measures running speed: it catches large errors such as
 slow motion. Peaks vary between runs and routes (6-9 at every frame rate so far), so it can't show small ones.
+
+`AR_ONLINE=1` is `--online`; `AR_NET_IP` overrides this machine's address; `AR_ONLINE_TRACE` logs packets and traffic per socket. `find watch` and `AR_FRAME_TRACE` work as usual on each copy, in its own folder.
+
+Guest memory can also be read from outside with `ReadProcessMemory` at 0x100000000 + address, which doesn't disturb timing: snapshots over a run, with the player's position at player + 0x40, found through the word at 0x831C51C0 + 6208.
 
 ## Memory watches
 

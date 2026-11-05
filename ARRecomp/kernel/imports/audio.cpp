@@ -9,6 +9,7 @@
 #include <stdafx.h>
 #include <kernel/imports.h>
 #include <cpu/guest_thread.h>
+#include <kernel/keyboard_mouse.h>
 #include <xaudio2.h>
 
 constexpr uint32_t AUDIO_SAMPLE_RATE = 48000;
@@ -72,6 +73,7 @@ public:
     {
         auto& buffer = m_buffers[m_nextBuffer];
         m_nextBuffer = (m_nextBuffer + 1) % BUFFER_RING_SIZE;
+        bool skipping = kbm::MovieSkipping();
 
         for (uint32_t i = 0; i < AUDIO_FRAME_SAMPLES; i++)
         {
@@ -81,8 +83,10 @@ public:
             float backLeft = samples[4 * AUDIO_FRAME_SAMPLES + i];
             float backRight = samples[5 * AUDIO_FRAME_SAMPLES + i];
 
-            buffer[i * 2 + 0] = frontLeft + center * 0.75f + backLeft;
-            buffer[i * 2 + 1] = frontRight + center * 0.75f + backRight;
+            // Going quiet quickly while a cutscene is being skipped.
+            m_gain = skipping ? std::max(m_gain - 1.0f / (AUDIO_SAMPLE_RATE * 0.15f), 0.0f) : std::min(m_gain + 1.0f / (AUDIO_SAMPLE_RATE * 0.05f), 1.0f);
+            buffer[i * 2 + 0] = (frontLeft + center * 0.75f + backLeft) * m_gain;
+            buffer[i * 2 + 1] = (frontRight + center * 0.75f + backRight) * m_gain;
             m_peak = std::max({ m_peak, std::abs(buffer[i * 2 + 0]), std::abs(buffer[i * 2 + 1]) });
         }
 
@@ -117,6 +121,7 @@ private:
     uint32_t m_nextBuffer{};
     uint64_t m_framesSubmitted{};
     float m_peak{};
+    float m_gain{ 1.0f };
 };
 
 static AudioOutput g_output;

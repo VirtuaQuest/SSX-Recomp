@@ -4,6 +4,7 @@
 #include <kernel/vfs.h>
 #include <kernel/xam.h>
 #include <kernel/xex_loader.h>
+#include <kernel/net_session.h>
 #include <xex.h>
 
 // ---- Overlapped requests ----
@@ -134,11 +135,54 @@ constexpr uint32_t CONTENT_DEVICE_ID = 1; // The hard drive.
 
 static std::filesystem::path ContentPath(uint32_t contentType, std::string_view fileName)
 {
-    return vfs::UserPath() / "content" / fmt::format("{:08X}", contentType) / std::string(fileName);
+    // A second copy of the game running on this machine (--online) mustn't write over the first one's saves: it has its own, starting as a copy of them.
+    static const std::string folder = []
+        {
+            int copy = net::Online() ? (net::LocalBase() - net::BASE_PORT) / net::PORT_BLOCK : 0;
+            if (copy == 0)
+                return std::string("content");
+            std::string name = fmt::format("content_copy{}", copy + 1);
+            std::error_code ec;
+            if (!std::filesystem::exists(vfs::UserPath() / name, ec))
+                std::filesystem::copy(vfs::UserPath() / "content", vfs::UserPath() / name, std::filesystem::copy_options::recursive, ec);
+            LOGF_INFO("online: saves of this copy are in {}", name);
+            return name;
+        }();
+    return vfs::UserPath() / folder / fmt::format("{:08X}", contentType) / std::string(fileName);
 }
 
-static uint64_t g_userXuid = 0xE000000000000001ull;
-static const char* g_userName = "Player";
+static uint64_t g_offlineXuid = 0xE000000000000001ull;
+
+// The profile. With AR_ONLINE every copy has to be someone else: the title ignores a player with its own id. AR_PLAYER_NAME sets the name.
+static uint64_t UserXuid()
+{
+    if (!net::Online())
+        return g_offlineXuid;
+    static const uint64_t xuid = []
+        {
+            uint8_t address[36];
+            net::FillLocalAddress(address);
+            uint64_t id = 0x0009000000000000ull;
+            for (int i = 16; i < 22; i++)
+                id |= uint64_t(address[i]) << (8 * (i - 16));
+            return id;
+        }();
+    return xuid;
+}
+
+static const char* UserName()
+{
+    static const std::string name = []
+        {
+            if (!net::Online())
+                return std::string("Player");
+            const char* chosen = AR_ENV("AR_PLAYER_NAME");
+            std::string text = chosen && chosen[0] ? std::string(chosen).substr(0, 15) : fmt::format("Player {}", (net::LocalBase() - net::BASE_PORT) / net::PORT_BLOCK + 1);
+            net::SetHostName(text.c_str()); // Others are told it when they find a game hosted here, and the title checks it when they join.
+            return text;
+        }();
+    return name.c_str();
+}
 
 void PrintCurrentStack(int maxFrames);
 
@@ -292,8 +336,11 @@ namespace imports
     // Without Xbox Live these have nothing to do; accepting them lets titles continue.
     constexpr uint32_t XGI_APP = 0xFB;
 
-    static uint32_t DispatchXgiMessage(uint32_t message)
+    static uint32_t DispatchXgiMessage(uint32_t message, uint32_t buffer = 0, uint32_t bufferLength = 0)
     {
+        uint32_t sessionResult;
+        if (net::HandleSessionMessage(message, buffer, bufferLength, sessionResult))
+            return sessionResult;
         static std::mutex mutex;
         static std::set<uint32_t> logged;
         std::lock_guard lock(mutex);
@@ -307,7 +354,10 @@ namespace imports
         if (app == XMP_APP)
             return DispatchXmpMessage(message, parameter1);
         if (app == XGI_APP)
-            return DispatchXgiMessage(message);
+            return DispatchXgiMessage(message, parameter1, parameter2);
+        // Xbox Live parties (app 0xFC): not in one. The title trusts what comes back unless it's told exactly that, and reads a list that isn't there.
+        if (app == 0xFC && net::Online())
+            return 0x807D0003;
 
         LOGF_WARNING("unhandled message 0x{:08X} to app 0x{:08X}", message, app);
         return X_ERROR_NOT_FOUND;
@@ -318,7 +368,7 @@ namespace imports
         if (app == XMP_APP)
             return FinishRequest(overlapped, DispatchXmpMessage(message, buffer));
         if (app == XGI_APP)
-            return FinishRequest(overlapped, DispatchXgiMessage(message));
+            return FinishRequest(overlapped, DispatchXgiMessage(message, buffer, bufferLength));
 
         LOGF_WARNING("unhandled I/O request 0x{:08X} to app 0x{:08X}", message, app);
         return FinishRequest(overlapped, X_ERROR_NOT_FOUND);
@@ -329,7 +379,7 @@ namespace imports
         if (app == XMP_APP)
             return FinishRequest(overlapped, DispatchXmpMessage(message, buffer));
         if (app == XGI_APP)
-            return FinishRequest(overlapped, DispatchXgiMessage(message));
+            return FinishRequest(overlapped, DispatchXgiMessage(message, buffer, bufferLength));
 
         LOGF_WARNING("unhandled I/O request 0x{:08X} to app 0x{:08X}", message, app);
         return FinishRequest(overlapped, X_ERROR_NOT_FOUND);
@@ -342,10 +392,12 @@ namespace imports
 
     // ---- Users ----
 
-    // One local profile is signed in on the first controller; it is never signed in to Xbox Live.
+    // One local profile is signed in on the first controller; it is never signed in to Xbox Live, except that AR_ONLINE (--online, see net.cpp) says it is,
+    // which gets the title's multiplayer menus to open. Nothing connects to any service.
+    // Asked when needed, not read into a global: --online sets it in main, after globals are initialised.
     uint32_t XamUserGetSigninState(uint32_t userIndex)
     {
-        return userIndex == 0 ? 1 : 0; // eXUserSigninState_SignedInLocally
+        return userIndex == 0 ? (net::Online() ? 2 : 1) : 0; // eXUserSigninState_SignedInToLive, _SignedInLocally
     }
 
     uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags, XUSER_SIGNIN_INFO* info)
@@ -354,9 +406,9 @@ namespace imports
         if (userIndex != 0)
             return X_ERROR_NO_SUCH_USER;
 
-        info->xuid = g_userXuid;
-        info->SigninState = 1;
-        strcpy(info->Name, g_userName);
+        info->xuid = UserXuid();
+        info->SigninState = net::Online() ? 2 : 1;
+        strcpy(info->Name, UserName());
         return X_ERROR_SUCCESS;
     }
 
@@ -365,7 +417,7 @@ namespace imports
         if (userIndex != 0)
             return X_ERROR_NO_SUCH_USER;
 
-        *xuid = g_userXuid;
+        *xuid = UserXuid();
         return X_ERROR_SUCCESS;
     }
 
@@ -376,7 +428,7 @@ namespace imports
 
         if (bufferSize > 0)
         {
-            strncpy(buffer, g_userName, bufferSize - 1);
+            strncpy(buffer, UserName(), bufferSize - 1);
             buffer[bufferSize - 1] = '\0';
         }
 
@@ -389,7 +441,7 @@ namespace imports
             return X_ERROR_NO_SUCH_USER;
 
         // Offline profile: no Live privileges such as multiplayer sessions or communication.
-        *result = 0;
+        *result = net::Online() ? 1 : 0;
         return X_ERROR_SUCCESS;
     }
 
@@ -692,7 +744,7 @@ namespace imports
         // Titles expect the current sign-in and input device state when they start listening.
         listener->Post(XN_SYS_SIGNINCHANGED, 1);
         listener->Post(XN_SYS_INPUTDEVICESCHANGED, 0);
-        listener->Post(XN_LIVE_CONNECTIONCHANGED, 0x80151001); // XONLINE_E_LOGON_CANNOT_ACCESS_SERVICE
+        listener->Post(XN_LIVE_CONNECTIONCHANGED, net::Online() ? 0 : 0x80151001); // XONLINE_E_LOGON_CANNOT_ACCESS_SERVICE
 
         return CreateHandle(listener);
     }
@@ -758,15 +810,34 @@ namespace imports
         return false;
     }
 
+    // With AR_ONLINE (net_session.cpp) a session is just a handle and a piece of guest memory the title passes back in its messages.
+    struct SessionObject : KernelObject
+    {
+        uint32_t guest{};
+        SessionObject() : KernelObject(ObjectType::Other) {}
+    };
+
     uint32_t XamSessionCreateHandle(be<uint32_t>* handle)
     {
-        LOGF_WARNING("Xbox Live sessions are not available");
-        return X_ERROR_FUNCTION_FAILED;
+        if (!net::Online())
+        {
+            LOGF_WARNING("Xbox Live sessions are not available");
+            return X_ERROR_FUNCTION_FAILED;
+        }
+        auto session = std::make_shared<SessionObject>();
+        session->guest = g_runtimeHeap.AllocGuest(0x40);
+        memset(g_memory.Translate(session->guest), 0, 0x40);
+        *handle = CreateHandle(session);
+        return X_ERROR_SUCCESS;
     }
 
     uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t>* object)
     {
-        return X_ERROR_INVALID_HANDLE;
+        auto session = std::dynamic_pointer_cast<SessionObject>(LookupHandle(handle));
+        if (!session)
+            return X_ERROR_INVALID_HANDLE;
+        *object = session->guest;
+        return X_ERROR_SUCCESS;
     }
 }
 

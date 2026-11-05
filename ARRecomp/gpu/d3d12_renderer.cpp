@@ -2490,6 +2490,17 @@ float4 main(float4 position : SV_Position) : SV_Target
 
     static void NoteGameFont(CachedTexture& entry, const DecodedTexture& decoded, uint32_t address)
     {
+        // The title's logo, which has the emblem for the window's icon.
+        if (decoded.format == DXGI_FORMAT_BC3_UNORM && decoded.width == 1024 && decoded.height == 1024 && gpu::window::NeedsGameIcon())
+        {
+            static constexpr uint64_t LOGO_HASH = 0xED5841CF6DB22485ull;
+            uint64_t hash = HashMemory(decoded.data.data(), decoded.data.size());
+            static const bool logHash = AR_ENV("AR_LOG_ATLAS_HASHES") != nullptr;
+            if (logHash)
+                LOGF_INFO("atlas {:08X} 1024x1024 hash {:016X} row pitch {}", address, hash, decoded.rowPitch);
+            if (hash == LOGO_HASH)
+                gpu::window::SaveGameIcon(decoded.data.data(), decoded.rowPitch);
+        }
         entry.gameFont = -1;
         bool icons = decoded.width == 128 && decoded.height == 64;
         bool stencil = decoded.format == DXGI_FORMAT_BC3_UNORM && decoded.width == 512 && decoded.height == 512;
