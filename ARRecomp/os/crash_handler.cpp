@@ -121,6 +121,14 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* info)
     }
 
     PrintStack(GetCurrentThread(), *info->ContextRecord, 48);
+
+    // AR_CRASH_DUMP_THREADS: what every other guest thread was doing, for crashes that look like races.
+    if (getenv("AR_CRASH_DUMP_THREADS"))
+    {
+        void DumpGuestThreads();
+        fflush(stderr);
+        DumpGuestThreads();
+    }
     TerminateProcess(GetCurrentProcess(), 0xC0DE0000 | (code & 0xFFFF));
     return EXCEPTION_CONTINUE_SEARCH;
 }

@@ -7,6 +7,7 @@
 #include <stdafx.h>
 #include <kernel/imports.h>
 #include <kernel/net_session.h>
+#include <kernel/objects.h>
 #include <random>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -697,6 +698,106 @@ namespace imports
         return 0;
     }
 
+    // ---- WSA events: kernel events (manual reset), as on the console ----
+
+    uint32_t NetDll_WSACreateEvent()
+    {
+        auto event = CreateGuestBackedObject<KernelObject>(sizeof(XDISPATCHER_HEADER), ObjectType::Event);
+        event->Header()->Type = DISPATCHER_NOTIFICATION_EVENT;
+        event->Header()->Size = sizeof(XDISPATCHER_HEADER) / 4;
+        event->Header()->SignalState = 0;
+        return CreateHandle(event);
+    }
+
+    uint32_t NetDll_WSACloseEvent(uint32_t handle)
+    {
+        return CloseHandle(handle) ? 1 : 0;
+    }
+
+    uint32_t NetDll_WSASetEvent(uint32_t handle)
+    {
+        auto event = LookupHandle<KernelObject>(handle, ObjectType::Event);
+        if (!event)
+            return 0;
+        SetDispatcherEvent(event->Header());
+        return 1;
+    }
+
+    uint32_t NetDll_WSAResetEvent(uint32_t handle)
+    {
+        auto event = LookupHandle<KernelObject>(handle, ObjectType::Event);
+        if (!event)
+            return 0;
+        ResetDispatcherEvent(event->Header());
+        return 1;
+    }
+
+    // Returns WSA_WAIT_EVENT_0 + index, WSA_WAIT_TIMEOUT (0x102) or WSA_WAIT_FAILED (-1).
+    uint32_t NetDll_WSAWaitForMultipleEvents(uint32_t count, be<uint32_t>* handles, uint32_t waitAll, uint32_t timeout, uint32_t alertable)
+    {
+        std::vector<std::shared_ptr<KernelObject>> objects;
+        std::vector<XDISPATCHER_HEADER*> headers;
+        for (uint32_t i = 0; i < count && i < 64; i++)
+        {
+            auto object = LookupHandle(handles[i]);
+            if (!object)
+                return 0xFFFFFFFF;
+            headers.push_back(object->Header());
+            objects.push_back(std::move(object));
+        }
+        if (headers.empty())
+            return 0xFFFFFFFF;
+        uint32_t status = WaitForDispatcherObjects(headers, waitAll != 0, timeout == 0xFFFFFFFF ? std::nullopt : MillisecondsToDeadline(timeout), alertable != 0);
+        return status == X_STATUS_TIMEOUT ? 0x102 : status;
+    }
+
+    // ---- Offline answers for the rest of the network library: no link, no addresses ----
+
+    uint32_t NetDll_XNetCleanup(uint32_t caller, uint32_t unknown) { return 0; }
+    uint32_t NetDll_XNetGetEthernetLinkStatus(uint32_t caller) { return net::Online() ? 0x1 | 0x2 | 0x8 : 0; } // Active, 100 Mbps, full duplex.
+    uint32_t NetDll_XNetGetConnectStatus(uint32_t caller, uint32_t address) { return 0; } // XNET_CONNECT_STATUS_IDLE
+    uint32_t NetDll_XNetConnect(uint32_t caller, uint32_t address) { return 0; }
+    uint32_t NetDll_XNetRegisterKey(uint32_t caller, uint32_t keyId, uint32_t key) { return 0; }
+    uint32_t NetDll_XNetUnregisterKey(uint32_t caller, uint32_t keyId) { return 0; }
+    uint32_t NetDll_XnpLogonGetStatus(uint32_t caller, be<uint32_t>* status, be<uint32_t>* error)
+    {
+        if (status != nullptr)
+            *status = 0;
+        if (error != nullptr)
+            *error = 0;
+        return 0;
+    }
+
+    uint32_t NetDll_XNetRandom(uint32_t caller, uint8_t* buffer, uint32_t length)
+    {
+        static std::mt19937 random{ std::random_device{}() };
+        for (uint32_t i = 0; i < length; i++)
+            buffer[i] = uint8_t(random());
+        return 0;
+    }
+
+    // XNKID (8 bytes) and XNKEY (16 bytes), random.
+    uint32_t NetDll_XNetCreateKey(uint32_t caller, uint8_t* keyId, uint8_t* key)
+    {
+        NetDll_XNetRandom(caller, keyId, 8);
+        NetDll_XNetRandom(caller, key, 16);
+        keyId[0] &= ~0x74; // XNET_XNKID_MASK: a system link key.
+        keyId[0] |= 0x04;
+        return 0;
+    }
+
+    uint32_t NetDll_XNetDnsLookup(uint32_t caller, const char* name, uint32_t event, be<uint32_t>* dns) { return X_WSAENETDOWN; }
+    uint32_t NetDll_XNetDnsRelease(uint32_t caller, uint32_t dns) { return 0; }
+    uint32_t NetDll_XNetServerToInAddr(uint32_t caller, uint32_t address, uint32_t serviceId, be<uint32_t>* inaddr) { return X_WSAENETDOWN; }
+    uint32_t NetDll_XNetQosServiceLookup(uint32_t caller, uint32_t flags, uint32_t event, be<uint32_t>* qos) { return X_WSAENETDOWN; }
+
+    int32_t NetDll_getsockname(uint32_t caller, uint32_t socket, uint32_t name, uint32_t length) { t_lastSocketError = X_WSAENETDOWN; return X_SOCKET_ERROR; }
+    int32_t NetDll_getpeername(uint32_t caller, uint32_t socket, uint32_t name, uint32_t length) { t_lastSocketError = X_WSAENETDOWN; return X_SOCKET_ERROR; }
+    int32_t NetDll_getsockopt(uint32_t caller, uint32_t socket, uint32_t level, uint32_t option, uint32_t value, uint32_t length) { t_lastSocketError = X_WSAENETDOWN; return X_SOCKET_ERROR; }
+    int32_t NetDll_WSARecv(uint32_t caller, uint32_t socket) { t_lastSocketError = X_WSAENETDOWN; return X_SOCKET_ERROR; }
+    int32_t NetDll_WSARecvFrom(uint32_t caller, uint32_t socket) { t_lastSocketError = X_WSAENETDOWN; return X_SOCKET_ERROR; }
+    uint32_t NetDll_WSAGetOverlappedResult(uint32_t caller, uint32_t socket) { t_lastSocketError = X_WSAENETDOWN; return 0; }
+
     uint32_t NetDll_XNetQosRelease(uint32_t caller, uint32_t qos)
     {
         if (!net::Online() || qos == 0)
@@ -738,3 +839,27 @@ AR_IMPORT(NetDll_XNetXnAddrToMachineId);
 AR_IMPORT(NetDll_XNetQosListen);
 AR_IMPORT(NetDll_XNetQosLookup);
 AR_IMPORT(NetDll_XNetQosRelease);
+AR_IMPORT(NetDll_WSACreateEvent);
+AR_IMPORT(NetDll_WSACloseEvent);
+AR_IMPORT(NetDll_WSASetEvent);
+AR_IMPORT(NetDll_WSAResetEvent);
+AR_IMPORT(NetDll_WSAWaitForMultipleEvents);
+AR_IMPORT(NetDll_XNetCleanup);
+AR_IMPORT(NetDll_XNetGetEthernetLinkStatus);
+AR_IMPORT(NetDll_XNetGetConnectStatus);
+AR_IMPORT(NetDll_XNetConnect);
+AR_IMPORT(NetDll_XNetRegisterKey);
+AR_IMPORT(NetDll_XNetUnregisterKey);
+AR_IMPORT(NetDll_XnpLogonGetStatus);
+AR_IMPORT(NetDll_XNetRandom);
+AR_IMPORT(NetDll_XNetCreateKey);
+AR_IMPORT(NetDll_XNetDnsLookup);
+AR_IMPORT(NetDll_XNetDnsRelease);
+AR_IMPORT(NetDll_XNetServerToInAddr);
+AR_IMPORT(NetDll_XNetQosServiceLookup);
+AR_IMPORT(NetDll_getsockname);
+AR_IMPORT(NetDll_getpeername);
+AR_IMPORT(NetDll_getsockopt);
+AR_IMPORT(NetDll_WSARecv);
+AR_IMPORT(NetDll_WSARecvFrom);
+AR_IMPORT(NetDll_WSAGetOverlappedResult);

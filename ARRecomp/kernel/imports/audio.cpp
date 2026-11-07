@@ -1,11 +1,9 @@
-// Audio: the XAudio render driver and XMA contexts.
+// Audio: the XAudio render driver (XMA decoding is in xma.cpp).
 //
 // The title mixes its audio in software and hands the render driver frames of 256 samples for 6 channels
 // (planar, big endian float, 48 kHz). The driver calls the title's audio client whenever the host device needs
 // more audio, which paces the title's mixer like the console's audio hardware, and plays the frames through
 // XAudio2, downmixed to stereo. Based on Unleashed Recompiled's apu/driver/sdl2_driver.cpp (GPL-3.0).
-//
-// XMA contexts (hardware decoded compressed audio) are allocated, but nothing decodes them yet.
 #include <stdafx.h>
 #include <kernel/imports.h>
 #include <cpu/guest_thread.h>
@@ -272,22 +270,6 @@ namespace imports
     uint32_t XAudioGetDuckerReleaseTime(be<float>* time) { if (time) *time = 0.0f; return X_STATUS_SUCCESS; }
     uint32_t XAudioGetDuckerHoldTime(be<float>* time) { if (time) *time = 0.0f; return X_STATUS_SUCCESS; }
 
-    // XMA contexts live in physical memory, where the decoder hardware reads them.
-    uint32_t XMACreateContext(be<uint32_t>* context)
-    {
-        static std::atomic<bool> warned;
-        if (!warned.exchange(true))
-            LOGF_WARNING("XMA decoding is not implemented, sounds using it will be silent");
-
-        *context = AllocatePhysicalMemory(0x40, 0x1000, PHYSICAL_VIEW_4K, 0x04, false);
-        return *context != 0 ? X_STATUS_SUCCESS : X_STATUS_NO_MEMORY;
-    }
-
-    void XMAReleaseContext(uint32_t context)
-    {
-        FreePhysicalMemory(context);
-    }
-
     uint32_t HidReadKeys(uint32_t unknown1, uint32_t unknown2, uint32_t unknown3)
     {
         return 0xC000009D; // STATUS_DEVICE_NOT_CONNECTED
@@ -305,6 +287,4 @@ AR_IMPORT(XAudioGetDuckerThreshold);
 AR_IMPORT(XAudioGetDuckerAttackTime);
 AR_IMPORT(XAudioGetDuckerReleaseTime);
 AR_IMPORT(XAudioGetDuckerHoldTime);
-AR_IMPORT(XMACreateContext);
-AR_IMPORT(XMAReleaseContext);
 AR_IMPORT(HidReadKeys);

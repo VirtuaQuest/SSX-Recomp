@@ -38,7 +38,7 @@ namespace gpu
         return factor > 1.01f ? factor : 1.0f;
     }
 
-    // How much wider than 16:9 the picture is shown now: only while the title is building a 3D camera's view, or movies and 2D screens would be stretched
-    // (they stay 16:9 with bars). See sub_82703DF8 in draw_hooks.cpp.
+    // How much wider than 16:9 the picture is shown now. For SSX the title's projection isn't widened yet, so the
+    // picture always stays 16:9 with bars (1).
     float UltrawideFactor();
 }

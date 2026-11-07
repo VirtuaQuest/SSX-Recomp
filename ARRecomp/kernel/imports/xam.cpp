@@ -76,8 +76,14 @@ struct EnumeratorObject : KernelObject
     uint32_t itemSize{};
     std::vector<std::vector<uint8_t>> items;
     size_t position{};
+    uint32_t privateData{}; // XamCreateEnumeratorHandle's extra space for the system app answering it.
 
     EnumeratorObject() : KernelObject(ObjectType::Other) {}
+    ~EnumeratorObject()
+    {
+        if (privateData != 0)
+            g_runtimeHeap.FreeGuest(privateData);
+    }
 };
 
 // ---- Notification listeners ----
@@ -550,6 +556,42 @@ namespace imports
         return result;
     }
 
+    // An enumerator answered by a system app (marketplace, friends): the title gets room for the app's state, which
+    // nothing fills here, so its enumeration finds nothing.
+    uint32_t XamCreateEnumeratorHandle(uint32_t userIndex, uint32_t appId, uint32_t openMessage, uint32_t closeMessage,
+        uint32_t extraSize, uint32_t itemCount, uint32_t flags, be<uint32_t>* handle)
+    {
+        auto enumerator = std::make_shared<EnumeratorObject>();
+        enumerator->itemSize = 1;
+        enumerator->privateData = g_runtimeHeap.AllocGuest(std::max<uint32_t>(extraSize, 4));
+        memset(g_memory.Translate(enumerator->privateData), 0, std::max<uint32_t>(extraSize, 4));
+        *handle = CreateHandle(enumerator);
+        LOGF_INFO("enumerator for app 0x{:X} (message 0x{:X}, {} bytes, {} items)", appId, openMessage, extraSize, itemCount);
+        return X_ERROR_SUCCESS;
+    }
+
+    uint32_t XamGetPrivateEnumStructureFromHandle(uint32_t handle, be<uint32_t>* data)
+    {
+        auto enumerator = std::dynamic_pointer_cast<EnumeratorObject>(LookupHandle(handle));
+        if (!enumerator)
+            return X_ERROR_INVALID_HANDLE;
+        *data = enumerator->privateData;
+        return X_ERROR_SUCCESS;
+    }
+
+    // The full game: every license bit.
+    uint32_t XamContentGetLicenseMask(be<uint32_t>* mask, uint32_t overlapped)
+    {
+        if (mask != nullptr)
+            *mask = 0xFFFFFFFF;
+        if (overlapped != 0)
+        {
+            CompleteOverlapped(overlapped, X_ERROR_SUCCESS, 0);
+            return X_ERROR_IO_PENDING;
+        }
+        return X_ERROR_SUCCESS;
+    }
+
     // ---- Content ----
 
     uint32_t XamContentGetDeviceData(uint32_t deviceId, XDEVICE_DATA* data)
@@ -872,6 +914,9 @@ AR_IMPORT(XamUserReadProfileSettings);
 AR_IMPORT(XamUserCreateAchievementEnumerator);
 AR_IMPORT(XamUserCreateStatsEnumerator);
 AR_IMPORT(XamEnumerate);
+AR_IMPORT(XamCreateEnumeratorHandle);
+AR_IMPORT(XamGetPrivateEnumStructureFromHandle);
+AR_IMPORT(XamContentGetLicenseMask);
 AR_IMPORT(XamContentGetDeviceData);
 AR_IMPORT(XamContentCreateEnumerator);
 AR_IMPORT(XamContentCreateEx);

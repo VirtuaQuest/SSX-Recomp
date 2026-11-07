@@ -354,4 +354,9 @@ namespace gpu
         if (!g_renderingDisabled)
             d3d12::Present(registers, swap);
     }
+
+    float UltrawideFactor()
+    {
+        return 1.0f;
+    }
 }

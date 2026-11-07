@@ -190,6 +190,150 @@ namespace gpu
         }
     }
 
+    // ---- Block compressed textures whose top level isn't a whole number of blocks ----
+    //
+    // D3D12 needs block compressed textures to be multiples of 4 texels across and down. Padding them would stretch
+    // what the title samples by up to a texel, so such textures are decompressed to RGBA8 instead (BC4 to red, BC5 to
+    // red and green, as their own formats sample). AR_NO_BC_DECOMPRESS leaves them as they were (they then fail to
+    // be created).
+
+    static void DecodeColorBlock(const uint8_t* block, uint8_t (*texels)[4], bool fourColors)
+    {
+        auto expand = [](uint16_t c, uint8_t* out)
+            {
+                out[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
+                out[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+                out[2] = uint8_t((c & 31) * 255 / 31);
+                out[3] = 255;
+            };
+        uint16_t c0 = uint16_t(block[0] | (block[1] << 8)), c1 = uint16_t(block[2] | (block[3] << 8));
+        uint8_t colors[4][4];
+        expand(c0, colors[0]);
+        expand(c1, colors[1]);
+        for (int i = 0; i < 3; i++)
+        {
+            if (fourColors || c0 > c1)
+            {
+                colors[2][i] = uint8_t((2 * colors[0][i] + colors[1][i]) / 3);
+                colors[3][i] = uint8_t((colors[0][i] + 2 * colors[1][i]) / 3);
+            }
+            else
+            {
+                colors[2][i] = uint8_t((colors[0][i] + colors[1][i]) / 2);
+                colors[3][i] = 0;
+            }
+        }
+        colors[2][3] = 255;
+        colors[3][3] = (fourColors || c0 > c1) ? 255 : 0;
+        uint32_t indices = uint32_t(block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24));
+        for (int t = 0; t < 16; t++)
+            memcpy(texels[t], colors[(indices >> (t * 2)) & 3], 4);
+    }
+
+    // BC3 alpha, BC4 and BC5 channels: two endpoints and 3 bit indices.
+    static void DecodeInterpolatedBlock(const uint8_t* block, uint8_t (*texels)[4], int channel)
+    {
+        uint8_t values[8];
+        values[0] = block[0];
+        values[1] = block[1];
+        if (values[0] > values[1])
+        {
+            for (int i = 1; i < 7; i++)
+                values[i + 1] = uint8_t(((7 - i) * values[0] + i * values[1]) / 7);
+        }
+        else
+        {
+            for (int i = 1; i < 5; i++)
+                values[i + 1] = uint8_t(((5 - i) * values[0] + i * values[1]) / 5);
+            values[6] = 0;
+            values[7] = 255;
+        }
+        uint64_t indices = 0;
+        for (int i = 0; i < 6; i++)
+            indices |= uint64_t(block[2 + i]) << (8 * i);
+        for (int t = 0; t < 16; t++)
+            texels[t][channel] = values[(indices >> (t * 3)) & 7];
+    }
+
+    static bool DecompressBlocks(DecodedTexture& texture)
+    {
+        uint32_t blockBytes;
+        switch (texture.format)
+        {
+        case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC4_UNORM: blockBytes = 8; break;
+        case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC5_UNORM: blockBytes = 16; break;
+        default: return false;
+        }
+
+        uint32_t widthBlocks = (texture.width + 3) / 4;
+        uint32_t heightBlocks = texture.rowCount;
+        // Rows of upload data have to start on 256 byte boundaries (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT).
+        uint32_t rowPitch = (texture.width * 4 + 255) & ~255u;
+        std::vector<uint8_t> rgba(size_t(rowPitch) * texture.height * texture.depth);
+        uint8_t texels[16][4];
+        for (uint32_t z = 0; z < texture.depth; z++)
+        {
+            const uint8_t* source = texture.data.data() + size_t(texture.rowPitch) * texture.rowCount * z;
+            uint8_t* dest = rgba.data() + size_t(rowPitch) * texture.height * z;
+            for (uint32_t by = 0; by < heightBlocks; by++)
+            {
+                for (uint32_t bx = 0; bx < widthBlocks; bx++)
+                {
+                    const uint8_t* block = source + size_t(texture.rowPitch) * by + size_t(bx) * blockBytes;
+                    switch (texture.format)
+                    {
+                    case DXGI_FORMAT_BC1_UNORM:
+                        DecodeColorBlock(block, texels, false);
+                        break;
+                    case DXGI_FORMAT_BC2_UNORM:
+                        DecodeColorBlock(block + 8, texels, true);
+                        for (int t = 0; t < 16; t++)
+                            texels[t][3] = uint8_t(((block[t / 2] >> ((t & 1) * 4)) & 15) * 17);
+                        break;
+                    case DXGI_FORMAT_BC3_UNORM:
+                        DecodeColorBlock(block + 8, texels, true);
+                        DecodeInterpolatedBlock(block, texels, 3);
+                        break;
+                    case DXGI_FORMAT_BC4_UNORM:
+                        for (auto& texel : texels)
+                        {
+                            texel[1] = texel[2] = 0;
+                            texel[3] = 255;
+                        }
+                        DecodeInterpolatedBlock(block, texels, 0);
+                        break;
+                    default: // BC5
+                        for (auto& texel : texels)
+                        {
+                            texel[2] = 0;
+                            texel[3] = 255;
+                        }
+                        DecodeInterpolatedBlock(block, texels, 0);
+                        DecodeInterpolatedBlock(block + 8, texels, 1);
+                        break;
+                    }
+                    for (uint32_t ty = 0; ty < 4; ty++)
+                    {
+                        uint32_t y = by * 4 + ty;
+                        if (y >= texture.height)
+                            break;
+                        for (uint32_t tx = 0; tx < 4; tx++)
+                        {
+                            uint32_t x = bx * 4 + tx;
+                            if (x < texture.width)
+                                memcpy(dest + size_t(rowPitch) * y + x * 4, texels[ty * 4 + tx], 4);
+                        }
+                    }
+                }
+            }
+        }
+        texture.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texture.rowPitch = rowPitch;
+        texture.rowCount = texture.height;
+        texture.data = std::move(rgba);
+        return true;
+    }
+
     bool DecodeTexture(const TextureFetch& fetch, DecodedTexture& out)
     {
         FormatInfo info;
@@ -252,6 +396,9 @@ namespace gpu
             }
         }
 
+        static const bool decompress = !AR_ENV("AR_NO_BC_DECOMPRESS");
+        if (decompress && ((out.width & 3) != 0 || (out.height & 3) != 0))
+            DecompressBlocks(out);
         return true;
     }
 }

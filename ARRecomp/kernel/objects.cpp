@@ -397,6 +397,27 @@ bool ReleaseDispatcherSemaphore(XDISPATCHER_HEADER* semaphore, int32_t count, in
     return true;
 }
 
+// A mutant is free with a signal state of 1; each acquisition by its owner takes one away. Only the owner may
+// release it, and the last release frees it for others.
+bool ReleaseDispatcherMutant(XDISPATCHER_HEADER* mutant, uint32_t thread, int32_t* previousCount)
+{
+    std::lock_guard lock(g_dispatcherMutex);
+
+    int32_t previous = SignalState(mutant);
+    if (previousCount != nullptr)
+        *previousCount = previous;
+    if (MutantOwner(mutant) != thread || previous > 0)
+        return false;
+
+    SetSignalState(mutant, previous + 1);
+    if (previous + 1 == 1)
+    {
+        MutantOwner(mutant) = 0;
+        WakeWaiters(mutant);
+    }
+    return true;
+}
+
 void SignalDispatcherObject(XDISPATCHER_HEADER* object, int32_t signalState)
 {
     std::lock_guard lock(g_dispatcherMutex);

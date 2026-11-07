@@ -19,6 +19,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace gpu::d3d12
 {
+    static ComPtr<ID3D12InfoQueue> g_infoQueue; // AR_D3D12_DEBUG on debug layers without a message callback.
+    void LogStoredDebugMessages();
     using namespace reg;
 
     constexpr uint32_t FRAME_COUNT = 2;
@@ -1748,7 +1750,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             return g.initialized;
 
         g.failed = true;
-        HWND hwnd = window::Create("Anarchy Reigns");
+        HWND hwnd = window::Create("SSX");
         g_scale = std::clamp<uint32_t>(g_videoSettings.renderScale, 1, 4);
 
         // AR_D3D12_DEBUG: the D3D12 debug layer, with its messages in the log (each message once);
@@ -1798,9 +1800,10 @@ float4 main(float4 position : SV_Position) : SV_Target
                                 uint32_t(id), count, description);
                     }, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
             }
-            else
+            else if (SUCCEEDED(g.device.As(&g_infoQueue)))
             {
-                LOGF_WARNING("the D3D12 debug layer's message callback isn't available; messages go to the debugger");
+                // Older debug layers have no callback: the stored messages are logged after a creation fails.
+                LOGF_INFO("D3D12 debug layer: messages are logged when a creation fails");
             }
         }
 
@@ -2156,7 +2159,8 @@ float4 main(float4 position : SV_Position) : SV_Target
         D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
         if (FAILED(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&texture.resource))))
         {
-            LOGF_ERROR("failed to create a {}x{}x{} texture of format {}", width, height, depth, uint32_t(format));
+            LOGF_ERROR("failed to create a {}x{}x{} texture of format {} (flags {})", width, height, depth, uint32_t(format), uint32_t(flags));
+            LogStoredDebugMessages();
             return {};
         }
 
@@ -2737,6 +2741,34 @@ float4 main(float4 position : SV_Position) : SV_Target
                 return art.srv;
         }
         return entry.texture.resource ? entry.texture.srv : nullSrv;
+    }
+
+    // AR_D3D12_DEBUG without the message callback: the debug layer's stored messages, logged once and cleared.
+    void LogStoredDebugMessages()
+    {
+        HRESULT removed = g.device->GetDeviceRemovedReason();
+        if (removed != S_OK)
+        {
+            static bool logged;
+            if (!logged)
+                LOGF_ERROR("the D3D12 device was removed: 0x{:08X}", uint32_t(removed));
+            logged = true;
+        }
+        if (!g_infoQueue)
+            return;
+        static std::set<uint32_t> seen;
+        UINT64 count = g_infoQueue->GetNumStoredMessages();
+        for (UINT64 i = 0; i < count; i++)
+        {
+            SIZE_T size = 0;
+            g_infoQueue->GetMessage(i, nullptr, &size);
+            std::vector<uint8_t> buffer(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+            if (SUCCEEDED(g_infoQueue->GetMessage(i, message, &size)) && message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING &&
+                seen.insert(uint32_t(message->ID)).second)
+                LOGF_WARNING("D3D12 {}: {}", uint32_t(message->ID), std::string_view(message->pDescription, message->DescriptionByteLength ? message->DescriptionByteLength - 1 : 0));
+        }
+        g_infoQueue->ClearStoredMessages();
     }
 
     // ---- Samplers ----
@@ -3386,6 +3418,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (FAILED(g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline))))
         {
             LOGF_ERROR("failed to create a pipeline for shaders {:016X} / {:016X}", vertexShader.hash, pixelShader ? pixelShader->hash : 0);
+            LogStoredDebugMessages();
             return nullptr;
         }
 
@@ -5917,7 +5950,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         {
             // Scaled to fit the window, keeping the aspect ratio.
             float sourceWidth = float(swap.width ? swap.width : 1280), sourceHeight = float(swap.height ? swap.height : 720);
-            // (Ultrawide: the view is wider, shown as wide as the setting says. See sub_82703DF8 in draw_hooks.cpp.)
+            // (Ultrawide: the view is wider, shown as wide as the setting says.)
             float wider = UltrawideFactor();
             float scale = std::min(float(g.swapWidth) / (sourceWidth * wider), float(g.swapHeight) / sourceHeight);
             float viewWidth = sourceWidth * wider * scale, viewHeight = sourceHeight * scale;

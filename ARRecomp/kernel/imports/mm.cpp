@@ -186,6 +186,12 @@ namespace imports
         return address != 0 ? X_PAGE_READWRITE : 0;
     }
 
+    // Guest memory stays readable and writable on the host, so changing protection has no effect.
+    uint32_t MmSetAddressProtect(uint32_t address, uint32_t size, uint32_t protect)
+    {
+        return X_STATUS_SUCCESS;
+    }
+
     uint32_t MmMapIoSpace(uint32_t unknown, uint32_t sourceAddress, uint32_t size, uint32_t flags)
     {
         return sourceAddress;
@@ -262,6 +268,7 @@ AR_IMPORT(MmAllocatePhysicalMemoryEx);
 AR_IMPORT(MmFreePhysicalMemory);
 AR_IMPORT(MmGetPhysicalAddress);
 AR_IMPORT(MmQueryAddressProtect);
+AR_IMPORT(MmSetAddressProtect);
 AR_IMPORT(MmMapIoSpace);
 AR_IMPORT(MmQueryStatistics);
 AR_IMPORT(ExAllocatePoolTypeWithTag);

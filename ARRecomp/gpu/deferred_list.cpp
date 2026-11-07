@@ -2,6 +2,8 @@
 #include "deferred_list.h"
 #include <array>
 
+void PrintCurrentStack(int maxFrames);
+
 namespace gpu::d3d12
 {
     namespace
@@ -297,6 +299,33 @@ namespace gpu::d3d12
         std::copy_n(color, 4, d.color);
         std::copy_n(rects, rectCount, d.rects);
         Recorded();
+    }
+
+    void DeferredList::CheckOpen(Type type)
+    {
+        switch (type)
+        {
+        case Type::Reset:
+            m_open = true;
+            return;
+        case Type::Close:
+            m_open = false;
+            return;
+        case Type::Execute: case Type::ExecuteOther: case Type::ResetAllocator: case Type::Present:
+            return;
+        default:
+            break;
+        }
+        if (m_open)
+            return;
+        static std::mutex mutex;
+        static std::set<uint32_t> logged;
+        std::lock_guard lock(mutex);
+        if (logged.insert(uint32_t(type)).second)
+        {
+            LOGF_ERROR("command {} recorded while the command list is closed", uint32_t(type));
+            ::PrintCurrentStack(16);
+        }
     }
 
     void DeferredList::Close()

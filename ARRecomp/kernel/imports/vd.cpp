@@ -3,6 +3,8 @@
 #include <kernel/imports.h>
 #include <gpu/command_processor.h>
 
+void RunMemoryTools(uint8_t* base);
+
 static uint32_t MakePacketType3(uint32_t opcode, uint32_t count)
 {
     return (3u << 30) | (((count - 1) & 0x3FFF) << 16) | ((opcode & 0x7F) << 8);
@@ -148,6 +150,7 @@ namespace imports
             buffer[i] = 0;
 
         gpu::NoteSwapSubmitted();
+        RunMemoryTools(g_memory.base);
 
         // The front buffer's texture fetch constant tells the renderer its format and layout.
         if (fetchConstant != 0)

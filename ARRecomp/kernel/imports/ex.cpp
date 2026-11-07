@@ -67,7 +67,8 @@ namespace imports
         *address = thunk;
         if (thunk == 0)
         {
-            LOGF_WARNING("procedure {} of module 0x{:08X} is not available", ordinal, module);
+            const char* name = module == g_xamModule ? "xam" : module == g_kernelModule ? "xboxkrnl" : module == g_module.ldrEntry ? "the title" : "unknown";
+            LOGF_WARNING("procedure {} of module 0x{:08X} ({}) is not available", ordinal, module, name);
             return X_STATUS_UNSUCCESSFUL;
         }
 

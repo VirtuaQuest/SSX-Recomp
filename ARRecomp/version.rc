@@ -9,8 +9,8 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "Anarchy Reigns"
-            VALUE "ProductName", "Anarchy Reigns"
+            VALUE "FileDescription", "SSX Recompiled"
+            VALUE "ProductName", "SSX Recompiled"
         END
     END
     BLOCK "VarFileInfo"

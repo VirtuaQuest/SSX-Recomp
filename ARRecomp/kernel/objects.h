@@ -126,6 +126,9 @@ int32_t PulseDispatcherEvent(XDISPATCHER_HEADER* event);
 // Releases a semaphore. Returns false when the limit would be exceeded.
 bool ReleaseDispatcherSemaphore(XDISPATCHER_HEADER* semaphore, int32_t count, int32_t limit, int32_t* previousCount);
 
+// Releases a mutant owned by this guest thread. False when the thread doesn't own it.
+bool ReleaseDispatcherMutant(XDISPATCHER_HEADER* mutant, uint32_t thread, int32_t* previousCount);
+
 // Sets the signal state of any dispatcher object and wakes waiters, e.g. for threads finishing.
 void SignalDispatcherObject(XDISPATCHER_HEADER* object, int32_t signalState);
 

@@ -1,93 +1,20 @@
+// Memory tools for finding things in a title, driven by the remote control (AR_REMOTE) and environment switches:
+// a timer scan (AR_SCAN_TIMERS), a cheat-finder style search ("find ..."), a tracker and pokes. They run once per
+// frame from VdSwap (RunMemoryTools).
 #include <stdafx.h>
-#include <kernel/keyboard_mouse.h>
 #include <kernel/function.h>
-#include <kernel/net_session.h>
 #include <kernel/memory.h>
 #include <gpu/video_settings.h>
 #include <gpu/d3d12_renderer.h>
 
-// D3D's block on fence (device r3, fence r4): kicks the command buffer when the fence is the newest one, then spins
-// until the GPU's completed fence (*(device + 11024)) reaches it (the device's newest fence is at device + 11036).
-//
-// Diagnostics (AR_LOG_FENCE_WAITS): time spent waiting per caller and how far behind the newest fence the target was.
-PPC_FUNC_IMPL(__imp__sub_82238EC8);
-PPC_FUNC(sub_82238EC8)
-{
-    static const bool logWaits = AR_ENV("AR_LOG_FENCE_WAITS") != nullptr;
-    if (!logWaits)
-    {
-        __imp__sub_82238EC8(ctx, base);
-        return;
-    }
-
-    uint32_t caller = uint32_t(ctx.lr), device = ctx.r3.u32, fence = ctx.r4.u32;
-    uint32_t behind = PPC_LOAD_U32(device + 11036) - fence;
-    auto start = std::chrono::steady_clock::now();
-    __imp__sub_82238EC8(ctx, base);
-    double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-
-    struct Entry
-    {
-        uint32_t calls = 0;
-        double total = 0.0;
-        std::map<uint32_t, uint32_t> behind;
-    };
-    static std::mutex mutex;
-    static std::map<uint32_t, Entry> entries;
-    static auto lastReport = std::chrono::steady_clock::now();
-    std::lock_guard lock(mutex);
-    auto& entry = entries[caller];
-    entry.calls++;
-    entry.total += waited;
-    entry.behind[std::min(behind, 9u)]++;
-    auto now = std::chrono::steady_clock::now();
-    if (now - lastReport < std::chrono::seconds(5))
-        return;
-    lastReport = now;
-    std::string text;
-    for (const auto& [address, value] : entries)
-    {
-        std::string distances;
-        for (auto [distance, count] : value.behind)
-            distances += fmt::format(" {}:{}", distance, count);
-        text += fmt::format("\n    caller {:08X}: {} waits, {:.0f} ms (fences behind newest:{})", address, value.calls, value.total, distances);
-    }
-    LOGF_INFO("D3D fence waits in 5 s:{}", text);
-    entries.clear();
-}
-
-// The title's QueryPerformanceCounter: stores the 64-bit time base at r3 and returns 1.
-//
-// Diagnostics (AR_LOG_QPC): calls per guest return address, every 5 seconds.
-PPC_FUNC_IMPL(__imp__sub_8245B458);
-PPC_FUNC(sub_8245B458)
-{
-    static const bool logCallers = AR_ENV("AR_LOG_QPC") != nullptr;
-    if (logCallers)
-    {
-        static std::mutex mutex;
-        static std::map<uint32_t, uint32_t> counts;
-        static auto lastReport = std::chrono::steady_clock::now();
-        std::lock_guard lock(mutex);
-        counts[uint32_t(ctx.lr)]++;
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastReport > std::chrono::seconds(5))
-        {
-            lastReport = now;
-            std::string text;
-            for (auto [caller, count] : counts)
-                text += fmt::format(" {:08X} {};", caller, count);
-            LOGF_INFO("QueryPerformanceCounter callers in 5 s:{}", text);
-            counts.clear();
-        }
-    }
-
-    __imp__sub_8245B458(ctx, base);
-}
-
+static std::atomic<int64_t> g_updateNumber;
 void WatchGuestWords(const std::vector<uint32_t>& addresses, bool reads = false);
 void StopWatchingGuestWords();
-void RequestUiDump();
+// The UI item dump belonged to the previous title's UI hooks; SSX has none yet.
+static void RequestUiDump()
+{
+    LOGF_INFO("UI dump: not available for this title");
+}
 
 // Whether a watch started here is active: starting another then would lose track of the pages it protects.
 static bool g_watchActive;
@@ -167,7 +94,7 @@ static void ScanTimers(uint8_t* base)
     if (index == 0)
         LOGF_INFO("timer scan at frame {}", gpu::d3d12::GetFrameNumber());
 
-    static constexpr std::pair<uint32_t, uint32_t> ranges[] = { { 0x40000000, 0x50000000 }, { 0x83000000, 0x83B00000 },
+    static constexpr std::pair<uint32_t, uint32_t> ranges[] = { { 0x40000000, 0x50000000 }, { 0x837C0000, 0x83A00000 },
         { 0xA0000000, 0xC0000000 } };
     static std::vector<uint32_t> snapshots[std::size(ranges)];
     // Candidates, alive while consistent: integers changing by 1, or floats changing by the same amount every update
@@ -302,17 +229,6 @@ static void ScanTimers(uint8_t* base)
 static std::mutex g_findMutex;
 static std::deque<std::string> g_findRequests;
 
-// CRI's mwPlyGetStat (r3 = the player): 0 stopped, 1 preparing, 2 playing, 3 played to the end, 4 error. A cutscene being skipped has played to the end.
-PPC_FUNC_IMPL(__imp__sub_82507700);
-PPC_FUNC(sub_82507700)
-{
-    __imp__sub_82507700(ctx, base);
-    if (ctx.r3.u32 == 1 || ctx.r3.u32 == 2)
-    {
-        if (kbm::MovieSkippingOpen())
-            ctx.r3.u64 = 3;
-    }
-}
 
 void RequestFind(const std::string& request)
 {
@@ -327,7 +243,7 @@ static bool g_intFresh;
 
 static void RunFind(uint8_t* base)
 {
-    static constexpr std::pair<uint32_t, uint32_t> ranges[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83B00000 },
+    static constexpr std::pair<uint32_t, uint32_t> ranges[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83A00000 },
         { 0xA0000000, 0xC0000000 } };
     static std::vector<uint32_t> snapshots[std::size(ranges)];
     static std::vector<std::pair<uint32_t, uint32_t>> candidates; // Address and value at the last step.
@@ -372,7 +288,7 @@ static void RunFind(uint8_t* base)
     {
         // "find intnew", then "find intstep <delta>" after each change: small integers that changed by exactly that much. List
         // them with "find intlist".
-        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x83000000, 0x83B00000 } };
+        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x837C0000, 0x83A00000 } };
         static std::vector<uint32_t> snapshot[2];
         if (request == "intnew")
         {
@@ -534,14 +450,6 @@ static void RunFind(uint8_t* base)
             LOGF_INFO("FINDINT {:08X} = {}", g_intCandidates[i].first, PPC_LOAD_U32(g_intCandidates[i].first));
         return;
     }
-    if (request.rfind("addcpu ", 0) == 0)
-    {
-        // "find addcpu <count>": the title's own function adding CPU players to the session.
-        int count = atoi(request.c_str() + 7);
-        LOGF_INFO("adding {} CPU players", count);
-        GuestToHostFunction<void>(0x8271D6B8, 0x832AF7A8, count);
-        return;
-    }
     if (request.rfind("poke ", 0) == 0)
     {
         // "find poke <address> <hex word>": that word is set before every update from now on ("find poke <address> off" stops it). Testing only.
@@ -588,7 +496,7 @@ static void RunFind(uint8_t* base)
             wide.push_back(0);
             wide.push_back(uint8_t(c));
         }
-        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83B00000 }, { 0xA0000000, 0xC0000000 } };
+        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83A00000 }, { 0xA0000000, 0xC0000000 } };
         uint32_t found = 0;
         for (auto [first, end] : searched)
         {
@@ -618,7 +526,7 @@ static void RunFind(uint8_t* base)
     {
         // "find ptr <address>": words holding that value.
         uint32_t wanted = uint32_t(strtoul(request.c_str() + 4, nullptr, 16));
-        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83B00000 }, { 0xA0000000, 0xC0000000 } };
+        static constexpr std::pair<uint32_t, uint32_t> searched[] = { { 0x40000000, 0x50000000 }, { 0x82000000, 0x83A00000 }, { 0xA0000000, 0xC0000000 } };
         uint32_t found = 0;
         for (auto [first, end] : searched)
         {
@@ -640,7 +548,7 @@ static void RunFind(uint8_t* base)
     {
         // "find state a" in menus, "find state b" in gameplay: words of the image's data with one value in every "b" snapshot
         // and another value in every "a" snapshot. "find state list" logs them.
-        static constexpr uint32_t first = 0x82000000, end = 0x83B00000;
+        static constexpr uint32_t first = 0x82000000, end = 0x83A00000;
         static std::vector<uint32_t> firstA;
         static std::vector<std::pair<uint32_t, uint32_t>> kept; // Address, value in gameplay.
         static bool started;
@@ -767,461 +675,15 @@ static void RunFind(uint8_t* base)
     }
 }
 
-// The UI's updates hand their elements (HUD, radar, dialogue boxes, result screens) a fixed 1/30 s per update, so
-// above 30 fps the UI ran 2-4 times too fast. Mid-function hooks after each load of that step into f31 (see AR.toml)
-// scale it by the game's time step (30 Hz frames, 0x830778C8), which follows the frame time above 30 fps. The constant
-// itself has to stay: character code multiplies it by the time step, so scaling it put characters in slow motion.
-// AR_NO_UI_TIMESTEP_FIX keeps the fixed step; AR_LOG_UI_TIMESTEP logs how often each hook runs (every 5 s).
-// What the fixed step is multiplied by: the game's time step above 30 fps, otherwise 1.
-static float UiStepScale()
+// Once per frame, before the title builds it: pokes first, so the frame sees them.
+void RunMemoryTools(uint8_t* base)
 {
-    static const bool fix = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_UI_TIMESTEP_FIX");
-    if (!fix)
-        return 1.0f;
-    uint32_t bits = *reinterpret_cast<const be<uint32_t>*>(g_memory.Translate(0x830778C8));
-    float step;
-    memcpy(&step, &bits, 4);
-    return std::isfinite(step) && step > 0.0f && step <= 4.0f ? step : 1.0f;
-}
-
-static void ScaleUiStep(PPCRegister& f31, int site)
-{
-    static const bool logCalls = AR_ENV("AR_LOG_UI_TIMESTEP") != nullptr;
-    if (logCalls)
-    {
-        static std::mutex mutex;
-        static uint32_t calls[7];
-        static auto lastReport = std::chrono::steady_clock::now();
-        std::lock_guard lock(mutex);
-        calls[site]++;
-        if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(5))
-        {
-            lastReport = std::chrono::steady_clock::now();
-            LOGF_INFO("UI step hooks in 5 s: {} {} {} {} {} {}", calls[1], calls[2], calls[3], calls[4], calls[5], calls[6]);
-            memset(calls, 0, sizeof(calls));
-        }
-    }
-
-    f31.f64 = double(float(f31.f64) * UiStepScale());
-}
-
-// The rest of the UI code loads the step itself (see AR.toml): the same scaling after each of those loads. The constant
-// itself has to stay, as said above.
-void UiConstantHook(PPCRegister& step)
-{
-    step.f64 = double(float(step.f64) * UiStepScale());
-}
-
-// Updates a controller's buttons (r3: current at +0, pressed +4, released +8, pressed or repeating +12; updates held at
-// +44) from the new state in r4. A held button repeats after a number of updates given by two globals, so above 30 fps
-// a tap could count as 2 or 3 presses in the menus. There the count advances at 30 Hz, following the time step
-// (AR_NO_INPUT_REPEAT_FIX keeps it per update; AR_LOG_INPUT_REPEAT logs the repeats).
-PPC_FUNC_IMPL(__imp__sub_826E91E0);
-PPC_FUNC(sub_826E91E0)
-{
-    static const bool fix = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_INPUT_REPEAT_FIX");
-    static const bool log = AR_ENV("AR_LOG_INPUT_REPEAT") != nullptr;
-    uint32_t pad = ctx.r3.u32;
-    if (!fix)
-    {
-        uint32_t before = PPC_LOAD_U32(pad), held = ctx.r4.u32;
-        __imp__sub_826E91E0(ctx, base);
-        if (log && held != 0 && before == held && PPC_LOAD_U32(pad + 12) != 0)
-            LOGF_INFO("REPEAT {:08X} buttons {:08X} at frame {} delay {} period {}", pad, held, gpu::d3d12::GetFrameNumber(),
-                PPC_LOAD_U32(0x831AE360), PPC_LOAD_U32(0x831AE35C));
-        return;
-    }
-
-    static std::map<uint32_t, float> fractions;
-    uint32_t before = PPC_LOAD_U32(pad), buttons = ctx.r4.u32;
-    uint32_t changed = before ^ buttons, pressed = changed & buttons;
-    PPC_STORE_U32(pad + 0, buttons);
-    PPC_STORE_U32(pad + 4, pressed);
-    PPC_STORE_U32(pad + 8, changed & before);
-    PPC_STORE_U32(pad + 12, pressed);
-    float& fraction = fractions[pad];
-    if (before != buttons)
-    {
-        PPC_STORE_U32(pad + 44, 0);
-        fraction = 0.0f;
-        return;
-    }
-    uint32_t bits = PPC_LOAD_U32(0x830778C8);
-    float step;
-    memcpy(&step, &bits, 4);
-    fraction += std::isfinite(step) && step > 0.0f && step <= 4.0f ? step : 1.0f;
-    if (fraction < 1.0f)
-        return;
-    fraction = std::min(fraction - 1.0f, 1.0f);
-
-    uint32_t count = PPC_LOAD_U32(pad + 44) + 1, delay = PPC_LOAD_U32(0x831AE360), period = PPC_LOAD_U32(0x831AE35C);
-    PPC_STORE_U32(pad + 44, count);
-    if (count != delay)
-    {
-        if (count < delay + period)
-            return;
-        PPC_STORE_U32(pad + 44, count - period);
-    }
-    PPC_STORE_U32(pad + 12, pressed | buttons);
-    if (log && buttons != 0)
-        LOGF_INFO("REPEAT {:08X} buttons {:08X} at frame {} delay {} period {}", pad, buttons, gpu::d3d12::GetFrameNumber(), delay, period);
-}
-
-// Updates an animated object's animation (r3: its controller; the object at +3376). Animation advances by the object's
-// own time step at +944, which most objects refresh every update. Those that don't (the characters of two-character
-// dialogues among them) keep the 1 they were created with, so above 30 fps their lips and idle motion ran 2-4 times too
-// fast. Those get the game's time step here; they are recognised by the 1, or the step they got last time
-// (AR_NO_ANIM_STEP_FIX keeps the 1; AR_LOG_ANIM_STEP logs how many objects this concerns, every 5 s).
-PPC_FUNC_IMPL(__imp__sub_82BAE108);
-PPC_FUNC(sub_82BAE108)
-{
-    static const bool fix = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_ANIM_STEP_FIX");
-    static const bool log = AR_ENV("AR_LOG_ANIM_STEP") != nullptr;
-    uint32_t controller = ctx.r3.u32;
-    if (fix && PPC_LOAD_U32(controller) != 0)
-    {
-        uint32_t owner = PPC_LOAD_U32(controller + 3376);
-        if (owner != 0)
-        {
-            static std::atomic<uint32_t> latest{ 0x3F800000 }, previous{ 0x3F800000 };
-            uint32_t stepBits = PPC_LOAD_U32(0x830778C8);
-            uint32_t seen = latest.load(std::memory_order_relaxed);
-            if (stepBits != seen)
-            {
-                previous.store(seen, std::memory_order_relaxed);
-                latest.store(stepBits, std::memory_order_relaxed);
-            }
-            uint32_t value = PPC_LOAD_U32(owner + 944);
-            if (value == 0x3F800000 || value == seen || value == previous.load(std::memory_order_relaxed))
-            {
-                float step;
-                memcpy(&step, &stepBits, 4);
-                if (std::isfinite(step) && step > 0.0f && step <= 4.0f)
-                    PPC_STORE_U32(owner + 944, stepBits);
-                if (log)
-                {
-                    static std::mutex mutex;
-                    static std::set<uint32_t> owners;
-                    static auto lastReport = std::chrono::steady_clock::now();
-                    std::lock_guard lock(mutex);
-                    owners.insert(owner);
-                    if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(5))
-                    {
-                        lastReport = std::chrono::steady_clock::now();
-                        LOGF_INFO("ANIMSTEP {} objects at frame {} (step {}), vtable of one {:08X}", owners.size(), gpu::d3d12::GetFrameNumber(), step,
-                            PPC_LOAD_U32(owner));
-                        owners.clear();
-                    }
-                }
-            }
-        }
-    }
-    __imp__sub_82BAE108(ctx, base);
-}
-
-// Advances a UI element's time (at +116) and its children by f1. Nested elements (the two-character dialogues' among
-// them) get the fixed step from callers like sub_827EC068, which load it themselves: scale it here when it still is
-// the fixed step.
-PPC_FUNC_IMPL(__imp__sub_827EAEE0);
-PPC_FUNC(sub_827EAEE0)
-{
-    if (std::abs(float(ctx.f1.f64) - 1.0f / 30.0f) < 1e-6f)
-        ctx.f1.f64 = double(float(ctx.f1.f64) * UiStepScale());
-    __imp__sub_827EAEE0(ctx, base);
-}
-
-// Result screens run their timers on the UI's step (scaled above), but count up per update: above 30 fps the scores and the bar for what
-// gets unlocked went 2-4 times too fast. Each counts on the updates that would have happened at 30 fps, the others skip it.
-// AR_NO_RESULT_STEP_FIX counts every update; AR_LOG_RESULTS logs each screen's steps with the time they took.
-static bool ResultCountDue(float& fraction)
-{
-    static const bool fix = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_RESULT_STEP_FIX");
-    if (!fix)
-        return true;
-    fraction += UiStepScale();
-    if (fraction < 1.0f)
-        return false;
-    fraction = std::min(fraction - 1.0f, 1.0f);
-    return true;
-}
-
-static void LogResultStep(const char* screen, uint32_t state, uint32_t step)
-{
-    static const bool log = AR_ENV("AR_LOG_RESULTS") != nullptr;
-    if (!log)
-        return;
-    static uint64_t before;
-    static auto beforeTime = std::chrono::steady_clock::now();
-    uint64_t now = (uint64_t(state) << 32) | step;
-    if (now == before)
-        return;
-    auto time = std::chrono::steady_clock::now();
-    LOGF_INFO("RESULTS {} step {}.{} after {} ms", screen, state, step, std::chrono::duration_cast<std::chrono::milliseconds>(time - beforeTime).count());
-    before = now;
-    beforeTime = time;
-}
-
-// Bring a shown number closer to its total by half the difference, and return whether it's there (one of a mission's scores).
-PPC_FUNC_IMPL(__imp__sub_827F0808);
-PPC_FUNC(sub_827F0808)
-{
-    static float fraction;
-    if (!ResultCountDue(fraction))
-    {
-        ctx.r3.u64 = 0;
-        return;
-    }
-    __imp__sub_827F0808(ctx, base);
-}
-
-PPC_FUNC_IMPL(__imp__sub_827F08F0);
-PPC_FUNC(sub_827F08F0)
-{
-    static float fraction;
-    if (!ResultCountDue(fraction))
-    {
-        ctx.r3.u64 = 0;
-        return;
-    }
-    __imp__sub_827F08F0(ctx, base);
-}
-
-// A mission's result screen (state at +4140, its step at +4144). Step 1 of state 3 raises the total behind the unlock bar. Another step
-// value does nothing and goes on to draw it, so that's what it sees when not counting.
-PPC_FUNC_IMPL(__imp__sub_828042B8);
-PPC_FUNC(sub_828042B8)
-{
-    static constexpr uint32_t STEP_DOING_NOTHING = 99;
-    uint32_t screen = ctx.r3.u32;
-    uint32_t state = PPC_LOAD_U32(screen + 4140), step = PPC_LOAD_U32(screen + 4144);
-    LogResultStep("mission", state, step);
-    static float fraction;
-    if (state == 3 && step == 1 && !ResultCountDue(fraction))
-    {
-        PPC_STORE_U32(screen + 4144, STEP_DOING_NOTHING);
-        __imp__sub_828042B8(ctx, base);
-        PPC_STORE_U32(screen + 4144, 1);
-        return;
-    }
-    __imp__sub_828042B8(ctx, base);
-}
-
-// Another result screen (state at +1148): state 2 raises ten numbers by a thirtieth of their totals. A state past its last does nothing and goes on to draw it.
-PPC_FUNC_IMPL(__imp__sub_82803688);
-PPC_FUNC(sub_82803688)
-{
-    static constexpr uint32_t STATE_DOING_NOTHING = 99;
-    uint32_t screen = ctx.r3.u32;
-    uint32_t state = PPC_LOAD_U32(screen + 1148);
-    LogResultStep("scores", state, 0);
-    static float fraction;
-    if (state == 2 && !ResultCountDue(fraction))
-    {
-        PPC_STORE_U32(screen + 1148, STATE_DOING_NOTHING);
-        __imp__sub_82803688(ctx, base);
-        PPC_STORE_U32(screen + 1148, 2);
-        return;
-    }
-    __imp__sub_82803688(ctx, base);
-}
-
-// Characters move toward a target each update, at most 1.5 units per update (0x820A4130 + 644, shared with other code).
-// Ordinary movement stays below it and already follows the time step, but launches from vents and ramps hit it, so above
-// 30 fps they went up 2-4 times too fast. Hooks after each load of the limit scale it by the time step
-// (AR_NO_MOTION_CAP_FIX keeps it).
-void MotionCapHook(PPCRegister& limit)
-{
-    static const bool fix = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_MOTION_CAP_FIX");
-    if (!fix)
-        return;
-    uint32_t bits = *reinterpret_cast<const be<uint32_t>*>(g_memory.Translate(0x830778C8));
-    float step;
-    memcpy(&step, &bits, 4);
-    if (std::isfinite(step) && step > 0.0f && step <= 4.0f)
-        limit.f64 = double(float(limit.f64) * step);
-}
-
-// Diagnostics (AR_LOG_QUADS=<update>): every effect sprite queued for drawing during 60 updates from that one, with its class and fields.
-static std::atomic<int64_t> g_updateNumber;
-
-PPC_FUNC_IMPL(__imp__sub_82C478A0);
-PPC_FUNC(sub_82C478A0)
-{
-    static const int64_t from = AR_ENV("AR_LOG_QUADS") ? atoll(AR_ENV("AR_LOG_QUADS")) : -1;
-    int64_t update = g_updateNumber.load(std::memory_order_relaxed);
-    if (from >= 0 && update >= from && update < from + 60)
-    {
-        uint32_t o = ctx.r3.u32;
-        auto f = [&](uint32_t offset) { uint32_t bits = PPC_LOAD_U32(o + offset); float value; memcpy(&value, &bits, 4); return value; };
-        LOGF_INFO("QUAD {} frame {} {:08X} vt {:08X} kind {} flags {:08X} {:08X} {:08X} parent {:08X} a300 {} a944 {} rgb {} {} {} blend {} cells {} {} size {} {} v1148 {} lr {:08X}", update, gpu::d3d12::GetFrameNumber(), o,
-            PPC_LOAD_U32(o), PPC_LOAD_U16(o + 82), PPC_LOAD_U32(o + 60), PPC_LOAD_U32(o + 64), PPC_LOAD_U32(o + 124), PPC_LOAD_U32(o + 92), f(300), f(944), f(932), f(936), f(940), PPC_LOAD_U32(o + 1116),
-            PPC_LOAD_U32(o + 1120), PPC_LOAD_U32(o + 1124), f(1136), f(1140), f(1148), uint32_t(ctx.lr));
-    }
-    __imp__sub_82C478A0(ctx, base);
-}
-
-// Diagnostics (AR_LOG_GLOW=<update>): the effect objects drawn by sub_82C5BD28, during 40 updates from that one.
-PPC_FUNC_IMPL(__imp__sub_82C5BD28);
-PPC_FUNC(sub_82C5BD28)
-{
-    static const int64_t from = AR_ENV("AR_LOG_GLOW") ? atoll(AR_ENV("AR_LOG_GLOW")) : -1;
-    int64_t update = g_updateNumber.load(std::memory_order_relaxed);
-    if (from >= 0 && update >= from && update < from + 40)
-    {
-        uint32_t o = ctx.r3.u32;
-        std::string words;
-        for (uint32_t i = 0; i < 96; i++)
-            words += fmt::format(" {:08X}", PPC_LOAD_U32(o + i * 4));
-        LOGF_INFO("GLOW {} frame {} {:08X}{}", update, gpu::d3d12::GetFrameNumber(), o, words);
-    }
-    __imp__sub_82C5BD28(ctx, base);
-}
-
-// Diagnostics (AR_LOG_PLAYER_WAIT): a media player's state from its counters of work in hand. Scene shutdown waits for this to reach 0 (sub_824C9908).
-PPC_FUNC_IMPL(__imp__sub_824C8188);
-PPC_FUNC(sub_824C8188)
-{
-    static const bool log = AR_ENV("AR_LOG_PLAYER_WAIT") != nullptr;
-    uint32_t o = ctx.r3.u32;
-    __imp__sub_824C8188(ctx, base);
-    if (!log)
-        return;
-    static std::mutex mutex;
-    static std::map<uint32_t, std::chrono::steady_clock::time_point> seen;
-    std::lock_guard lock(mutex);
-    auto now = std::chrono::steady_clock::now();
-    auto& last = seen[o];
-    if (now - last < std::chrono::seconds(2))
-        return;
-    last = now;
-    uint32_t parent = PPC_LOAD_U32(o + 16);
-    LOGF_INFO("PLAYER {:08X} lr {:08X} vt {:08X} parent {:08X} vt {:08X} state {} counts {} {} {} {} flag {} +1932 {:08X} +1936 {:08X} +1940 {:08X}", o, uint32_t(ctx.lr), PPC_LOAD_U32(o), parent,
-        parent ? PPC_LOAD_U32(parent) : 0, PPC_LOAD_U32(o + 1928), PPC_LOAD_U32(o + 1968), PPC_LOAD_U32(o + 1972), PPC_LOAD_U32(o + 1976), PPC_LOAD_U32(o + 1980), PPC_LOAD_U32(o + 1952),
-        PPC_LOAD_U32(o + 1932), PPC_LOAD_U32(o + 1936), PPC_LOAD_U32(o + 1940));
-}
-
-// The lobby of a match, each update. A Player Match waits for its mode's minimum of real players, 12 for Battle Royale, which only made sense with all of Xbox Live to draw
-// on. So with everyone here ready, the host makes up the numbers with CPU players, with the function a Private Match uses, and the title goes on to its countdown. Until
-// then it's an ordinary lobby that others can join. AR_NO_MATCH_CPUS: as on Xbox Live.
-PPC_FUNC_IMPL(__imp__sub_82E40230);
-PPC_FUNC(sub_82E40230)
-{
-    static const bool fill = !AR_ENV("AR_NO_MATCH_CPUS");
-    constexpr uint32_t SESSION = 0x832AF7A8;
-    uint32_t flags = PPC_LOAD_U32(SESSION + 20);
-    bool host = PPC_LOAD_U8(SESSION + 2802) != 0, cpusAlready = (flags & 8) != 0;
-    if (fill && net::Online() && host && !cpusAlready)
-    {
-        uint32_t players = PPC_LOAD_U8(SESSION + 2801), ready = 0;
-        for (uint32_t i = 0; i < 16; i++)
-            ready += PPC_LOAD_U8(SESSION + 1428 + i) != 0;
-        uint32_t mode = (flags >> 7) & 0xF;
-        if (players != 0 && ready >= players)
-        {
-            // As the title works it out in this function.
-            uint32_t minimum = mode >= 1 && mode <= 13 ? GuestToHostFunction<uint32_t>(0x827110E0, mode - 1) : 16;
-            if (mode == 2)
-                minimum = 12;
-            if (players < minimum)
-            {
-                LOGF_INFO("online: everyone is ready: {} players of {}, adding CPU players", players, minimum);
-                GuestToHostFunction<void>(0x8271D6B8, SESSION, minimum - players);
-            }
-        }
-    }
-    __imp__sub_82E40230(ctx, base);
-}
-
-// Diagnostics (AR_LOG_CAMERA): which code sets where the camera looks, to find what moves it in a scene.
-static void LogCameraCaller(const char* what, uint32_t caller)
-{
-    static const bool log = AR_ENV("AR_LOG_CAMERA") != nullptr;
-    if (!log)
-        return;
-    // Each once, and again after not being seen for two seconds: scenes use several every frame.
-    static std::mutex mutex;
-    static std::map<uint32_t, std::chrono::steady_clock::time_point> seen;
-    auto now = std::chrono::steady_clock::now();
-    std::lock_guard lock(mutex);
-    auto [entry, isNew] = seen.try_emplace(caller, now);
-    if (isNew || now - entry->second > std::chrono::seconds(2))
-        LOGF_INFO("CAMERA {} from {:08X} at frame {} step {}", what, caller, gpu::d3d12::GetFrameNumber(), UiStepScale());
-    entry->second = now;
-}
-
-PPC_FUNC_IMPL(__imp__sub_826F6088);
-PPC_FUNC(sub_826F6088)
-{
-    LogCameraCaller("target", uint32_t(ctx.lr));
-    __imp__sub_826F6088(ctx, base);
-}
-
-// The zoom of the Gallery's character viewer: follows the time step too, and a held stick crossed its whole range in a third of a second, so it's
-// slower than the original (AR_VIEWER_ZOOM_SPEED: 1 is the original's).
-void ViewerZoomHook(PPCRegister& step)
-{
-    static const float speed = AR_ENV("AR_VIEWER_ZOOM_SPEED") ? float(atof(AR_ENV("AR_VIEWER_ZOOM_SPEED"))) : 0.2f;
-    step.f64 = double(float(step.f64) * UiStepScale() * speed);
-}
-
-void UiTimeStepHook(PPCRegister& f31) { ScaleUiStep(f31, 1); } // sub_827BA3B0, the UI manager.
-void UiTimeStepHook2(PPCRegister& f31) { ScaleUiStep(f31, 2); } // sub_82789708, its twin.
-void UiTimeStepHook3(PPCRegister& f31) { ScaleUiStep(f31, 3); } // sub_827B5BC8
-void UiTimeStepHook4(PPCRegister& f31) { ScaleUiStep(f31, 4); } // sub_827B6690
-void UiTimeStepHook5(PPCRegister& f31) { ScaleUiStep(f31, 5); } // sub_827B6E40
-void UiTimeStepHook6(PPCRegister& f31) { ScaleUiStep(f31, 6); } // sub_827F7828
-
-// The title's per-frame timing update: measures the time since the last frame and sets the game's time step (in 60 Hz
-// frames) at 0x830778C8, from constants at 0x820A4130.
-//
-// Diagnostics (AR_LOG_TIMESTEP): the constants once and the time step every 30 calls.
-PPC_FUNC_IMPL(__imp__sub_82BD7EC8);
-PPC_FUNC(sub_82BD7EC8)
-{
-    // The title takes the measured step only between 1.01 and 2 (falling back to 1 below): frames shorter than
-    // 30 Hz still advance the game by a whole 30 Hz frame, so it runs fast above 30 fps. Above 30 fps, the minimum is
-    // lowered so the step follows the frame time (AR_NO_TIMESTEP_FIX keeps the original).
-    static const bool fixStep = gpu::g_videoSettings.frameRate > 30 && !AR_ENV("AR_NO_TIMESTEP_FIX");
-    if (fixStep)
-    {
-        static const float minimum = 0.2f;
-        uint32_t bits;
-        memcpy(&bits, &minimum, 4);
-        PPC_STORE_U32(0x820A4130 + 2176, bits);
-    }
-
     {
         std::lock_guard lock(g_pokeMutex);
         for (auto [address, value] : g_pokes)
             PPC_STORE_U32(address, value);
     }
-
-    __imp__sub_82BD7EC8(ctx, base);
     g_updateNumber.fetch_add(1, std::memory_order_relaxed);
-
     ScanTimers(base);
     RunFind(base);
-
-    static const bool logStep = AR_ENV("AR_LOG_TIMESTEP") != nullptr;
-    if (!logStep)
-        return;
-
-    auto readFloat = [&](uint32_t address)
-        {
-            uint32_t bits = PPC_LOAD_U32(address);
-            float value;
-            memcpy(&value, &bits, 4);
-            return value;
-        };
-    static bool loggedConstants;
-    if (!loggedConstants)
-    {
-        loggedConstants = true;
-        LOGF_INFO("time step constants: default {} max {} scale {} min {} (+212 {} +124 {} +644 {} +1104 {})", readFloat(0x820A4130 + 16),
-            readFloat(0x820A4130 + 68), readFloat(0x820A4130 + 716), readFloat(0x820A4130 + 2176), readFloat(0x820A4130 + 212),
-            readFloat(0x820A4130 + 124), readFloat(0x820A4130 + 644), readFloat(0x820A4130 + 1104));
-    }
-    static uint32_t calls;
-    if (++calls % 30 == 0)
-        LOGF_INFO("time step {} (measured {})", readFloat(0x830778C8), readFloat(0x830C6B7C));
 }

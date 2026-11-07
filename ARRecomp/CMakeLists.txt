@@ -30,6 +30,17 @@ target_link_libraries(ARRecomp PRIVATE
     dxgi
     dxguid)
 
+# FFmpeg (LGPL, shared) decodes XMA audio. FFMPEG_ROOT is a build with include/, lib/ and bin/; its DLLs go next to the game.
+set(FFMPEG_ROOT "C:/Downloads/Repos/_tools/ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-shared-8.1" CACHE PATH "FFmpeg shared build (include, lib, bin)")
+if (NOT EXISTS "${FFMPEG_ROOT}/include/libavcodec/avcodec.h")
+    message(FATAL_ERROR "FFmpeg was not found at FFMPEG_ROOT (${FFMPEG_ROOT}): it is needed to decode the game's audio.")
+endif()
+target_include_directories(ARRecomp PRIVATE "${FFMPEG_ROOT}/include")
+target_link_libraries(ARRecomp PRIVATE "${FFMPEG_ROOT}/lib/avcodec.lib" "${FFMPEG_ROOT}/lib/avutil.lib")
+file(GLOB AR_FFMPEG_DLLS "${FFMPEG_ROOT}/bin/avcodec-*.dll" "${FFMPEG_ROOT}/bin/avutil-*.dll" "${FFMPEG_ROOT}/bin/swresample-*.dll")
+add_custom_command(TARGET ARRecomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${AR_FFMPEG_DLLS} "$<TARGET_FILE_DIR:ARRecomp>")
+
 # DXC compiles the translated shaders at run time; the Windows SDK ships it.
 find_file(AR_DXCOMPILER_DLL dxcompiler.dll PATHS "$ENV{WindowsSdkDir}bin/$ENV{WindowsSDKVersion}x64" "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64" NO_DEFAULT_PATH)
 if (AR_DXCOMPILER_DLL)

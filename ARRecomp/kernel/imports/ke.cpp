@@ -323,6 +323,47 @@ namespace imports
         return released ? X_STATUS_SUCCESS : X_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
     }
 
+    // KMUTANT: header, MutantListEntry (+0x10), OwnerThread (+0x18), Abandoned (+0x1C).
+    uint32_t NtCreateMutant(be<uint32_t>* handle, XOBJECT_ATTRIBUTES* attributes, uint32_t initialOwner)
+    {
+        WarnIfNamed(attributes);
+
+        auto mutant = CreateGuestBackedObject<KernelObject>(0x20, ObjectType::Mutant);
+        auto* header = mutant->Header();
+        header->Type = DISPATCHER_MUTANT;
+        header->Size = 0x20 / 4;
+        header->SignalState = initialOwner ? 0 : 1;
+        *reinterpret_cast<be<uint32_t>*>(reinterpret_cast<uint8_t*>(header) + 0x18) = initialOwner ? GetCurrentKThread() : 0;
+
+        *handle = CreateHandle(mutant);
+        return X_STATUS_SUCCESS;
+    }
+
+    uint32_t NtReleaseMutant(uint32_t handle, be<int32_t>* previousCount)
+    {
+        auto mutant = LookupHandle<KernelObject>(handle, ObjectType::Mutant);
+        if (!mutant)
+            return X_STATUS_INVALID_HANDLE;
+
+        int32_t previous;
+        bool released = ReleaseDispatcherMutant(mutant->Header(), GetCurrentKThread(), &previous);
+        if (previousCount != nullptr)
+            *previousCount = previous;
+        return released ? X_STATUS_SUCCESS : 0xC0000046; // STATUS_MUTANT_NOT_OWNED
+    }
+
+    uint32_t NtYieldExecution()
+    {
+        SwitchToThread();
+        return X_STATUS_SUCCESS;
+    }
+
+    // Floating point exceptions stay masked: the recompiled code doesn't trap on them.
+    uint32_t KeEnableFpuExceptions(uint32_t enable)
+    {
+        return 0;
+    }
+
     struct TimerObject : KernelObject
     {
         TimerObject() : KernelObject(ObjectType::Timer) {}
@@ -815,6 +856,10 @@ AR_IMPORT(NtSetEvent);
 AR_IMPORT(NtClearEvent);
 AR_IMPORT(NtCreateSemaphore);
 AR_IMPORT(NtReleaseSemaphore);
+AR_IMPORT(NtCreateMutant);
+AR_IMPORT(NtReleaseMutant);
+AR_IMPORT(NtYieldExecution);
+AR_IMPORT(KeEnableFpuExceptions);
 AR_IMPORT(NtCreateTimer);
 AR_IMPORT(NtSetTimerEx);
 AR_IMPORT(NtCancelTimer);

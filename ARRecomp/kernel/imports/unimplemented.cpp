@@ -12,3 +12,31 @@
         ctx.r3.u64 = 0; \
     }
 
+AR_IMPORT_STUB(DbgBreakPoint);
+AR_IMPORT_STUB(ExAllocatePool);
+AR_IMPORT_STUB(IoDismountVolume);
+AR_IMPORT_STUB(IoDismountVolumeByFileHandle);
+AR_IMPORT_STUB(NtDeviceIoControlFile);
+AR_IMPORT_STUB(NtQueueApcThread);
+AR_IMPORT_STUB(XMsgCompleteIORequest);
+AR_IMPORT_STUB(XNetLogonGetMachineID);
+AR_IMPORT_STUB(XNetLogonGetTitleID);
+AR_IMPORT_STUB(XamBackgroundDownloadGetMode);
+AR_IMPORT_STUB(XamBackgroundDownloadSetMode);
+AR_IMPORT_STUB(XamContentFlush);
+AR_IMPORT_STUB(XamContentGetDeviceState);
+AR_IMPORT_STUB(XamGetOverlappedResult);
+AR_IMPORT_STUB(XamParseGamerTileKey);
+AR_IMPORT_STUB(XamReadTileToTexture);
+AR_IMPORT_STUB(XamShowFriendRequestUI);
+AR_IMPORT_STUB(XamShowKeyboardUI);
+AR_IMPORT_STUB(XamShowMarketplaceDownloadItemsUI);
+AR_IMPORT_STUB(XamShowMarketplaceUI);
+AR_IMPORT_STUB(XamTaskCloseHandle);
+AR_IMPORT_STUB(XamTaskSchedule);
+AR_IMPORT_STUB(XamTaskShouldExit);
+AR_IMPORT_STUB(XamUserGetMembershipTierFromXUID);
+AR_IMPORT_STUB(XamUserGetOnlineCountryFromXUID);
+AR_IMPORT_STUB(XamWriteGamerTile);
+AR_IMPORT_STUB(XeKeysConsolePrivateKeySign);
+AR_IMPORT_STUB(XeKeysConsoleSignatureVerification);

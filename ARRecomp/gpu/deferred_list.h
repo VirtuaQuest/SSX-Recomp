@@ -88,11 +88,17 @@ namespace gpu::d3d12
         T& Add(Type type, uint32_t count = 0)
         {
             static_assert(sizeof(T) <= sizeof(Command::data));
+            CheckOpen(type);
             Command& command = m_recording.emplace_back();
             command.type = type;
             command.count = count;
             return *new (command.data) T{};
         }
+
+        // Commands for the list (not the queue) recorded while it is closed would fail when replayed and remove the
+        // device: the first of each kind is logged with where it came from.
+        void CheckOpen(Type type);
+        bool m_open = false;
 
         void Recorded();
         void Replay(const Command& command);
