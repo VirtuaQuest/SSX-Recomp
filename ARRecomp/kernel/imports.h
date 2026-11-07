@@ -6,14 +6,45 @@
 #include "objects.h"
 #include <cpu/guest_thread.h>
 
+// AR_TRACE_IMPORTS=<prefixes, comma separated>: logs calls of the imports whose names start with one of them (Xam,
+// XUser...), without the cost of trace logging everything else.
+inline bool TraceImport(const char* name)
+{
+    static const std::vector<std::string> prefixes = []
+        {
+            std::vector<std::string> list;
+            if (const char* text = getenv("AR_TRACE_IMPORTS"))
+            {
+                std::string all = text;
+                for (size_t start = 0; start <= all.size();)
+                {
+                    size_t end = all.find(',', start);
+                    std::string prefix = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    if (!prefix.empty())
+                        list.push_back(prefix);
+                    if (end == std::string::npos)
+                        break;
+                    start = end + 1;
+                }
+            }
+            return list;
+        }();
+    for (const auto& prefix : prefixes)
+    {
+        if (strncmp(name, prefix.c_str(), prefix.size()) == 0)
+            return true;
+    }
+    return false;
+}
+
 // Kernel and XAM imports are implemented as host functions in the "imports" namespace (to avoid clashing with
 // Windows API names) and bound to the import thunks the recompiled code calls.
 #define AR_IMPORT(name) \
     PPC_FUNC(__imp__##name) \
     { \
         RecordImportCall(#name, uint32_t(ctx.lr)); \
-        if (logger::g_minimumLevel == logger::Level::Trace) \
-            logger::Print(logger::Level::Trace, #name, "thread {} r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} lr 0x{:08X}", GetCurrentGuestThreadId(), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, uint32_t(ctx.lr)); \
+        if (logger::g_minimumLevel == logger::Level::Trace || TraceImport(#name)) \
+            logger::Print(logger::g_minimumLevel == logger::Level::Trace ? logger::Level::Trace : logger::Level::Info, #name, "thread {} r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} lr 0x{:08X}", GetCurrentGuestThreadId(), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, uint32_t(ctx.lr)); \
         HostToGuestFunction<imports::name>(ctx, base); \
     }
 

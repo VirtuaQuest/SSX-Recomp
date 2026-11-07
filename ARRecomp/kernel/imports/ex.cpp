@@ -19,6 +19,45 @@ static void InitSystemModules()
         });
 }
 
+// Functions titles look up by ordinal without importing them. They get guest addresses of their own at the end of
+// the code section (the last words of .text are data, never called) so the title can call them through a pointer.
+PPC_EXTERN_FUNC(__imp__XamContentCreateInternal);
+PPC_EXTERN_FUNC(__imp__XamContentDeleteInternal);
+
+struct DynamicExport
+{
+    bool xam;
+    uint32_t ordinal;
+    PPCFunc* host;
+    uint32_t address;
+};
+
+static DynamicExport g_dynamicExports[] = {
+    { true, 625, __imp__XamContentCreateInternal },
+    { true, 624, __imp__XamContentDeleteInternal },
+};
+
+static uint32_t FindDynamicExport(bool xam, uint32_t ordinal)
+{
+    static std::once_flag once;
+    std::call_once(once, []
+        {
+            uint32_t address = uint32_t(PPC_CODE_BASE + PPC_CODE_SIZE) & ~3u;
+            for (auto& entry : g_dynamicExports)
+            {
+                address -= 4;
+                entry.address = address;
+                g_memory.InsertFunction(address, entry.host);
+            }
+        });
+    for (const auto& entry : g_dynamicExports)
+    {
+        if (entry.xam == xam && entry.ordinal == ordinal)
+            return entry.address;
+    }
+    return 0;
+}
+
 namespace imports
 {
     uint32_t XexCheckExecutablePrivilege(uint32_t privilege)
@@ -63,6 +102,8 @@ namespace imports
             thunk = FindImportThunk(true, ordinal);
         else if (module == g_kernelModule)
             thunk = FindImportThunk(false, ordinal);
+        if (thunk == 0 && (module == g_xamModule || module == g_kernelModule))
+            thunk = FindDynamicExport(module == g_xamModule, ordinal);
 
         *address = thunk;
         if (thunk == 0)

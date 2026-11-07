@@ -696,6 +696,21 @@ namespace imports
         return FinishRequest(overlapped, X_ERROR_SUCCESS);
     }
 
+    // Newer XDKs' XContentCreate and XContentDelete call these by ordinal (625 and 624, looked up with
+    // XexGetProcedureAddress, not imported). The content data is XCONTENT_DATA followed by the owner's XUID (+0x138)
+    // and a device value (+0x140), so the user is named by XUID instead of a user index. One profile here: the same
+    // saves either way.
+    uint32_t XamContentCreateInternal(const char* rootName, XContentData* contentData, uint32_t flags, be<uint32_t>* disposition,
+        be<uint32_t>* licenseMask, uint32_t cacheSize, uint64_t contentSize, uint32_t overlapped)
+    {
+        return XamContentCreateEx(0, rootName, contentData, flags, disposition, licenseMask, cacheSize, contentSize, overlapped);
+    }
+
+    uint32_t XamContentDeleteInternal(XContentData* contentData, uint32_t overlapped)
+    {
+        return XamContentDelete(0, contentData, overlapped);
+    }
+
     // ---- System UI ----
 
     static std::string ReadWideString(const be<uint16_t>* text)
@@ -922,6 +937,8 @@ AR_IMPORT(XamContentCreateEnumerator);
 AR_IMPORT(XamContentCreateEx);
 AR_IMPORT(XamContentClose);
 AR_IMPORT(XamContentDelete);
+AR_IMPORT(XamContentCreateInternal);
+AR_IMPORT(XamContentDeleteInternal);
 AR_IMPORT(XamShowSigninUI);
 AR_IMPORT(XamShowDeviceSelectorUI);
 AR_IMPORT(XamShowMessageBoxUI);

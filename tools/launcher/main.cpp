@@ -40,17 +40,13 @@ namespace
     constexpr const wchar_t* ANISOTROPIC_VALUES[] = { L"0", L"2", L"4", L"8", L"16" };
     constexpr const wchar_t* TEXTURE_LABELS[] = { L"Original", L"High", L"Ultra (may shimmer)" };
     constexpr const wchar_t* TEXTURE_VALUES[] = { L"0", L"-0.5", L"-1" };
-    constexpr const wchar_t* DRAW_DISTANCE_LABELS[] = { L"Original", L"Far (2x)", L"Very far (4x)", L"Extreme (8x)", L"Always full detail" };
-    constexpr const wchar_t* DRAW_DISTANCE_VALUES[] = { L"1", L"2", L"4", L"8", L"1000" };
     constexpr const wchar_t* SHARPEN_LABELS[] = { L"Off", L"Low", L"Medium", L"High" };
-    constexpr const wchar_t* ULTRAWIDE_LABELS[] = { L"Off (16:9 with bars)", L"Wider view on ultrawide resolutions" };
     constexpr const wchar_t* VSYNC_LABELS[] = { L"Off", L"On" };
-    constexpr const wchar_t* SHADOW_LABELS[] = { L"On", L"Off" };
     constexpr const wchar_t* MOUSE_LABELS[] = { L"Low", L"Medium", L"High", L"Very high" };
+    // (Mouse movement drives the right stick, which is SSX's trick stick.)
     constexpr const wchar_t* MOUSE_VALUES[] = { L"0.5", L"1", L"2", L"4" };
-    constexpr const wchar_t* INVERT_LABELS[] = { L"Normal", L"Inverted" };
+    constexpr const wchar_t* INVERT_LABELS[] = { L"Normal (mouse up is stick up)", L"Inverted" };
     constexpr const wchar_t* CONTROLLER_LABELS[] = { L"1", L"2", L"3", L"4" };
-    constexpr const wchar_t* ONLINE_LABELS[] = { L"Off (original, no Xbox Live)", L"On (experimental: host and join)" };
 
     enum Control
     {
@@ -60,24 +56,18 @@ namespace
         ID_AA,
         ID_ANISOTROPIC,
         ID_TEXTURES,
-        ID_DRAW_DISTANCE,
         ID_SHARPEN,
-        ID_ULTRAWIDE,
         ID_VSYNC,
         ID_SCALE,
-        ID_SHADOWS,
         ID_MOUSE,
         ID_INVERT,
         ID_CONTROLLER,
-        ID_ONLINE,
-        ID_ONLINE_PEER,
-        ID_PLAYER_NAME,
         ID_GAME_PATH,
         ID_BROWSE,
         ID_LAUNCH,
     };
 
-    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_drawDistance, g_sharpen, g_ultrawide, g_vsync, g_scale, g_shadows, g_mouse, g_invert, g_gamePath, g_online, g_onlinePeer, g_playerName, g_controller;
+    HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_sharpen, g_vsync, g_scale, g_mouse, g_invert, g_gamePath, g_controller;
     theme::Form g_form;
     std::wstring g_folder, g_iniPath;
 
@@ -153,22 +143,17 @@ namespace
         int aa = int(SendMessageW(g_aa, CB_GETCURSEL, 0, 0));
         int anisotropic = int(SendMessageW(g_anisotropic, CB_GETCURSEL, 0, 0));
         int textures = int(SendMessageW(g_textures, CB_GETCURSEL, 0, 0));
-        int drawDistance = int(SendMessageW(g_drawDistance, CB_GETCURSEL, 0, 0));
         int sharpen = int(SendMessageW(g_sharpen, CB_GETCURSEL, 0, 0));
-        int ultrawide = int(SendMessageW(g_ultrawide, CB_GETCURSEL, 0, 0));
         int vsync = int(SendMessageW(g_vsync, CB_GETCURSEL, 0, 0));
         int scale = int(SendMessageW(g_scale, CB_GETCURSEL, 0, 0));
-        int shadows = int(SendMessageW(g_shadows, CB_GETCURSEL, 0, 0));
         int mouse = int(SendMessageW(g_mouse, CB_GETCURSEL, 0, 0));
         int invert = int(SendMessageW(g_invert, CB_GETCURSEL, 0, 0));
         std::wstring gamePath = ToAbsolute(GetText(g_gamePath));
-        int online = int(SendMessageW(g_online, CB_GETCURSEL, 0, 0));
         int controller = int(SendMessageW(g_controller, CB_GETCURSEL, 0, 0));
-        std::wstring onlinePeer = GetText(g_onlinePeer), playerName = GetText(g_playerName);
 
         if (GetFileAttributesW(gamePath.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
-            MessageBoxW(window, L"Choose the Anarchy Reigns disc image (.iso) first.", L"Anarchy Reigns", MB_ICONWARNING);
+            MessageBoxW(window, L"Choose your SSX disc image (.iso) first.", L"SSX Recompiled", MB_ICONWARNING);
             return;
         }
 
@@ -178,39 +163,24 @@ namespace
         WriteSetting(L"AntiAliasing", std::to_wstring(aa));
         WriteSetting(L"Anisotropic", std::to_wstring(anisotropic));
         WriteSetting(L"TextureDetail", std::to_wstring(textures));
-        WriteSetting(L"DrawDistance", std::to_wstring(drawDistance));
         WriteSetting(L"Sharpen", std::to_wstring(sharpen));
-        WriteSetting(L"Ultrawide", std::to_wstring(ultrawide));
         WriteSetting(L"VSync", std::to_wstring(vsync));
         WriteSetting(L"RenderScale", std::to_wstring(scale));
-        WriteSetting(L"Shadows", std::to_wstring(shadows));
         WriteSetting(L"MouseSensitivity", std::to_wstring(mouse));
         WriteSetting(L"InvertMouse", std::to_wstring(invert));
         WriteSetting(L"Game", ToRelative(gamePath));
-        WriteSetting(L"Online", std::to_wstring(online));
         WriteSetting(L"Controller", std::to_wstring(controller));
-        WriteSetting(L"OnlinePeer", onlinePeer);
-        WriteSetting(L"PlayerName", playerName);
 
         const Resolution& r = RESOLUTIONS[resolution];
         std::wstring exe = g_folder + L"\\ARRecomp.exe";
         std::wstring command = L"\"" + exe + L"\" --game \"" + gamePath + L"\" --resolution " + std::to_wstring(r.width) + L"x" +
             std::to_wstring(r.height) + L" --display " + DISPLAY_ARGS[display] + L" --fps " + std::to_wstring(FRAME_RATES[fps]) +
             L" --antialiasing " + std::to_wstring(aa) + L" --anisotropic " + ANISOTROPIC_VALUES[anisotropic] + L" --texture-lod-bias " + TEXTURE_VALUES[textures] +
-            L" --draw-distance " + DRAW_DISTANCE_VALUES[drawDistance] + L" --sharpen " + std::to_wstring(sharpen) + (ultrawide == 1 ? L" --ultrawide" : L"") + (vsync == 1 ? L" --vsync" : L"") +
-            L" --render-scale " + std::to_wstring(scale + 1) +
-            L" --shadows " + (shadows == 0 ? L"on" : L"off") + L" --mouse-sensitivity " + MOUSE_VALUES[mouse] +
+            L" --sharpen " + std::to_wstring(sharpen) + (vsync == 1 ? L" --vsync" : L"") +
+            L" --render-scale " + std::to_wstring(scale + 1) + L" --mouse-sensitivity " + MOUSE_VALUES[mouse] +
             (invert == 1 ? L" --invert-mouse" : L"");
         if (controller != 0)
             command += L" --controller " + std::to_wstring(controller + 1);
-        if (online == 1)
-        {
-            command += L" --online";
-            if (!onlinePeer.empty())
-                command += L" --online-peer \"" + onlinePeer + L"\"";
-            if (!playerName.empty())
-                command += L" --player-name \"" + playerName + L"\"";
-        }
 
         std::wstring workingFolder = WorkingFolder();
         if (workingFolder != g_folder) // Otherwise the setting is left alone: it may be a drive that's only away for now.
@@ -220,7 +190,7 @@ namespace
         PROCESS_INFORMATION process{};
         if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, workingFolder.c_str(), &startup, &process))
         {
-            MessageBoxW(window, (L"Could not start " + exe).c_str(), L"Anarchy Reigns", MB_ICONERROR);
+            MessageBoxW(window, (L"Could not start " + exe).c_str(), L"SSX Recompiled", MB_ICONERROR);
             return;
         }
         CloseHandle(process.hThread);
@@ -228,7 +198,7 @@ namespace
         DestroyWindow(window);
     }
 
-    constexpr int WINDOW_WIDTH = 860, WINDOW_HEIGHT = 650;
+    constexpr int WINDOW_WIDTH = 860, WINDOW_HEIGHT = 560;
 
     LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
     {
@@ -244,7 +214,7 @@ namespace
             for (const auto& r : RESOLUTIONS)
                 resolutionLabels.push_back(r.label);
 
-            g_form.Attach(window, WINDOW_WIDTH, WINDOW_HEIGHT, L"Launcher", L"Anarchy Reigns Recompiled");
+            g_form.Attach(window, WINDOW_WIDTH, WINDOW_HEIGHT, L"SSX Recompiled", L"Launcher: choose how the game runs on this PC, then drop in");
 
             constexpr int ROW = 36, SECTION_TOP = 30, LABEL_WIDTH = 132;
             constexpr int left = 24, right = 442, columnWidth = 394;
@@ -269,34 +239,29 @@ namespace
                     return control;
                 };
 
-            section(6, L"Display");
+            section(5, L"Display");
             g_resolution = combo(L"Resolution", ID_RESOLUTION, resolutionLabels.data(), resolutionLabels.size(), L"Resolution");
             g_display = combo(L"Display mode", ID_DISPLAY, DISPLAY_MODES, std::size(DISPLAY_MODES), L"Display");
             g_fps = combo(L"Frame rate", ID_FPS, FRAME_RATE_LABELS, std::size(FRAME_RATE_LABELS), L"FrameRate");
             g_scale = combo(L"Internal resolution", ID_SCALE, SCALE_LABELS, std::size(SCALE_LABELS), L"RenderScale");
             g_vsync = combo(L"V-Sync", ID_VSYNC, VSYNC_LABELS, std::size(VSYNC_LABELS), L"VSync");
-            g_ultrawide = combo(L"Ultrawide", ID_ULTRAWIDE, ULTRAWIDE_LABELS, std::size(ULTRAWIDE_LABELS), L"Ultrawide");
             y += 12;
-            section(6, L"Graphics");
+            section(4, L"Graphics");
             g_aa = combo(L"Anti-aliasing", ID_AA, AA_LABELS, std::size(AA_LABELS), L"AntiAliasing");
             g_anisotropic = combo(L"Anisotropic filtering", ID_ANISOTROPIC, ANISOTROPIC_LABELS, std::size(ANISOTROPIC_LABELS), L"Anisotropic");
             g_textures = combo(L"Texture detail", ID_TEXTURES, TEXTURE_LABELS, std::size(TEXTURE_LABELS), L"TextureDetail");
-            g_drawDistance = combo(L"Draw distance", ID_DRAW_DISTANCE, DRAW_DISTANCE_LABELS, std::size(DRAW_DISTANCE_LABELS), L"DrawDistance");
             g_sharpen = combo(L"Sharpening", ID_SHARPEN, SHARPEN_LABELS, std::size(SHARPEN_LABELS), L"Sharpen");
-            g_shadows = combo(L"Shadows", ID_SHADOWS, SHADOW_LABELS, std::size(SHADOW_LABELS), L"Shadows");
 
             x = right;
             y = 96;
-            section(3, L"Controls");
+            section(4, L"Controls");
             g_controller = combo(L"Controller", ID_CONTROLLER, CONTROLLER_LABELS, std::size(CONTROLLER_LABELS), L"Controller");
             g_mouse = combo(L"Mouse sensitivity", ID_MOUSE, MOUSE_LABELS, std::size(MOUSE_LABELS), L"MouseSensitivity", 1);
-            g_invert = combo(L"Mouse look", ID_INVERT, INVERT_LABELS, std::size(INVERT_LABELS), L"InvertMouse");
-            y += 12;
-            section(3, L"Multiplayer");
-            g_online = combo(L"Multiplayer", ID_ONLINE, ONLINE_LABELS, std::size(ONLINE_LABELS), L"Online");
-            g_playerName = edit(L"Player name", ID_PLAYER_NAME, L"PlayerName");
-            g_onlinePeer = edit(L"Host's IP (to join)", ID_ONLINE_PEER, L"OnlinePeer");
-            y += 12;
+            g_invert = combo(L"Mouse tricks", ID_INVERT, INVERT_LABELS, std::size(INVERT_LABELS), L"InvertMouse");
+            g_form.AddLabel(x + 2, y, columnWidth - 4, 20, L"WASD steer, Space jumps, the mouse is the trick stick.", theme::DIM, theme::Font::Small);
+            y += 20;
+            g_form.AddLabel(x + 2, y, columnWidth - 4, 20, L"Change any key in user\\key_bindings.ini.", theme::DIM, theme::Font::Small);
+            y += 28;
             section(1, L"Game");
             g_form.AddLabel(x + 2, y, 90, 28, L"Game image");
             g_gamePath = g_form.AddEdit(ID_GAME_PATH, x + 92, y, columnWidth - 92 - 86, ToRelative(ReadSetting(L"Game", L"")));
@@ -339,7 +304,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
     windowClass.hbrBackground = nullptr;
     windowClass.lpszClassName = L"ARLauncher";
-    // The icon the game cut from its own logo the first time it ran, if it has. Otherwise a plain one.
+    // The icon taken from the player's own copy of the game, if there is one. Otherwise the theme's emblem.
     std::wstring iconPath = WorkingFolder() + L"\\user\\game_icon.ico";
     windowClass.hIcon = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE));
     windowClass.hIconSm = HICON(LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
@@ -357,7 +322,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     RECT rect{ 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
-    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,
+    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"SSX Recompiled Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
     ShowWindow(window, show);
 

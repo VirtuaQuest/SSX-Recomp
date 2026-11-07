@@ -419,6 +419,11 @@ namespace vfs
         std::error_code ec;
         std::filesystem::create_directories(g_userPath, ec);
 
+        // The utility drive (cache:), already mounted: titles that look for it first (SSX does) then don't try to
+        // set it up from the raw hard disk partition. AR_NO_CACHE_DRIVE leaves it out.
+        if (!getenv("AR_NO_CACHE_DRIVE"))
+            MapRoot("cache:", g_userPath / "cache");
+
         if (std::filesystem::is_directory(gamePath))
         {
             g_gameFolder = gamePath;

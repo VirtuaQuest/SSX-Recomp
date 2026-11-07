@@ -6,6 +6,7 @@
 #include <gpu/d3d12_renderer.h>
 #include <gpu/video_settings.h>
 #include <gpu/shader_compiler.h>
+#include <gpu/window.h>
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <kernel/variables.h>
@@ -46,7 +47,7 @@ static void PrintUsage()
         "  --online-peer IP       Also look for games at these addresses (comma separated).\n"
         "  --player-name NAME     Your name in multiplayer.\n"
         "  --controller N         Which controller this copy reads, 1 to 4 (default 1).\n"
-        "  --make-icon            Takes the icon from the game, unseen and silent, then exits (setup uses this).\n");
+        "  --make-icon            Saves the game's own icon from its executable to user/game_icon.ico, then exits (setup uses this).\n");
 }
 
 int main(int argc, char* argv[])
@@ -191,6 +192,16 @@ int main(int argc, char* argv[])
 
     if (!LoadExecutable(xexPath))
         return 1;
+
+    // The window's icon, from the title's own executable, the first time (--make-icon only does this, for setup).
+    if (gpu::window::NeedsGameIcon())
+    {
+        bool saved = gpu::window::SaveTitleIcon();
+        if (getenv("AR_MAKE_ICON"))
+            return saved ? 0 : 2;
+    }
+    else if (getenv("AR_MAKE_ICON"))
+        return 0;
 
     // For reverse engineering: the loaded image, as the recompiled code sees it (AR_DUMP_IMAGE=<path>).
     if (const char* dumpPath = getenv("AR_DUMP_IMAGE"))

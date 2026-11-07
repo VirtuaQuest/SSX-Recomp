@@ -27,7 +27,7 @@ namespace
 {
     // What this project's hooks were made for. Any other executable has its code at other addresses.
     constexpr const char* KNOWN_EXECUTABLE_SHA1 = "639e27f4d5c970b80a03b2c64932d5644a6c9b6d";
-    constexpr uint32_t TITLE_ID = 0x5345083F;
+    constexpr uint32_t TITLE_ID = 0x4541096D; // SSX
     constexpr uint64_t NEEDED_DISK_BYTES = 5ull * 1024 * 1024 * 1024;
     constexpr int WINDOW_WIDTH = 760, WINDOW_HEIGHT = 640;
 
@@ -289,7 +289,7 @@ namespace
     {
         auto show = [](int i, bool good, const std::wstring& name, const std::wstring& missing)
             {
-                g_form.SetLabel(g_toolLabels[i], (good ? L"✓  " : L"✗  ") + (good ? name : name + L": " + missing), good ? theme::GREEN : theme::BAD);
+                g_form.SetLabel(g_toolLabels[i], (good ? L"✓  " : L"✗  ") + (good ? name : name + L": " + missing), good ? theme::ICE_MID : theme::BAD);
             };
         show(0, !g_tools.vcvars.empty(), L"Visual Studio C++ tools", L"install Build Tools");
         show(1, g_tools.sdk, L"Windows SDK", L"add it in that installer");
@@ -328,7 +328,7 @@ namespace
             else if (package::Sha1(xex.data(), xex.size()) == KNOWN_EXECUTABLE_SHA1)
             {
                 g_gameCheck = Check::Good;
-                g_form.SetLabel(g_gameStatus, L"✓  Recognised: the version this project was made for.", theme::GREEN);
+                g_form.SetLabel(g_gameStatus, L"✓  Recognised: the version this project was made for.", theme::ICE_MID);
             }
             else
             {
@@ -396,7 +396,7 @@ namespace
             if (!dlc.name.empty())
                 names += (names.empty() ? L": " : L", ") + dlc.name;
         }
-        g_form.SetLabel(g_dlcStatus, L"✓  " + std::to_wstring(found.size()) + (found.size() == 1 ? L" package" : L" packages") + names, theme::GREEN);
+        g_form.SetLabel(g_dlcStatus, L"✓  " + std::to_wstring(found.size()) + (found.size() == 1 ? L" package" : L" packages") + names, theme::ICE_MID);
     }
 
     void RefreshBuildButton()
@@ -676,7 +676,7 @@ namespace
         WritePrivateProfileStringW(L"Launcher", L"Game", RelativeTo(choices.game, outputFolder).c_str(), ini.c_str());
         WritePrivateProfileStringW(L"Launcher", L"WorkingFolder", RelativeTo(g_runFolder, outputFolder).c_str(), ini.c_str());
 
-        // The icon: cut from the player's game by running it for a moment, unseen and silent, in a folder of its own, so saves aren't touched.
+        // The icon: the game's own, read from the player's executable by the game with --make-icon, in a folder of its own, so saves aren't touched.
         SetProgressOnly(BAR_COMPILE, L"Taking the icon from your game", L"");
         fs::path icon = g_runFolder / L"user\\game_icon.ico";
         if (!Exists(icon))
@@ -698,7 +698,7 @@ namespace
             Say(stamped ? L"The programs have the icon from your game." : L"The icon couldn't be put in the programs. They'll still work.");
         }
         else
-            Say(L"The icon couldn't be taken from the game now. The game will make it the first time it reaches the title screen.");
+            Say(L"The icon couldn't be taken from the game now. The game will try again when it starts.");
         SetProgressOnly(BAR_ICON, L"Finishing");
         return true;
     }
@@ -805,8 +805,8 @@ namespace
             RefreshBuildButton();
             if (g_succeeded)
             {
-                g_form.SetLabel(g_stepLabel, L"Finished. Open the launcher to play.", theme::LIME);
-                g_form.SetLabel(g_timeLabel, L"100%   " + TimeText(), theme::LIME);
+                g_form.SetLabel(g_stepLabel, L"Finished. Open the launcher to play.", theme::ICE);
+                g_form.SetLabel(g_timeLabel, L"100%   " + TimeText(), theme::ICE);
             }
             else
             {
@@ -908,7 +908,7 @@ namespace
         case WM_CREATE:
         {
             g_window = window;
-            g_form.Attach(window, WINDOW_WIDTH, WINDOW_HEIGHT, L"Setup", L"Anarchy Reigns Recompiled: builds the game on this PC from your own copy");
+            g_form.Attach(window, WINDOW_WIDTH, WINDOW_HEIGHT, L"Setup", L"Builds the game on this PC from your own copy of SSX");
 
             constexpr int x = 24, width = WINDOW_WIDTH - 48, labelWidth = 104, browseWidth = 84;
             int y = 96;
@@ -1070,7 +1070,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     RECT rect{ 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
-    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"Anarchy Reigns Setup", style, CW_USEDEFAULT, CW_USEDEFAULT,
+    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"SSX Recompiled Setup", style, CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
     ShowWindow(window, show);
 

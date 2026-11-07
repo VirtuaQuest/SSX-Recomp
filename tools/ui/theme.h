@@ -1,23 +1,27 @@
 #pragma once
 
-// The look shared by the launcher and setup: near black with lime lines and text. Everything is drawn here, from code and the fonts Windows has, so these
-// programs carry no images or fonts of anyone's.
+// The look shared by the launcher and setup: a winter night over the mountains, icy cyan lines and hot magenta accents. Everything
+// is drawn here, from code and the fonts Windows has, so these programs carry no images or fonts of anyone's (none of the game's art
+// either: the sky, ridges, snow and emblem are made up in code).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 namespace theme
 {
-    constexpr COLORREF BACKGROUND = RGB(5, 10, 6);
-    constexpr COLORREF FIELD = RGB(9, 22, 11);
-    constexpr COLORREF LIME = RGB(170, 240, 40);
-    constexpr COLORREF GREEN = RGB(58, 150, 58);
-    constexpr COLORREF DARK_GREEN = RGB(24, 66, 28);
-    constexpr COLORREF TEXT = RGB(220, 240, 208);
-    constexpr COLORREF DIM = RGB(120, 160, 110);
-    constexpr COLORREF BAD = RGB(255, 112, 84);
+    constexpr COLORREF BACKGROUND = RGB(10, 10, 30);
+    constexpr COLORREF FIELD = RGB(14, 18, 44);
+    constexpr COLORREF ICE = RGB(96, 232, 255);     // The main accent: lines, highlights, the primary button.
+    constexpr COLORREF ICE_MID = RGB(46, 140, 196);
+    constexpr COLORREF ICE_DARK = RGB(30, 52, 98);
+    constexpr COLORREF MAGENTA = RGB(255, 64, 170);  // Hover and the second accent.
+    constexpr COLORREF SUNSET = RGB(255, 150, 70);
+    constexpr COLORREF TEXT = RGB(236, 244, 255);
+    constexpr COLORREF DIM = RGB(150, 170, 210);
+    constexpr COLORREF BAD = RGB(255, 98, 110);
     constexpr COLORREF WARNING = RGB(255, 205, 70);
 
     enum class Font
@@ -77,6 +81,7 @@ namespace theme
         std::vector<RECT> m_fields;
         HDC m_backgroundDc{}, m_canvasDc{};
         HBITMAP m_backgroundBitmap{}, m_canvasBitmap{};
+        uint32_t* m_canvasPixels{};
         bool m_stale{ true };
     };
 

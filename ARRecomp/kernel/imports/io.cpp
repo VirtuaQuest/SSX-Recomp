@@ -165,7 +165,7 @@ namespace imports
             status = X_STATUS_FILE_IS_A_DIRECTORY;
         }
 
-        LOGF_INFO("{} {} -> 0x{:08X}", write ? "write" : "read", path, status);
+        LOGF_INFO("{} {} -> 0x{:08X} (access 0x{:X}, disposition {}, options 0x{:X})", write ? "write" : "read", path, status, desiredAccess, disposition, options);
 
         SetIoStatus(ioStatus, status, status == X_STATUS_SUCCESS ? information : 0);
         if (status != X_STATUS_SUCCESS)
@@ -192,8 +192,10 @@ namespace imports
         return OpenFile(handle, desiredAccess, attributes, ioStatus, disposition, options);
     }
 
+    // Like NT's, with the share access before the options: DeleteFile and MoveFile pass 7 (share everything) there,
+    // which read as options asked for a directory and failed with STATUS_NOT_A_DIRECTORY.
     uint32_t NtOpenFile(be<uint32_t>* handle, uint32_t desiredAccess, XOBJECT_ATTRIBUTES* attributes,
-        XIO_STATUS_BLOCK* ioStatus, uint32_t options)
+        XIO_STATUS_BLOCK* ioStatus, uint32_t shareAccess, uint32_t options)
     {
         return OpenFile(handle, desiredAccess, attributes, ioStatus, 1, options);
     }
