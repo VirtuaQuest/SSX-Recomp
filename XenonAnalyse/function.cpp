@@ -181,8 +181,10 @@ Function Function::Analyze(const void* code, size_t size, size_t base, const Swi
                 }
                 else if (op == PPC_OP_CTR)
                 {
-                    // 5th bit of BO tells cpu to ignore the counter, which is a blr/bctr otherwise it's conditional
-                    const bool conditional = !(PPC_BO(instruction) & 0x10);
+                    // Only BO 1z1zz (both "ignore the condition" and "ignore the counter") always branches. bdzlr and
+                    // bdnzlr ignore the condition but still decrement and test the counter, so code follows them
+                    // (memset's tail stores, for one), and ending the function there dropped it.
+                    const bool conditional = (PPC_BO(instruction) & 0x14) != 0x14;
                     if (conditional)
                     {
                         // right block's just going to return
