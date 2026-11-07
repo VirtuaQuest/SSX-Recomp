@@ -1,6 +1,5 @@
 #include <stdafx.h>
 #include "command_processor.h"
-#include <kernel/net_session.h>
 #include <cpu/guest_thread.h>
 #include <kernel/function.h>
 #include <kernel/memory.h>
@@ -160,29 +159,14 @@ namespace gpu
 
     static void RunVblankThread()
     {
-        // The game presents every second vblank (30 fps at 60 Hz); a higher frame rate setting raises the rate.
+        // The game presents every second vblank (30 fps at 60 Hz); a higher frame rate setting raises the rate. SSX steps
+        // its simulation by the time base, not by frames, so it runs at the same speed at any rate (measured at 30 and 60:
+        // the tutorial's scripted events the same real time apart).
         const int64_t interval = 1000000 / (int64_t(g_videoSettings.frameRate) * 2);
-        const int64_t consoleInterval = 1000000 / (30 * 2);
-        // The Tutorial's target can't be caught above 30 fps. Not understood yet, so the Tutorial runs at the console's rate (AR_NO_SIM_FPS_CAP: at the chosen one).
-        // So do multiplayer matches, for now: one whole Dogfight between two copies has worked above 30 (see LESSONS), other game types and real networks not yet. All of these have no value in these two words of the state the time steps
-        // are in, as does Training, and the menus are told apart by the title's flags. Training has more than 0x100 in the mode word 0x83214D50 (0xC0100).
-        static const bool capRooms = !AR_ENV("AR_NO_SIM_FPS_CAP") && g_videoSettings.frameRate > 30;
         auto next = std::chrono::steady_clock::now();
         while (true)
         {
-            bool capped = false;
-            if (capRooms && g_memory.base != nullptr)
-            {
-                auto word = [](uint32_t address) { return uint32_t(*g_memory.Translate<be<uint32_t>>(address)); };
-                capped = word(0x83121290) == 0xFFFFFFFF && word(0x83121294) == 0xFFFFFFFF && (word(0x83214CF0) & 0x02200000) == 0 && ((word(0x83214D50) & ~0x100u) == 0 || net::InSession());
-                static bool cappedBefore;
-                if (capped != cappedBefore)
-                {
-                    cappedBefore = capped;
-                    LOGF_INFO("frame rate {} ({})", capped ? 30 : g_videoSettings.frameRate, capped ? "limited: Tutorial or a multiplayer match" : "as chosen");
-                }
-            }
-            next += std::chrono::microseconds(capped ? consoleInterval : interval);
+            next += std::chrono::microseconds(interval);
             std::this_thread::sleep_until(next);
 
             g_swapCounter++;

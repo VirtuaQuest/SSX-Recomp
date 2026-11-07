@@ -42,7 +42,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_DUMP_FRAME=<n>`, `AR_DUMP_FRAMES=<count>` | Dump resolves of these frames without logging draws |
 | `AR_DUMP_ONLY=<hex addresses, comma separated>` | Limit dumps to resolves to these addresses (use it: dumps are big) |
 | `AR_DUMP_ALPHA`, `AR_DUMP_SCALE=<value>` | Dump alpha as grey; scale for single float dumps (default 100 is white) |
-| `AR_DUMP_SOURCES`, `AR_DUMP_TEXTURES`, `AR_DUMP_IMAGE=<path>`, `AR_DUMP_DECOMPRESS=<address>` | Resolve sources, uploaded textures, the loaded image, the LZ decompressor's output |
+| `AR_DUMP_SOURCES`, `AR_DUMP_TEXTURES`, `AR_DUMP_IMAGE=<path>` | Resolve sources, uploaded textures, the loaded image, the LZ decompressor's output |
 | `AR_SCREENSHOT_INTERVAL=<frames>` | Screenshot period with `--screenshots` (default 300) |
 | `AR_TRACE_PS=<hash prefix>`, `AR_TRACE_INPUTS`, `AR_TRACE_FETCH` | Constants of draws with a pixel shader, hashes of each draw's inputs, fetch details |
 | `AR_HIGHLIGHT_PS=<prefix>`, `AR_HIGHLIGHT_PRIM=<type>` | Draw those in magenta |
@@ -51,10 +51,6 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_SHADOW_PIXELS=1\|2\|3` | With `AR_SHADOW_LOG`: occlusion query per shadow map draw, logged as PX lines (frame, cascade, shader, vertex buffer, index offset, count, ..., samples). 2 adds hashes of everything the draw reads (vertex data, indices, constants) checked again once the GPU is done (slow); 3 also draws each again without depth testing and logs the rasterized `area` |
 | `AR_SHADOW_CONSTANTS=<vertex buffers>` | With the above: float constants (PC), context registers (PR) and system constants (PY) of far cascade draws from those buffers |
 | `AR_MARK_DRAWS` | NOP packets before each title draw holding a hash of the guest call chain and the model (MK lines name the chains; IB lines show the marker) |
-| `AR_LOG_MODEL_DRAWS=<frame>,<count>`, `AR_HASH_MODEL_DRAWS` | The engine's model draw calls with guest call chains; per-frame count and hash |
-| `AR_LOG_DRAW_CALLS`, `AR_LOG_QUEUES`, `AR_LOG_QUEUE_ITEMS=<queues>` | The title's draw packet writers per 5 s; render queue executions and their items |
-| `AR_LOG_LOD` | Objects at each detail level per 5 s, and each object's thresholds and level as it changes (LODOBJ lines) |
-| `AR_LOG_UI_TEXT=<frame>,<count>` | The UI's text draw items in those frames (`AR_LOG_UI_ITEMS` is the same for sprites) |
 | `AR_CHECK_VERTEX_MEMO` | Vertex uploads reused within a command list although guest memory changed |
 | `AR_SHADOW_STATS` | With `AR_SHADOW_PIXELS`: per draw pipeline statistics, pixel shader, alpha and depth state, texture 0 and writes to it |
 | `AR_SHADOW_READBACK` | The far cascade copied every frame without waiting, texels written per grid cell logged as SM lines; `smflick.py` counts flicker from them (`shadow_flick.sh`, or `shadow_stats.sh` with the per draw logs) |
@@ -75,25 +71,18 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_PROFILE` | Per-stage draw timing every 300 frames (adds clock reads per draw) |
 | `AR_LOG_FPS` | Frame rate every 300 frames and the GPU thread's busy time every 5 s, without the per-stage cost |
 | `AR_GPU_TIMING` | GPU time per frame, split into layout conversions, render target syncs, resolves, composites and draws |
-| `AR_LOG_FENCE_WAITS` | Time the title's D3D spends waiting for GPU fences, per caller (82245630 is its frame pacing) |
 | `AR_HOST_PROFILE=<thread name part>` | Samples host threads, e.g. `command` for the GPU thread (no spaces) |
 | `AR_THREAD_PROFILE` | Samples guest threads (slows the game; don't judge frame rates with it) |
 | `AR_LOG_SWAP_LATENCY`, `AR_LOG_FENCES`, `AR_LOG_GPU_WAITS`, `AR_LOG_IBS` | Swap latency, fences, waits, indirect buffers |
-| `AR_LOG_QUERIES`, `AR_LOG_QUERY_RESULTS` | Occlusion query waits (5 s summary) and results |
-| `AR_LOG_QUADS=<update>`, `AR_LOG_GLOW=<update>` | Effect sprites queued (`sub_82C478A0`, 60 updates) and objects drawn by `sub_82C5BD28` (40 updates) from that update on |
-| `AR_LOG_TIMEBASE`, `AR_LOG_QPC`, `AR_LOG_TIMESTEP` | Who reads the clock; the game's time step |
-| `AR_LOG_UI_TIME`, `AR_LOG_UI_TIMESTEP` | How fast UI time runs per real second (1 is right); calls per UI step hook |
-| `AR_LOG_ANIM_STEP`, `AR_LOG_INPUT_REPEAT` | Objects getting the time step for their animation; each menu input repeat |
+| `AR_LOG_TIMEBASE` | Who reads the clock |
 | `AR_SCAN_KEY` | F9 scans for values changing by a fixed amount per update while playing; F10 also logs their writers for 10 updates, slowing the game for those. Compare scans with `timerdiff.py` |
 | `AR_SCAN_TIMERS=<update>\|@<seconds>`, `AR_SCAN_TIMERS_WATCH` | Values counting updates instead of time (run at `--fps 120`), and who writes them |
-| `AR_WATCH_UI_TIME=<seconds>`, `AR_LOG_UI_ITEMS=<frame>,<count>` | Writers of UI element times; the UI's sprite draw items |
-| `AR_LOG_PRIORITIES`, `AR_LOG_DELAYS`, `AR_LOG_READS`, `AR_LOG_SHA`, `AR_LOG_SAVE_ERRORS` | Kernel calls |
+| `AR_LOG_PRIORITIES`, `AR_LOG_DELAYS`, `AR_LOG_READS`, `AR_LOG_SHA` | Kernel calls |
 | `AR_CHECK_ALU` | Constant memory changing after LOAD_ALU_CONSTANT read it |
 | `AR_D3D12_DEBUG`, `AR_D3D12_GBV` | D3D12 debug layer with its messages in the log; GPU-based validation (very slow) |
 | `AR_CHECK_UPLOADS` | Upload memory static shadow casters read, checked again once the GPU is done with the frame |
 | `AR_LOG_WAIT_TIMEOUTS` | Kernel waits with a timeout that time out, per thread and object (5 s summary) |
 | `AR_DUMP_THREADS_FILE=<file>` | When that file appears, what every guest thread is doing, waiting ones too, with stacks: for a game that has stopped |
-| `AR_LOG_PLAYER_WAIT` | A media player's state as scene shutdown waits for it (`sub_824C8188`) |
 
 ## Turning features off (bisecting)
 
@@ -102,15 +91,10 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_SINGLE_THREAD` | Submission thread (records on the GPU thread) |
 | `AR_NO_TEXTURE_POOL` | Reusing released textures |
 | `AR_NO_NATIVE_RESET` | Guest strip indices with the host's restart value |
-| `AR_WAIT_QUERIES` | Answering occlusion queries at once (polls like before) |
-| `AR_NO_TIMESTEP_FIX`, `AR_NO_UI_TIMESTEP_FIX` | Normal game speed above 30 fps; normal UI speed (HUD, radar, dialogue, results) above 30 fps |
-| `AR_NO_MOTION_CAP_FIX`, `AR_NO_ANIM_STEP_FIX`, `AR_NO_INPUT_REPEAT_FIX` | Above 30 fps: normal speed of launches from vents and ramps; of animation of objects not refreshing their step (dialogues); of menu input repeat |
 | `AR_NO_COMPOSITE` | Assembling textures from consecutive resolves |
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
 | `AR_NO_DEPTH_24` | Keeping depth to the guest's precision (see LESSONS) |
-| `AR_NO_MOVIE_SKIP`, `AR_NO_SIM_FPS_CAP`, `AR_NO_CLICK_FIRE` | Skipping movies; 30 fps in the Tutorial and multiplayer matches; left click firing while aiming |
-| `AR_NO_MATCH_CPUS`, `AR_KEEP_RANKED_MENU` | The host adding CPU players once everyone in a Player Match lobby is Ready; greying out Ranked Match and Leaderboards |
 | `AR_NO_DEPTH_CLIP`, `AR_NO_DEPTH_TEST` | Depth clipping (clamps instead), depth testing |
 | `AR_NO_STATE_CACHE`, `AR_FULL_HASH`, `AR_FULL_CONSTANTS`, `AR_FULL_VERTEX_BUFFERS` | Skipping redundant state, sampled hashes, constant and vertex range trimming |
 | `AR_NO_BULK_REGISTERS` | Copying constant and register blocks without side effects in one piece |
@@ -136,16 +120,10 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 
 SSX: every controller input has keys in `user/key_bindings.ini` (written with the defaults the first time: WASD left
 stick, IJKL or the mouse the right stick, which is the trick stick, Space A, E B, Left Shift X, Q Y, Z/C shoulders, right
-and left click the triggers, Escape Start, Tab Back, arrows the d-pad). `AR_MOUSE_STICK_GAIN` scales the mouse. The rest
-of this section describes Anarchy Reigns' version:
-
-`kernel/keyboard_mouse.cpp` merges them into controller 0. Bindings are in `user/key_bindings.txt` (delete it for the defaults), the window's icon, cut from the title's logo, in `user/game_icon.ico` (`AR_NO_GAME_ICON` leaves it out). `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
-`AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. `AR_KBM_ICONS=1|0`
-forces which icons show, `AR_LOG_INPUT_DEVICE` logs switches, `AR_MOUSE_FULL_SPEED` (counts per second for a full stick, 3000)
-and `AR_MOUSE_DEAD_ZONE` (0.41, just past the title's 0.4) tune the camera. `AR_CLICK_CHORD_MS` (35) is how long a click waits for the other
-button before it attacks on its own. `AR_TAP_HOLD_MS` (150) is how long right click is held before it readies the weapon instead of being a heavy attack (Heavy Attack and Use Killer Weapon can share a key; files saved before this get the weapon moved to right click unless it was changed by hand). `AR_LOG_BUTTONS` logs the buttons, left trigger and camera flags the title gets as they change, where the mouse is in a list or grid, and the stun prompts coming and going, `AR_LOG_OPTIONS` the Options screen's state
-and how its highlights grow, `AR_OPTIONS_HIGHLIGHT_SPEED` (4.4 per second) how fast the added rows' grow. `AR_LOG_ATLAS_HASHES` logs atlas hashes if the art stops being recognised.
-The art comes from `tools/mkb_art/make_mkb_art.py`, which writes `ARRecomp/gpu/mkb_art.inl`.
+and left click the triggers, Escape Start, Tab Back, arrows the d-pad). `AR_MOUSE_STICK_GAIN` scales the mouse.
+`kernel/keyboard_mouse.cpp` merges them into controller 0. `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
+`AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. The window's
+icon is the title's own, in `user/game_icon.ico` (`AR_NO_GAME_ICON` leaves it out).
 
 ## Driving the game without a controller
 

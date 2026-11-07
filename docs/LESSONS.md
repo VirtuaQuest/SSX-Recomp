@@ -339,5 +339,8 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   `fill=0xBA` for Scaleform's).
 - The window's icon is the title's own: image 0x8000 of the XDBF resource named after the title ID, a PNG put into an ICO
   as it is (`gpu/game_icon.cpp`), saved only in the player's `user/` folder.
-- Open: the terrain's bright white ridgelines (game style or a rendering error, not settled); frame rates above 30 not
-  checked for game speed.
+- Frame rate: SSX steps its simulation by the time base, so it keeps its speed at any rate. Measured with the same
+  `AR_REMOTE` script at 30 and 60 fps and a screenshot per real second: the tutorial's scripted events (leaving the
+  helicopter to the first spin prompt) are 10.1 s apart in both, and the 60 run presents 59 frames a second. (A first
+  60 run started 8 s late and played the intro slowly: something else had the PC busy; check before comparing.)
+- Open: the terrain's bright white ridgelines (game style or a rendering error, not settled).
