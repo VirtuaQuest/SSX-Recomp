@@ -126,7 +126,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_LOG_XMA`, `AR_NO_XMA` | XMA contexts as the title sets them up; the decoder off (silent) |
 | `AR_CACHE_DRIVE` | Mounts `cache:` (user/cache); off by default, see LESSONS |
 | `AR_NO_HW_THREADS`, `AR_LOG_HW_THREADS` | Guest hardware threads pinned to host logical processors; where threads go |
-| `AR_NO_RIDER_GUARD` | The rider update's null data check (`kernel/title_hooks.cpp`) |
+| `AR_NO_KEYSTROKE_DEVICES` | Keystroke reads ignore their device flags (pad keys go to keyboard-only reads too) |
+| `AR_CRASH_DUMP=<registers>` | 1 KB of guest memory where these registers (numbers, comma separated) point, after a crash |
 | `AR_NO_MIPS`, `AR_NO_BC_DECOMPRESS` | Textures at their base level only; odd sized block compressed textures left as they are |
 | `AR_CRASH_DUMP_THREADS` | Every guest thread's stack after a crash |
 | `AR_D3D12_DEBUG` | Where the debug layer has no callback, its stored messages and the device removal reason are logged when a creation fails |
@@ -173,4 +174,4 @@ Guest memory can also be read from outside with `ReadProcessMemory` at 0x1000000
 
 `AR_WATCH_PHYSICAL`, `AR_WATCH_VIRTUAL`, `AR_WATCH_MOVIE`: log writes to an address or the intro movie's frame buffer.
 `AR_WATCH_PHYSICAL_SIZE` widens the physical watch to a range (`AR_WATCH_DELAY` works for both kinds), `AR_WATCH_LIMIT` sets how many distinct writers are
-logged (64) and `AR_WATCH_DELAY=<seconds>` arms it late (memory written every frame makes the game crawl).
+logged (64; writes logged when watching one address), `AR_WATCH_STACK` how many frames of each writer's stack (8) and `AR_WATCH_DELAY=<seconds>` arms it late (memory written every frame makes the game crawl).

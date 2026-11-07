@@ -122,6 +122,39 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* info)
 
     PrintStack(GetCurrentThread(), *info->ContextRecord, 48);
 
+    // AR_CRASH_DUMP=<register numbers, comma separated>: 1 KB of guest memory from where those registers point.
+    if (const char* registers = getenv("AR_CRASH_DUMP"))
+    {
+        if (auto* ctx = GetPPCContext())
+        {
+            const PPCRegister* gprs[] = { &ctx->r0, &ctx->r1, &ctx->r2, &ctx->r3, &ctx->r4, &ctx->r5, &ctx->r6, &ctx->r7,
+                &ctx->r8, &ctx->r9, &ctx->r10, &ctx->r11, &ctx->r12, &ctx->r13, &ctx->r14, &ctx->r15, &ctx->r16, &ctx->r17,
+                &ctx->r18, &ctx->r19, &ctx->r20, &ctx->r21, &ctx->r22, &ctx->r23, &ctx->r24, &ctx->r25, &ctx->r26, &ctx->r27,
+                &ctx->r28, &ctx->r29, &ctx->r30, &ctx->r31 };
+            for (const char* p = registers; *p != 0;)
+            {
+                int index = atoi(p);
+                uint32_t address = index >= 0 && index < 32 ? gprs[index]->u32 & ~15u : 0;
+                if (address >= 0x10000)
+                {
+                    fmt::print(stderr, "     memory at r{} (0x{:08X}):\n", index, address);
+                    const uint8_t* bytes = g_memory.Translate<const uint8_t>(address);
+                    for (uint32_t row = 0; row < 1024; row += 32)
+                    {
+                        fmt::print(stderr, "     +{:03X}:", row);
+                        for (uint32_t i = 0; i < 32; i += 4)
+                            fmt::print(stderr, " {:02X}{:02X}{:02X}{:02X}", bytes[row + i], bytes[row + i + 1], bytes[row + i + 2], bytes[row + i + 3]);
+                        fmt::print(stderr, "\n");
+                    }
+                }
+                while (*p != 0 && *p != ',')
+                    p++;
+                if (*p == ',')
+                    p++;
+            }
+        }
+    }
+
     // AR_CRASH_DUMP_THREADS: what every other guest thread was doing, for crashes that look like races.
     if (getenv("AR_CRASH_DUMP_THREADS"))
     {
@@ -145,6 +178,7 @@ static std::vector<uint8_t*> g_watchPages;
 static size_t g_watchLimit = 64; // Distinct writers logged (AR_WATCH_LIMIT).
 static std::set<DWORD64> g_watchSeen;
 static thread_local bool t_watchStepping;
+static thread_local uint8_t* t_watchLogged; // A write just logged: its value is printed once it's done.
 static uint8_t* g_watchExact; // Only writes to these 8 bytes are logged, when set.
 static std::vector<uint8_t*> g_watchWords; // Or only writes to these words (WatchGuestWords), each writer once per word.
 static std::set<std::pair<DWORD64, uint8_t*>> g_watchWordWriters;
@@ -164,6 +198,12 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
     if (record->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watchStepping)
     {
         t_watchStepping = false;
+        if (t_watchLogged != nullptr)
+        {
+            auto* word = reinterpret_cast<uint8_t*>(uintptr_t(t_watchLogged) & ~uintptr_t(3));
+            fmt::print(stderr, "     now 0x{:08X} at guest 0x{:08X}\n", uint32_t(word[0]) << 24 | uint32_t(word[1]) << 16 | uint32_t(word[2]) << 8 | word[3], g_memory.MapVirtual(word));
+            t_watchLogged = nullptr;
+        }
         ProtectWatch(g_watchStopped ? PAGE_READWRITE : g_watchReads ? PAGE_NOACCESS : PAGE_READONLY);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -194,7 +234,7 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
         }
         else
         {
-            log = exact && (g_watchExact != nullptr ? exactLogs++ < 64 : g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < g_watchLimit);
+            log = exact && (g_watchExact != nullptr ? exactLogs++ < int(g_watchLimit) : g_watchSeen.insert(info->ContextRecord->Rip).second && g_watchSeen.size() < g_watchLimit);
         }
         if (log)
         {
@@ -203,7 +243,9 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
             if (auto* ctx = GetPPCContext())
                 fmt::print(stderr, "     guest r3 0x{:08X} r4 0x{:08X} r5 0x{:08X} r6 0x{:08X} r31 0x{:08X} lr 0x{:08X}\n",
                     ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r31.u32, uint32_t(ctx->lr));
-            PrintStack(GetCurrentThread(), *info->ContextRecord, 8);
+            static const int depth = getenv("AR_WATCH_STACK") ? atoi(getenv("AR_WATCH_STACK")) : 8;
+            PrintStack(GetCurrentThread(), *info->ContextRecord, depth);
+            t_watchLogged = address;
         }
     }
 
@@ -215,6 +257,8 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info)
 
 void InstallMemoryWatch()
 {
+    if (const char* limit = getenv("AR_WATCH_LIMIT"))
+        g_watchLimit = strtoul(limit, nullptr, 0);
     if (const char* text = getenv("AR_WATCH_VIRTUAL"))
     {
         // A page outside the physical views: watched in its one view.

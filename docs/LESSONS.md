@@ -325,14 +325,19 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   which every creation failed). 2D textures now get their stored mip levels (until the packed ones): without them the
   snow aliased into white speckle at a distance.
 - Threads: guest hardware threads run on host logical processors of their own (two per core, as on the console).
-- The cache drive (`cache:`): with it SSX copies its archives there (as on a console with a hard drive) and loads from
-  the copies, and its first race then crashed about every other run: a rider's state block had no data in
-  `sub_82964448` (and `sub_82BB63B0`), with no other thread running game code at the time. Without the drive it never
-  happened in 6 runs and saving works, so the drive is opt-in (`AR_CACHE_DRIVE`). The copies were byte-identical to the
-  disc, so it isn't corrupt data. Not understood yet. The rider hooks (`RiderDataMissingHook`) stay as a guard.
+- The cache drive (`cache:`): with it SSX copies its archives there (885 MB, as on a console with a hard drive) and
+  loads from the copies. It's opt-in (`AR_CACHE_DRIVE`) for the disk space only.
+- Keystrokes: SSX polls `XamInputGetKeystrokeEx` for the keyboard only (flags 0x40000002) and indexes a 256 entry key
+  table (+568 of its input object) by the virtual key. Pad keystrokes returned there (VK_PAD_A is 0x5800) wrote 0xFFFF
+  45 KB past the table, into whatever the heap had put there. Usually that was a rider's animation records: a value
+  count of 255 then overran a state machine's 22 entry table (`sub_82B97AE0` from `sub_82964448`) and the tutorial
+  crashed when A was pressed at its first dialog or to skip the helicopter scene. The crash moved with the heap layout
+  (the cache drive, I/O timing, thread pinning), so it looked like a loading race, and null data, a freed state machine
+  and an allocation "returning" 0x3F were all symptoms of it. Found by logging records with impossible counts, then a
+  watch (`AR_WATCH_VIRTUAL`) on the bad byte. Keystroke reads now honour the device flags.
 - The front end is Scaleform 4 (GFx); `data\common\config\memory.cfg` on the disc sets the heaps (fixed sizes on Xenon,
   `fill=0xBA` for Scaleform's).
 - The window's icon is the title's own: image 0x8000 of the XDBF resource named after the title ID, a PNG put into an ICO
   as it is (`gpu/game_icon.cpp`), saved only in the player's `user/` folder.
 - Open: the terrain's bright white ridgelines (game style or a rendering error, not settled); frame rates above 30 not
-  checked for game speed; the cache drive race.
+  checked for game speed.

@@ -24,18 +24,3 @@ setjmp_address = 0x828857F0
 functions = [
     { address = 0x834CCCB0, size = 0x2D0 },
 ]
-
-# A rider's update (sub_82964448) reads a state block's data through its first word at two places; with fast loading
-# another thread can still be attaching that data. When it's null, go on with the next block as these paths do
-# (82964B00). See kernel/title_hooks.cpp.
-[[midasm_hook]]
-name = "RiderDataMissingHook"
-address = 0x82964A50
-registers = ["r3"]
-jump_address_on_true = 0x82964B00
-
-[[midasm_hook]]
-name = "RiderDataMissingHook"
-address = 0x82964AE4
-registers = ["r3"]
-jump_address_on_true = 0x82964B00

@@ -538,12 +538,20 @@ namespace imports
     }
 
     // X_INPUT_KEYSTROKE: VirtualKey, Unicode, Flags (big endian 16 bit), UserIndex, HidCode. A user index of 0xFF
-    // reads from any controller and reports which one.
+    // reads from any controller and reports which one. The low flag bits pick the devices (1 gamepad, 2 keyboard, none
+    // for any); only gamepads are emulated, so a keyboard-only read finds nothing. SSX polls the keyboard this way and
+    // indexes a 256 entry table by the virtual key: given a pad key (VK_PAD_A is 0x5800) it wrote 45 KB past it, into
+    // whatever was allocated there (a rider's animation records, which then crashed the tutorial).
+    // AR_NO_KEYSTROKE_DEVICES ignores the flags.
     uint32_t XamInputGetKeystrokeEx(be<uint32_t>* userIndex, uint32_t flags, uint8_t* keystroke)
     {
         uint32_t user = userIndex != nullptr ? (userIndex->get() & 0xFF) : 0xFF;
         if (user != 0xFF && user >= XUSER_MAX_COUNT)
             return X_ERROR_DEVICE_NOT_CONNECTED;
+
+        static const bool devices = AR_ENV("AR_NO_KEYSTROKE_DEVICES") == nullptr;
+        if (devices && (flags & 3) == 2)
+            return X_ERROR_EMPTY;
 
         Keystroke event;
         if (!NextKeystroke(user, event))
