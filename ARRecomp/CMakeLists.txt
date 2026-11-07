@@ -31,9 +31,25 @@ target_link_libraries(ARRecomp PRIVATE
     dxguid)
 
 # FFmpeg (LGPL, shared) decodes XMA audio. FFMPEG_ROOT is a build with include/, lib/ and bin/; its DLLs go next to the game.
-set(FFMPEG_ROOT "C:/Downloads/Repos/_tools/ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-shared-8.1" CACHE PATH "FFmpeg shared build (include, lib, bin)")
+# Unless given (-DFFMPEG_ROOT or the environment), it's looked for where Setup looks: thirdparty/ffmpeg, then ffmpeg*
+# folders next to the project and in its _tools folder.
+if (NOT FFMPEG_ROOT AND DEFINED ENV{FFMPEG_ROOT})
+    set(FFMPEG_ROOT "$ENV{FFMPEG_ROOT}")
+endif()
+if (NOT FFMPEG_ROOT)
+    get_filename_component(AR_PROJECT_PARENT "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
+    file(GLOB AR_FFMPEG_CANDIDATES LIST_DIRECTORIES true "${AR_PROJECT_PARENT}/ffmpeg*" "${AR_PROJECT_PARENT}/_tools/ffmpeg*")
+    foreach (candidate "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg" ${AR_FFMPEG_CANDIDATES})
+        if (EXISTS "${candidate}/include/libavcodec/avcodec.h" AND EXISTS "${candidate}/lib/avcodec.lib")
+            set(FFMPEG_ROOT "${candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+set(FFMPEG_ROOT "${FFMPEG_ROOT}" CACHE PATH "FFmpeg shared build (include, lib, bin)" FORCE)
 if (NOT EXISTS "${FFMPEG_ROOT}/include/libavcodec/avcodec.h")
-    message(FATAL_ERROR "FFmpeg was not found at FFMPEG_ROOT (${FFMPEG_ROOT}): it is needed to decode the game's audio.")
+    message(FATAL_ERROR "FFmpeg was not found (FFMPEG_ROOT: '${FFMPEG_ROOT}'). It decodes the game's audio: unzip a win64 "
+        "LGPL shared build (with include, lib and bin folders) into thirdparty/ffmpeg or next to this project, or set FFMPEG_ROOT.")
 endif()
 target_include_directories(ARRecomp PRIVATE "${FFMPEG_ROOT}/include")
 target_link_libraries(ARRecomp PRIVATE "${FFMPEG_ROOT}/lib/avcodec.lib" "${FFMPEG_ROOT}/lib/avutil.lib")

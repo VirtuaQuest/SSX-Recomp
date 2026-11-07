@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 namespace
 {
     // What this project's hooks were made for. Any other executable has its code at other addresses.
-    constexpr const char* KNOWN_EXECUTABLE_SHA1 = "639e27f4d5c970b80a03b2c64932d5644a6c9b6d";
+    constexpr const char* KNOWN_EXECUTABLE_SHA1 = "9bbfa3af719e9e65eed73ba7d16bb051f427088a";
     constexpr uint32_t TITLE_ID = 0x4541096D; // SSX
     constexpr uint64_t NEEDED_DISK_BYTES = 5ull * 1024 * 1024 * 1024;
     constexpr int WINDOW_WIDTH = 760, WINDOW_HEIGHT = 640;
@@ -54,14 +54,14 @@ namespace
     theme::Form g_form;
     HWND g_window, g_game, g_dlc, g_build, g_launcher, g_bar, g_log;
     int g_gameStatus, g_dlcStatus, g_stepLabel, g_timeLabel;
-    int g_toolLabels[6];
+    int g_toolLabels[7];
     fs::path g_root, g_setupFolder, g_buildFolder, g_outFolder, g_runFolder, g_logPath;
 
     struct Toolchain
     {
-        fs::path visualStudio, vcvars, clang, cmake, ninja, xenonRecomp;
+        fs::path visualStudio, vcvars, clang, cmake, ninja, xenonRecomp, ffmpeg;
         bool sdk{}, disk{};
-        bool Ready() const { return !vcvars.empty() && !clang.empty() && !cmake.empty() && !ninja.empty() && !xenonRecomp.empty() && sdk && disk; }
+        bool Ready() const { return !vcvars.empty() && !clang.empty() && !cmake.empty() && !ninja.empty() && !xenonRecomp.empty() && !ffmpeg.empty() && sdk && disk; }
     };
     Toolchain g_tools;
 
@@ -280,6 +280,43 @@ namespace
         if (Exists(xenon / L"XenonUtils\\ppc_context.h") && !fs::is_empty(xenon / L"thirdparty\\simde", ec) && !ec)
             tools.xenonRecomp = xenon;
 
+        // FFmpeg decodes the game's XMA audio: a shared LGPL build (include, lib and bin folders), from FFMPEG_ROOT, a
+        // thirdparty/ffmpeg folder here, or an ffmpeg* folder next to this one or in its _tools folder.
+        auto isFfmpeg = [](const fs::path& folder)
+            {
+                std::error_code ec;
+                if (!Exists(folder / L"include" / L"libavcodec" / L"avcodec.h") || !Exists(folder / L"lib" / L"avcodec.lib"))
+                    return false;
+                for (const auto& entry : fs::directory_iterator(folder / L"bin", ec))
+                {
+                    if (entry.path().filename().wstring().rfind(L"avcodec-", 0) == 0 && entry.path().extension() == L".dll")
+                        return true;
+                }
+                return false;
+            };
+        std::vector<fs::path> ffmpegFolders;
+        if (auto dir = GetEnv(L"FFMPEG_ROOT"); !dir.empty())
+            ffmpegFolders.push_back(dir);
+        ffmpegFolders.push_back(g_root / L"thirdparty" / L"ffmpeg");
+        for (const fs::path& parent : { g_root.parent_path(), g_root.parent_path() / L"_tools" })
+        {
+            for (const auto& entry : fs::directory_iterator(parent, ec))
+            {
+                std::wstring name = entry.path().filename().wstring();
+                std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+                if (entry.is_directory(ec) && name.rfind(L"ffmpeg", 0) == 0)
+                    ffmpegFolders.push_back(entry.path());
+            }
+        }
+        for (const fs::path& folder : ffmpegFolders)
+        {
+            if (isFfmpeg(folder))
+            {
+                tools.ffmpeg = folder;
+                break;
+            }
+        }
+
         ULARGE_INTEGER free{};
         tools.disk = GetDiskFreeSpaceExW(g_root.c_str(), &free, nullptr, nullptr) && free.QuadPart >= NEEDED_DISK_BYTES;
         return tools;
@@ -297,6 +334,7 @@ namespace
         show(3, !g_tools.cmake.empty() && !g_tools.ninja.empty(), L"CMake and Ninja", L"add CMake in VS installer");
         show(4, !g_tools.xenonRecomp.empty(), L"XenonRecomp", L"clone next to this folder");
         show(5, g_tools.disk, L"5 GB of disk space", L"not enough free");
+        show(6, !g_tools.ffmpeg.empty(), L"FFmpeg (audio)", L"unzip a win64 lgpl-shared build next to this folder");
     }
 
     // ---- The player's files ----
@@ -628,7 +666,8 @@ namespace
             return false;
 
         std::wstring configure = Quote(g_tools.cmake) + L" -S " + Quote(g_root) + L" -B " + Quote(g_buildFolder) +
-            L" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DXENONRECOMP_ROOT=" + Quote(g_tools.xenonRecomp);
+            L" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DXENONRECOMP_ROOT=" + Quote(g_tools.xenonRecomp) +
+            L" -DFFMPEG_ROOT=" + Quote(g_tools.ffmpeg);
         auto logOnly = [](const std::string& line) { WriteLog(line); };
 
         SetStep(L"Preparing the recompiler", BAR_PREPARE + 5);
@@ -926,11 +965,11 @@ namespace
             row(L"DLC", ID_DLC, ID_DLC_BROWSE, g_dlc, g_dlcStatus);
 
             y += 12;
-            g_form.AddSection(x, y, width, 30 + 3 * 24 + 4, L"What's needed");
+            g_form.AddSection(x, y, width, 30 + 4 * 24 + 4, L"What's needed");
             y += 30;
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 7; i++)
                 g_toolLabels[i] = g_form.AddLabel(x + 4 + (i % 2) * (width / 2), y + (i / 2) * 24, width / 2 - 8, 22, L"", theme::DIM, theme::Font::Body);
-            y += 3 * 24 + 16;
+            y += 4 * 24 + 16;
 
             g_form.AddSection(x, y, width, WINDOW_HEIGHT - y - 16, L"Build");
             y += 30;

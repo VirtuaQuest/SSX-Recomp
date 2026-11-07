@@ -1,4 +1,4 @@
-# XenonRecomp configuration for SSX (Xbox 360, 2012, title 454108CE).
+# XenonRecomp configuration for SSX (Xbox 360, 2012, title 4541096D).
 [main]
 file_path = "../private/default.xex"
 out_directory_path = "../ppc"
