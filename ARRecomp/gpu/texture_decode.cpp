@@ -334,6 +334,81 @@ namespace gpu
         return true;
     }
 
+    // ---- Smaller levels ----
+    //
+    // A 2D texture's levels 1 and on start at the fetch constant's mip address, one after another, each with power of two
+    // dimensions (the base's rounded up, halved per level), rows padded to 32 blocks when tiled (256 bytes when linear),
+    // 32 rows of blocks, and 4 KB alignment. The last fetchable level is in word 4. Levels whose smaller side is 16 texels
+    // or less are packed together into one tile when the packed flag is set; the chain stops before them here (sampling then
+    // clamps at the smallest level there is, 32 texels, which is what matters against aliasing). AR_NO_MIPS leaves textures
+    // at their base level.
+    static void DecodeMips(const TextureFetch& fetch, const FormatInfo& info, DecodedTexture& out)
+    {
+        static const bool disabled = AR_ENV("AR_NO_MIPS") != nullptr;
+        uint32_t maxLevel = (fetch.words[4] >> 6) & 0xF;
+        uint32_t mipBase = fetch.words[5] & 0xFFFFF000;
+        if (disabled || fetch.Dimension() != 1 || out.depth != 1 || maxLevel == 0 || mipBase == 0)
+            return;
+        uint32_t mipAddress = IsPhysicalAddress(mipBase) ? VirtualToPhysical(mipBase) : mipBase & (GUEST_PHYSICAL_SIZE - 1);
+        const uint8_t* levels = g_memory.Translate<uint8_t>(PhysicalToVirtual(mipAddress));
+
+        bool packed = ((fetch.words[5] >> 11) & 1) != 0;
+        uint32_t hostBytesPerBlock = info.conversion == Conversion::None ? info.bytesPerBlock : 4;
+        uint32_t bppLog2 = std::countr_zero(info.bytesPerBlock);
+        uint32_t width = std::bit_ceil(fetch.Width()), height = std::bit_ceil(fetch.Height());
+        size_t offset = 0;
+        uint8_t block[16];
+        for (uint32_t level = 1; level <= maxLevel; level++)
+        {
+            uint32_t levelWidth = std::max(width >> level, 1u), levelHeight = std::max(height >> level, 1u);
+            if (packed && std::min(std::bit_width(levelWidth - 1), std::bit_width(levelHeight - 1)) <= 4)
+                break;
+
+            uint32_t widthBlocks = (levelWidth + info.blockSize - 1) / info.blockSize;
+            uint32_t heightBlocks = (levelHeight + info.blockSize - 1) / info.blockSize;
+            uint32_t pitchBlocks, rowPitchBytes;
+            size_t levelBytes;
+            if (fetch.Tiled())
+            {
+                pitchBlocks = (widthBlocks + 31) & ~31u;
+                rowPitchBytes = pitchBlocks * info.bytesPerBlock;
+                levelBytes = (size_t(rowPitchBytes) * ((heightBlocks + 31) & ~31u) + 4095) & ~size_t(4095);
+            }
+            else
+            {
+                pitchBlocks = widthBlocks;
+                rowPitchBytes = (widthBlocks * info.bytesPerBlock + 255) & ~255u;
+                levelBytes = (size_t(rowPitchBytes) * ((heightBlocks + 31) & ~31u) + 4095) & ~size_t(4095);
+            }
+
+            DecodedTexture::Level& mip = out.mips.emplace_back();
+            mip.width = levelWidth;
+            mip.height = levelHeight;
+            mip.rowPitch = (widthBlocks * hostBytesPerBlock + 255) & ~255u;
+            mip.rowCount = heightBlocks;
+            mip.data.assign(size_t(mip.rowPitch) * mip.rowCount, 0);
+            const uint8_t* source = levels + offset;
+            for (uint32_t y = 0; y < heightBlocks; y++)
+            {
+                uint8_t* destRow = mip.data.data() + size_t(mip.rowPitch) * y;
+                for (uint32_t x = 0; x < widthBlocks; x++)
+                {
+                    size_t at = fetch.Tiled()
+                        ? size_t(xe::gpu::texture_address::Tiled2D(int32_t(x), int32_t(y), pitchBlocks, bppLog2))
+                        : size_t(y) * rowPitchBytes + size_t(x) * info.bytesPerBlock;
+                    memcpy(block, source + at, info.bytesPerBlock);
+                    SwapBlock(block, info.bytesPerBlock, fetch.Endian());
+                    uint8_t* dest = destRow + size_t(x) * hostBytesPerBlock;
+                    if (info.conversion == Conversion::None)
+                        memcpy(dest, block, info.bytesPerBlock);
+                    else
+                        Convert(info.conversion, block, dest);
+                }
+            }
+            offset += levelBytes;
+        }
+    }
+
     bool DecodeTexture(const TextureFetch& fetch, DecodedTexture& out)
     {
         FormatInfo info;
@@ -398,7 +473,12 @@ namespace gpu
 
         static const bool decompress = !AR_ENV("AR_NO_BC_DECOMPRESS");
         if (decompress && ((out.width & 3) != 0 || (out.height & 3) != 0))
+        {
             DecompressBlocks(out);
+            return true; // Without its smaller levels: they'd need decompressing too.
+        }
+
+        DecodeMips(fetch, info, out);
         return true;
     }
 }

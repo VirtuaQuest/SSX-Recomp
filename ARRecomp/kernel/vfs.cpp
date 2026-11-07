@@ -419,9 +419,12 @@ namespace vfs
         std::error_code ec;
         std::filesystem::create_directories(g_userPath, ec);
 
-        // The utility drive (cache:), already mounted: titles that look for it first (SSX does) then don't try to
-        // set it up from the raw hard disk partition. AR_NO_CACHE_DRIVE leaves it out.
-        if (!getenv("AR_NO_CACHE_DRIVE"))
+        // The utility drive (cache:), already mounted, with AR_CACHE_DRIVE: titles that look for it first (SSX does) then
+        // don't try to set it up from the raw hard disk partition. SSX then copies its archives there and loads from the
+        // copies, which made its first race crash about every other time (a rider's data missing in its update, with no
+        // other thread running; not understood yet), so it's off by default. Without it SSX reads the disc, as a console
+        // without a hard drive would.
+        if (getenv("AR_CACHE_DRIVE"))
             MapRoot("cache:", g_userPath / "cache");
 
         if (std::filesystem::is_directory(gamePath))

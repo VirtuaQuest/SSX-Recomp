@@ -3,27 +3,19 @@
 #include <kernel/function.h>
 #include <kernel/memory.h>
 
-// A rider's update (sub_82964448, rider in r3) reads its state block at +724, whose first word points at the rider's data
-// (followed through +180 and +12 to a state number). With the archives on the cache drive, loading is fast enough that
-// this update can run while another thread hasn't attached that data yet (the block's first word still 0), and it
-// crashed reading through the null pointer. The console's slower CPU never got there first. Such an update is skipped
-// until the data is there: the rider stands still for that frame. AR_NO_RIDER_GUARD turns this off.
-PPC_FUNC_IMPL(__imp__sub_82964448);
-PPC_FUNC(sub_82964448)
+// A rider's update (sub_82964448) walks state blocks whose first word points at data it reads through +180 and +12 to a
+// state number. With the archives on the cache drive, loading is fast enough that another thread can still be attaching
+// that data while the update runs (the first word 0), and it crashed reading through the null pointer. The console's
+// slower CPU never got there first. A check at the two reads (mid-function hooks in AR.toml) goes on with the next block
+// instead, as the update does for blocks it has nothing to do with. AR_NO_RIDER_GUARD turns this off.
+bool RiderDataMissingHook(PPCRegister& block)
 {
     static const bool guard = AR_ENV("AR_NO_RIDER_GUARD") == nullptr;
-    if (guard)
-    {
-        uint32_t block = PPC_LOAD_U32(ctx.r3.u32 + 724);
-        if (block != 0 && PPC_LOAD_U32(block) == 0)
-        {
-            static std::atomic<uint32_t> skipped;
-            uint32_t count = ++skipped;
-            if (count == 1 || count == 100 || count == 10000)
-                LOGF_INFO("rider update skipped while its data isn't attached ({} times)", count);
-            ctx.r3.u64 = 0;
-            return;
-        }
-    }
-    __imp__sub_82964448(ctx, base);
+    if (!guard || block.u32 == 0 || g_memory.Translate<be<uint32_t>>(block.u32)->get() != 0)
+        return false;
+    static std::atomic<uint32_t> skipped;
+    uint32_t count = ++skipped;
+    if (count == 1 || count == 100 || count == 10000)
+        LOGF_INFO("rider state block skipped while its data isn't attached ({} times)", count);
+    return true;
 }

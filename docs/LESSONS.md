@@ -302,3 +302,37 @@ Two copies on one machine played a whole Cage Match through the title's own netc
 - Angular light patches around characters in tiled deferred lighting (pixel shader E9891C vs 57FBD2), possibly a
   translation bug; thin vertical ticks under ledge edges in the Foundry.
 - Bright washed-out frames while fighting or facing the sun: not looked into, may be the title's own bloom and hit flashes.
+
+## SSX specifics (from November 2026)
+
+SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
+
+- Recompiler: XenonAnalyse ended functions at `bdzlr`/`bdnzlr`, treating BO 0x12 as an unconditional return (only BO & 0x14
+  == 0x14 always branches). The CRT's memset ends with `stb; bdzlr; stb; bdzlr; stb`, so every memset leaving 2 or 3 tail
+  bytes stored one. It showed up far away: a Scaleform style table one byte short of 0xFF, a lookup reading the heap's
+  0xBA fill as vertex index 0xFFBA, and a crash in the tessellator. Before suspecting floating point, check the input
+  tables a function reads: a deterministic algorithm with varying results had varying memory under it. `vpkd3d128` and
+  `vupkd3d128` types 2 (10:10:10:2) and 4 (four shorts) used to be `__builtin_debugtrap`; grep generated code for traps.
+- Kernel: mutants (`NtCreateMutant`, `NtReleaseMutant`), WSA events, `XamCreateEnumeratorHandle`. `NtOpenFile` takes share
+  access before the options (as NT's does); with them swapped, DeleteFile/MoveFile's share mode 7 read as "directory".
+  XContentCreate/Delete of this XDK call XAM ordinals 625/624 through `XexGetProcedureAddress`; they're host functions
+  at the last words of `.text` (data, never code), see `FindDynamicExport` in `kernel/imports/ex.cpp`.
+- Audio: SSX drives XMA contexts itself. `kernel/imports/xma.cpp` finds frames (15 bit lengths, across packets and
+  buffers) and decodes each in a packet of its own with FFmpeg's XMA2 decoder; FFmpeg's skipped first frame becomes
+  silence so sample counts stay exact.
+- Textures: block compressed textures that aren't whole blocks (991x981) are decompressed to RGBA8; upload rows must be
+  256 byte aligned (an unaligned copy made the command list fail to close and removed the device, 0x887A0001, after
+  which every creation failed). 2D textures now get their stored mip levels (until the packed ones): without them the
+  snow aliased into white speckle at a distance.
+- Threads: guest hardware threads run on host logical processors of their own (two per core, as on the console).
+- The cache drive (`cache:`): with it SSX copies its archives there (as on a console with a hard drive) and loads from
+  the copies, and its first race then crashed about every other run: a rider's state block had no data in
+  `sub_82964448` (and `sub_82BB63B0`), with no other thread running game code at the time. Without the drive it never
+  happened in 6 runs and saving works, so the drive is opt-in (`AR_CACHE_DRIVE`). The copies were byte-identical to the
+  disc, so it isn't corrupt data. Not understood yet. The rider hooks (`RiderDataMissingHook`) stay as a guard.
+- The front end is Scaleform 4 (GFx); `data\common\config\memory.cfg` on the disc sets the heaps (fixed sizes on Xenon,
+  `fill=0xBA` for Scaleform's).
+- The window's icon is the title's own: image 0x8000 of the XDBF resource named after the title ID, a PNG put into an ICO
+  as it is (`gpu/game_icon.cpp`), saved only in the player's `user/` folder.
+- Open: the terrain's bright white ridgelines (game style or a rendering error, not settled); frame rates above 30 not
+  checked for game speed; the cache drive race.

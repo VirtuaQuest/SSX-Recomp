@@ -32,6 +32,14 @@ namespace gpu
         uint32_t rowPitch;    // Bytes per row of blocks in data.
         uint32_t rowCount;    // Rows of blocks per slice.
         std::vector<uint8_t> data;
+
+        // Smaller levels (1 and on) of 2D textures, as many as the guest stores apart from the packed ones.
+        struct Level
+        {
+            uint32_t width, height, rowPitch, rowCount;
+            std::vector<uint8_t> data;
+        };
+        std::vector<Level> mips;
     };
 
     // Host format for a Xenos texture format, or DXGI_FORMAT_UNKNOWN if not supported.

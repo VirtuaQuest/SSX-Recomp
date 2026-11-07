@@ -118,7 +118,25 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_SERIALIZE_FRAMES`, `AR_NO_VERTEX_CACHE`, `AR_STRIPS_AS_LISTS` | Experiments: GPU finishes each frame first; no cross-frame vertex cache; strips drawn as lists |
 | `AR_UPLOAD_RING`, `AR_ROTATE_UPLOADS`, `AR_UPLOAD_WRITE_BACK`, `AR_UPLOAD_FENCE`, `AR_VRAM_UPLOADS` | Upload memory experiments: 1 GB without reuse for frames; shifted per frame; cache coherent; fenced; mirrored in video memory |
 
+## SSX additions
+
+| Switch | |
+|---|---|
+| `AR_TRACE_IMPORTS=<prefixes>` | Logs calls of imports whose names start with these (comma separated), e.g. `Xam,XMsg` |
+| `AR_LOG_XMA`, `AR_NO_XMA` | XMA contexts as the title sets them up; the decoder off (silent) |
+| `AR_CACHE_DRIVE` | Mounts `cache:` (user/cache); off by default, see LESSONS |
+| `AR_NO_HW_THREADS`, `AR_LOG_HW_THREADS` | Guest hardware threads pinned to host logical processors; where threads go |
+| `AR_NO_RIDER_GUARD` | The rider update's null data check (`kernel/title_hooks.cpp`) |
+| `AR_NO_MIPS`, `AR_NO_BC_DECOMPRESS` | Textures at their base level only; odd sized block compressed textures left as they are |
+| `AR_CRASH_DUMP_THREADS` | Every guest thread's stack after a crash |
+| `AR_D3D12_DEBUG` | Where the debug layer has no callback, its stored messages and the device removal reason are logged when a creation fails |
+
 ## Keyboard and mouse
+
+SSX: every controller input has keys in `user/key_bindings.ini` (written with the defaults the first time: WASD left
+stick, IJKL or the mouse the right stick, which is the trick stick, Space A, E B, Left Shift X, Q Y, Z/C shoulders, right
+and left click the triggers, Escape Start, Tab Back, arrows the d-pad). `AR_MOUSE_STICK_GAIN` scales the mouse. The rest
+of this section describes Anarchy Reigns' version:
 
 `kernel/keyboard_mouse.cpp` merges them into controller 0. Bindings are in `user/key_bindings.txt` (delete it for the defaults), the window's icon, cut from the title's logo, in `user/game_icon.ico` (`AR_NO_GAME_ICON` leaves it out). `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
 `AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. `AR_KBM_ICONS=1|0`

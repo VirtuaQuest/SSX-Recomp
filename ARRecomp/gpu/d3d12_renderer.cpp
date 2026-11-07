@@ -102,6 +102,7 @@ namespace gpu::d3d12
         // it); 1 and 2 are as rasterized with 2x and 4x MSAA (a sample per texel, samples of a pixel adjacent).
         uint32_t layout = 0;
         uint64_t poolKey = 0; // Its description, for reuse once released (0: not pooled).
+        uint32_t mipLevels = 1;
     };
 
     struct DescriptorAllocator
@@ -2097,9 +2098,9 @@ float4 main(float4 position : SV_Position) : SV_Target
     // ---- Textures ----
 
     static Texture CreateTexture(uint32_t width, uint32_t height, uint32_t depth, bool cube, DXGI_FORMAT format,
-        D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state)
+        D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, uint32_t mipLevels = 1)
     {
-        uint64_t poolWords[4] = { (uint64_t(width) << 32) | height, (uint64_t(depth) << 1) | (cube ? 1 : 0), uint64_t(format), uint64_t(flags) };
+        uint64_t poolWords[4] = { (uint64_t(width) << 32) | height, (uint64_t(depth) << 1) | (cube ? 1 : 0) | (uint64_t(mipLevels) << 32), uint64_t(format), uint64_t(flags) };
         uint64_t poolKey = HashMemory(reinterpret_cast<const uint8_t*>(poolWords), sizeof(poolWords)) | 1;
         static const bool noPool = AR_ENV("AR_NO_TEXTURE_POOL") != nullptr;
         if (!noPool)
@@ -2129,13 +2130,14 @@ float4 main(float4 position : SV_Position) : SV_Target
         texture.width = width;
         texture.height = height;
         texture.poolKey = noPool ? 0 : poolKey;
+        texture.mipLevels = mipLevels;
 
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = (!cube && depth > 1) ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = width;
         desc.Height = height;
         desc.DepthOrArraySize = UINT16(depth);
-        desc.MipLevels = 1;
+        desc.MipLevels = UINT16(mipLevels);
         desc.SampleDesc.Count = 1;
         desc.Flags = flags;
 
@@ -2182,7 +2184,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         else
         {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srv.Texture2D.MipLevels = 1;
+            srv.Texture2D.MipLevels = mipLevels;
         }
         g.device->CreateShaderResourceView(texture.resource.Get(), &srv, CpuView(texture.srv));
 
@@ -2266,6 +2268,27 @@ float4 main(float4 position : SV_Position) : SV_Target
             dest.pResource = texture.resource.Get();
             dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dest.SubresourceIndex = slice;
+            g.list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+        }
+
+        // Smaller levels of a 2D texture: subresource = level. Block compressed footprints cover whole blocks.
+        bool blocks = decoded.format >= DXGI_FORMAT_BC1_TYPELESS && decoded.format <= DXGI_FORMAT_BC5_SNORM;
+        for (uint32_t level = 1; level < texture.mipLevels && level <= decoded.mips.size() && !volume && decoded.depth == 1; level++)
+        {
+            const DecodedTexture::Level& mip = decoded.mips[level - 1];
+            auto mipAllocation = Upload(uint64_t(mip.rowPitch) * mip.rowCount, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            if (mipAllocation.cpu == nullptr)
+                break;
+            memcpy(mipAllocation.cpu, mip.data.data(), mip.data.size());
+            D3D12_TEXTURE_COPY_LOCATION source{};
+            source.pResource = g.uploadBuffer.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint.Offset = mipAllocation.offset;
+            source.PlacedFootprint.Footprint = { decoded.format, blocks ? (mip.width + 3) & ~3u : mip.width, blocks ? (mip.height + 3) & ~3u : mip.height, 1, mip.rowPitch };
+            D3D12_TEXTURE_COPY_LOCATION dest{};
+            dest.pResource = texture.resource.Get();
+            dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dest.SubresourceIndex = level;
             g.list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
         }
 
@@ -2630,7 +2653,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
 
         // Fetch constants also hold sampler state, which doesn't change the texture.
-        uint32_t keyWords[6] = { fetch.words[0] & 0xFFC003FF, fetch.words[1], fetch.words[2], dimension, 0, fetch.words[5] & 0xFFFFF600 };
+        uint32_t keyWords[6] = { fetch.words[0] & 0xFFC003FF, fetch.words[1], fetch.words[2], dimension, (fetch.words[4] >> 6) & 0xF, fetch.words[5] & 0xFFFFFE00 };
         uint64_t key = HashMemory(reinterpret_cast<const uint8_t*>(keyWords), sizeof(keyWords));
         auto& entry = g.textures[key];
 
@@ -2656,7 +2679,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (!entry.texture.resource)
                 {
                     entry.texture = CreateTexture(decoded.width, decoded.height, decoded.depth, dimension == 3, decoded.format,
-                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, 1 + uint32_t(decoded.mips.size()));
                     if (!entry.texture.resource)
                         return nullSrv;
                 }
