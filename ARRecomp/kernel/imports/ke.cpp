@@ -105,12 +105,16 @@ namespace imports
 
     uint32_t KeSetAffinityThread(uint32_t kthread, uint32_t affinity, be<uint32_t>* previousAffinity)
     {
-        // The host scheduler decides where threads run; only remember the requested processor.
+        // The thread moves to the host core of that hardware thread (see SetGuestThreadProcessor).
         if (previousAffinity != nullptr)
             *previousAffinity = 1u << *GuestPtr<uint8_t>(kthread - PCR_SIZE + 0x10C);
 
         if (affinity != 0)
-            *GuestPtr<uint8_t>(kthread - PCR_SIZE + 0x10C) = uint8_t(std::countr_zero(affinity));
+        {
+            uint32_t processor = uint32_t(std::countr_zero(affinity));
+            *GuestPtr<uint8_t>(kthread - PCR_SIZE + 0x10C) = uint8_t(processor);
+            SetGuestThreadProcessor(kthread, processor);
+        }
 
         return X_STATUS_SUCCESS;
     }

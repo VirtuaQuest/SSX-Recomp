@@ -5,6 +5,8 @@
 #include <kernel/memory.h>
 #include <dbghelp.h>
 
+static void PinToHardwareThread(HANDLE hostThread, uint32_t processor, uint32_t threadId);
+
 void PrintThreadStack(HANDLE thread, int maxFrames);
 
 TlsInfo g_tlsInfo;
@@ -169,12 +171,94 @@ std::shared_ptr<ThreadObject> CreateGuestThread(const ThreadStartParams& params)
 
     std::string name = params.name.empty() ? fmt::format("Guest thread {}", thread->threadId) : params.name;
     SetThreadDescription(thread->hostThread, std::filesystem::path(name).wstring().c_str());
+    if (affinity != 0)
+        PinToHardwareThread(thread->hostThread, uint32_t(std::countr_zero(affinity)), thread->threadId);
 #endif
 
     LOGF_INFO("thread {} created: start 0x{:08X} context 0x{:08X} xapi 0x{:08X} stack 0x{:X} flags 0x{:X}",
         thread->threadId, params.startAddress, params.startContext, params.xapiStartup, stackSize, params.creationFlags);
 
     return thread;
+}
+
+// The console's six hardware threads, each pinned to one host core: guest threads asking for the same hardware thread
+// then share a core as they do on the console, time sliced but never running at the same moment. Titles count on that:
+// SSX's world update read an object another thread on its hardware thread hadn't finished building, which crashed
+// with every core free (and never when the process had two). Threads that ask for no hardware thread stay free.
+// Performance cores come first. AR_NO_HW_THREADS turns this off, AR_LOG_HW_THREADS logs where threads go.
+static const std::vector<DWORD_PTR>& HardwareThreadMasks()
+{
+    static const std::vector<DWORD_PTR> masks = []
+        {
+            std::vector<DWORD_PTR> result;
+            DWORD length = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+            std::vector<uint8_t> buffer(length);
+            auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+            if (length == 0 || !GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length))
+                return result;
+            // (efficiency class, the core's logical processors), the most capable cores first.
+            std::vector<std::pair<int, KAFFINITY>> cores;
+            for (DWORD offset = 0; offset < length;)
+            {
+                auto* entry = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+                const GROUP_AFFINITY& group = entry->Processor.GroupMask[0];
+                if (group.Group == 0 && group.Mask != 0)
+                    cores.push_back({ -int(entry->Processor.EfficiencyClass), group.Mask });
+                offset += entry->Size;
+            }
+            std::stable_sort(cores.begin(), cores.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            // The console has three cores of two threads: hardware threads 2n and 2n + 1 share a core. With SMT here, they
+            // get the two logical processors of one core each, which leaves the remaining cores to the GPU and audio. Without
+            // it, a core each.
+            std::vector<DWORD_PTR> logical;
+            for (const auto& [efficiency, mask] : cores)
+            {
+                int taken = 0;
+                for (int bit = 0; bit < int(sizeof(KAFFINITY) * 8) && taken < 2; bit++)
+                {
+                    if (mask & (KAFFINITY(1) << bit))
+                    {
+                        logical.push_back(DWORD_PTR(1) << bit);
+                        taken++;
+                    }
+                }
+            }
+            for (size_t i = 0; i < 6 && !logical.empty(); i++)
+                result.push_back(logical[i % logical.size()]);
+            return result;
+        }();
+    return masks;
+}
+
+static void PinToHardwareThread(HANDLE hostThread, uint32_t processor, uint32_t threadId)
+{
+    static const bool disabled = AR_ENV("AR_NO_HW_THREADS") != nullptr;
+    const auto& masks = HardwareThreadMasks();
+    if (disabled || masks.empty() || processor >= 6)
+        return;
+    SetThreadAffinityMask(hostThread, masks[processor]);
+    static const bool log = AR_ENV("AR_LOG_HW_THREADS") != nullptr;
+    if (log)
+        LOGF_INFO("thread {} on hardware thread {} (host mask 0x{:X})", threadId, processor, uint64_t(masks[processor]));
+}
+
+void SetGuestThreadProcessor(uint32_t kthread, uint32_t processor)
+{
+    std::shared_ptr<ThreadObject> found;
+    {
+        std::lock_guard lock(g_threadsMutex);
+        for (const auto& [id, weak] : g_threads)
+        {
+            if (auto thread = weak.lock(); thread && thread->guestObject == kthread)
+            {
+                found = thread;
+                break;
+            }
+        }
+    }
+    if (found && found->hostThread != nullptr)
+        PinToHardwareThread(found->hostThread, processor, found->threadId);
 }
 
 uint32_t SuspendGuestThread(ThreadObject* thread)

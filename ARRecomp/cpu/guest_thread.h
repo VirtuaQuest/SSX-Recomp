@@ -77,6 +77,8 @@ uint32_t ResumeGuestThread(ThreadObject* thread);
 
 std::shared_ptr<ThreadObject> GetCurrentThreadObject();
 uint32_t GetCurrentKThread();
+// Runs the guest thread on the host core standing for one of the console's six hardware threads.
+void SetGuestThreadProcessor(uint32_t kthread, uint32_t processor);
 uint32_t GetCurrentGuestThreadId();
 std::shared_ptr<ThreadObject> FindThreadById(uint32_t threadId);
 std::shared_ptr<ThreadObject> FindThreadByKThread(uint32_t kthread);
