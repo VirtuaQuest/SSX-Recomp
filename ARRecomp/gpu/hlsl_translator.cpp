@@ -163,7 +163,7 @@ float xe_linear_to_gamma(float l)
     return g / 1023.0f;
 }
 
-// Applies the fetch constant's per component sign (signed or gamma) and swizzle to a sampled value.
+// Applies the fetch constant's per component sign (signed, unsigned biased or gamma) and swizzle to a sampled value.
 float4 xe_texture_result(float4 value, uint4 info)
 {
     // Depth buffer words (resolved from a depth buffer, as bytes from the low one up) fetched as depth: 24 bit unorm
@@ -199,7 +199,15 @@ float4 xe_texture_result(float4 value, uint4 info)
         {
             value[i] = xe_gamma_to_linear(value[i]);
         }
+        else if ((info.w >> (i + 12u)) & 1u)
+        {
+            value[i] = value[i] * 2.0f - 1.0f;
+        }
     }
+    // Exponent bias of the fetch constant (6 bit signed power of two).
+    int expAdjust = int(info.w << 10u) >> 26;
+    if (expAdjust != 0)
+        value *= exp2(float(expAdjust));
     return xe_swizzle(value, info.z);
 }
 
@@ -1020,6 +1028,11 @@ float4 xe_cube(float4 a, float4 b)
         std::string& out = m_out;
 
         out = fmt::format("#define XE_REGISTER_COUNT {}\n", registerCount);
+        // AR_SHOW_EXPR=<HLSL float4>: what draws picked by AR_HIGHLIGHT_PS output instead of magenta, to look at a value
+        // the shader computes. XE_R(n) is temporary register n as the shader leaves it (clamped to the shader's count).
+        static const char* showExpression = AR_ENV("AR_SHOW_EXPR");
+        out += "#define XE_R(n) xe_r[min(n, XE_REGISTER_COUNT - 1)]\n";
+        out += fmt::format("#define XE_HIGHLIGHT_COLOR ({})\n", showExpression ? showExpression : "float4(1.0f, 0.0f, 1.0f, 1.0f)");
         out += HLSL_PRELUDE;
 
         if (pixel)
@@ -1147,7 +1160,7 @@ XeOutput main(uint vertexId : SV_VertexID)
     if (!alphaPass)
         discard;
     if (xe_flags & XE_FLAG_DEBUG_HIGHLIGHT)
-        xe_color[0] = float4(1.0f, 0.0f, 1.0f, 1.0f);
+        xe_color[0] = XE_HIGHLIGHT_COLOR;
     [unroll] for (int t = 0; t < 4; t++)
     {
         float4 color = xe_color[t] * xe_color_exp_bias[t];

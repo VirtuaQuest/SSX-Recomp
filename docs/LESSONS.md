@@ -80,6 +80,10 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   Generated float literals must look like `1.000000f` (`0f` is invalid).
 - `getWeights2D` (bilinear weights) is needed for shadow PCF; point sprites need a geometry shader.
 - Point sampled fetches of scaled textures must snap to texel centres (`floor(coord * size) + 0.5`).
+- Texture fetch constants carry an exponent bias (word 3 bits 13-18, signed): the fetch returns its value times 2^bias.
+  The 360's FXAA reads the frame through two more fetch constants at 2^-1 and 2^-2 to average its taps; without the
+  bias, every pixel it smoothed came out about twice as bright: white outlines on every contrast edge (in SSX the terrain
+  looked drawn in white lines). Sign mode 2 (unsigned biased) is x * 2 - 1.
 
 ## Performance
 
@@ -343,4 +347,6 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   `AR_REMOTE` script at 30 and 60 fps and a screenshot per real second: the tutorial's scripted events (leaving the
   helicopter to the first spin prompt) are 10.1 s apart in both, and the 60 run presents 59 frames a second. (A first
   60 run started 8 s late and played the intro slowly: something else had the PC busy; check before comparing.)
-- Open: the terrain's bright white ridgelines (game style or a rendering error, not settled).
+- The terrain's white ridgelines and speckle, and a white halo round the rider, were FXAA without the texture exponent
+  bias (see GPU: shaders). Found by putting intermediate values of the terrain shader on screen (`AR_SHOW_EXPR`): they
+  were right, and a resolve dump per post-process pass showed the outlines appear in FXAA's pass (ps 7069403B).

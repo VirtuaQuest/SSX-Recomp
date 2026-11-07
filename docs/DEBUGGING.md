@@ -46,6 +46,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_SCREENSHOT_INTERVAL=<frames>` | Screenshot period with `--screenshots` (default 300) |
 | `AR_TRACE_PS=<hash prefix>`, `AR_TRACE_INPUTS`, `AR_TRACE_FETCH` | Constants of draws with a pixel shader, hashes of each draw's inputs, fetch details |
 | `AR_HIGHLIGHT_PS=<prefix>`, `AR_HIGHLIGHT_PRIM=<type>` | Draw those in magenta |
+| `AR_SHOW_EXPR=<HLSL float4>` | What highlighted draws output instead of magenta, e.g. `float4(XE_R(7).yzw, 1.0f)` (register 7 as the shader leaves it; `input.position` can split the screen to show several) |
 | `AR_SKIP_PS=<prefixes>`, `AR_SKIP_VS=<prefixes>` | Skip draws by shader |
 | `AR_SHADOW_LOG` | One line per shadow map draw (S, IB), its resolves (SR), clear rectangles (SC), EDRAM syncs into it, mid-frame upload flushes (FW) and the light matrices (L), for the `AR_DUMP_FRAME` frames |
 | `AR_SHADOW_PIXELS=1\|2\|3` | With `AR_SHADOW_LOG`: occlusion query per shadow map draw, logged as PX lines (frame, cascade, shader, vertex buffer, index offset, count, ..., samples). 2 adds hashes of everything the draw reads (vertex data, indices, constants) checked again once the GPU is done (slow); 3 also draws each again without depth testing and logs the rasterized `area` |
@@ -112,6 +113,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_HW_THREADS`, `AR_LOG_HW_THREADS` | Guest hardware threads pinned to host logical processors; where threads go |
 | `AR_NO_KEYSTROKE_DEVICES` | Keystroke reads ignore their device flags (pad keys go to keyboard-only reads too) |
 | `AR_CRASH_DUMP=<registers>` | 1 KB of guest memory where these registers (numbers, comma separated) point, after a crash |
+| `AR_NO_TEXTURE_EXP_BIAS`, `AR_NO_BIASED_FETCH` | Fetch constants' exponent bias; unsigned biased components (then read as unsigned) |
 | `AR_NO_MIPS`, `AR_NO_BC_DECOMPRESS` | Textures at their base level only; odd sized block compressed textures left as they are |
 | `AR_CRASH_DUMP_THREADS` | Every guest thread's stack after a crash |
 | `AR_D3D12_DEBUG` | Where the debug layer has no callback, its stored messages and the device removal reason are logged when a creation fails |

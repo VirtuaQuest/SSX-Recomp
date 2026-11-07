@@ -3881,12 +3881,17 @@ float4 main(float4 position : SV_Position) : SV_Target
                     // ignore them (games set them anyway, for example signed 16_16_16_16_FLOAT light buffers).
                     uint32_t format = fetch.Format();
                     bool fixedPoint = !(format == 22 || format == 23 || (format >= 30 && format <= 32) || (format >= 36 && format <= 38));
+                    // Per component: 0 unsigned, 1 signed, 2 unsigned biased (x * 2 - 1), 3 gamma. AR_NO_BIASED_FETCH reads
+                    // biased components as unsigned, as before.
+                    static const bool noBiased = AR_ENV("AR_NO_BIASED_FETCH") != nullptr;
                     uint32_t signs = 0;
                     for (uint32_t c = 0; c < 4 && fixedPoint; c++)
                     {
                         uint32_t sign = (fetch.words[0] >> (2 + c * 2)) & 3;
                         if (sign == 1)
                             signs |= 1u << c;
+                        else if (sign == 2 && !noBiased)
+                            signs |= 1u << (c + 12);
                         else if (sign == 3)
                             signs |= 1u << (c + 4);
                     }
@@ -3958,7 +3963,12 @@ float4 main(float4 position : SV_Position) : SV_Target
                     if (pointSampled && !AR_ENV("AR_NO_POINT_SNAP"))
                         rawDepth |= 8;
                     slot[2] = fetch.Swizzle();
-                    slot[3] = signs | (rawDepth << 8);
+                    // The exponent bias (signed, bits 13-18 of word 3) scales what the fetch returns by a power of two. FXAA on
+                    // the 360 relies on it, reading the frame at 2^-1 and 2^-2 to average its taps; ignored, every edge it
+                    // smoothed came out about twice as bright (SSX's white outlines). AR_NO_TEXTURE_EXP_BIAS ignores it.
+                    static const bool noExpBias = AR_ENV("AR_NO_TEXTURE_EXP_BIAS") != nullptr;
+                    uint32_t expAdjust = noExpBias ? 0 : (fetch.words[3] >> 13) & 0x3F;
+                    slot[3] = signs | (rawDepth << 8) | (expAdjust << 16);
                 }
             };
         {
