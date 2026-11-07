@@ -2364,6 +2364,41 @@ bool Recompiler::Recompile(
             }
             break;
 
+        case 2: // NORMPACKED32: x, y, z signed 10 bits and w unsigned 2 bits, saturated, x in the low bits
+        {
+            if (insn.operands[3] != 1)
+                fmt::println("Unexpected normpacked32 pack instruction at {:X}", base);
+
+            // Inputs are 3.0 + n * 2^-22, so n is in the low bits of the float. Guest x, y, z, w are host 3, 2, 1, 0.
+            static constexpr uint32_t mins[] = { 0x40400000, 0x403FFE01, 0x403FFE01, 0x403FFE01 };
+            static constexpr uint32_t maxs[] = { 0x40400003, 0x404001FF, 0x404001FF, 0x404001FF };
+            static constexpr uint32_t masks[] = { 0x3, 0x3FF, 0x3FF, 0x3FF };
+            static constexpr uint32_t shifts[] = { 30, 20, 10, 0 };
+            println("\t{}.u32 = 0;", temp());
+            for (size_t i = 0; i < 4; i++)
+            {
+                println("\t{}.f32[{}] = {}.f32[{}];", vTemp(), i, v(insn.operands[1]), i);
+                println("\tif (!({0}.f32[{1}] >= std::bit_cast<float>(0x{2:X}u))) {0}.u32[{1}] = 0x{2:X}u; else if ({0}.f32[{1}] > std::bit_cast<float>(0x{3:X}u)) {0}.u32[{1}] = 0x{3:X}u;",
+                    vTemp(), i, mins[i], maxs[i]);
+                println("\t{}.u32 |= ({}.u32[{}] & 0x{:X}u) << {};", temp(), vTemp(), i, masks[i], shifts[i]);
+            }
+            println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+            break;
+        }
+
+        case 4: // NORMSHORT4: four saturated shorts in two words, x in the high half of the first
+            if (insn.operands[3] != 2 || insn.operands[4] > 2)
+                fmt::println("Unexpected normshort4 pack instruction at {:X}", base);
+
+            for (size_t i = 0; i < 4; i++)
+            {
+                println("\t{}.f32[{}] = {}.f32[{}];", vTemp(), i, v(insn.operands[1]), i);
+                println("\tif (!({0}.f32[{1}] >= std::bit_cast<float>(0x403F8001u))) {0}.u32[{1}] = 0x403F8001u; else if ({0}.f32[{1}] > std::bit_cast<float>(0x40407FFFu)) {0}.u32[{1}] = 0x40407FFFu;", vTemp(), i);
+            }
+            for (size_t i = 0; i < 4; i++)
+                println("\t{}.u16[{}] = uint16_t({}.u32[{}]);", v(insn.operands[0]), i + 2 * insn.operands[4], vTemp(), i);
+            break;
+
         default:
             println("\t__builtin_debugtrap();");
             break;
@@ -2593,6 +2628,28 @@ bool Recompiler::Recompile(
         case 5: // float16_4: four halves in the last two words
             for (size_t i = 0; i < 4; i++)
                 println("\t{}.f32[{}] = ppc_half_to_float({}.u16[{}]);", vTemp(), i, v(insn.operands[1]), i);
+            println("\t{} = {};", v(insn.operands[0]), vTemp());
+            break;
+
+        case 2: // NORMPACKED32 in the last word: x, y, z signed 10 bits (x lowest), w unsigned 2 bits; -512 is NaN
+        {
+            static constexpr uint32_t shifts[] = { 30, 20, 10, 0 };
+            println("\t{}.u32 = {}.u32[0];", temp(), v(insn.operands[1]));
+            println("\t{}.u32[0] = 0x40400000u + (({}.u32 >> 30) & 3);", vTemp(), temp());
+            for (size_t i = 1; i < 4; i++)
+                println("\t{0}.u32[{1}] = (({2}.u32 >> {3}) & 0x3FF) == 0x200 ? 0x7FC00000u : 0x40400000u + uint32_t(int32_t({2}.u32 << {4}) >> 22);",
+                    vTemp(), i, temp(), shifts[i], 22 - shifts[i]);
+            println("\t{} = {};", v(insn.operands[0]), vTemp());
+            break;
+        }
+
+        case 4: // NORMSHORT4: four shorts in the last two words, as 3.0 + n * 2^-22
+            for (size_t i = 0; i < 4; i++)
+            {
+                println("\t{}.f32 = 3.0f;", temp());
+                println("\t{}.s32 += {}.s16[{}];", temp(), v(insn.operands[1]), i);
+                println("\t{}.f32[{}] = {}.f32;", vTemp(), i, temp());
+            }
             println("\t{} = {};", v(insn.operands[0]), vTemp());
             break;
 

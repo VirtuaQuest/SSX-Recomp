@@ -5,6 +5,7 @@
 #error "ppc_config.h must be included before ppc_context.h"
 #endif
 
+#include <bit>
 #include <climits>
 #include <cmath>
 #include <csetjmp>
