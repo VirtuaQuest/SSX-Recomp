@@ -387,6 +387,9 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
 - Audio: SSX drives XMA contexts itself. `kernel/imports/xma.cpp` finds frames (15 bit lengths, across packets and
   buffers) and decodes each in a packet of its own with FFmpeg's XMA2 decoder; FFmpeg's skipped first frame becomes
   silence so sample counts stay exact.
+- Gamer picture: the front end's player badge reads it with `XUserReadGamerPicture` (`XamReadTileToTexture`, tile
+  type 2 or 3, a linear A8R8G8B8 texture of height x height, completed through the overlapped). A local profile
+  has none, so the runtime draws an original one (a peak under a low sun); unimplemented, the badge was an empty frame.
 - XMA input buffers become valid only when the title says so. SSX initializes a context, marks the output valid,
   sets the buffers and enables it, and only then fills the buffers and calls `XMASetInputBuffer0Valid`. Marked
   valid at init, they were decoded in between with the last sound's packets still in them, often a stereo sound on a

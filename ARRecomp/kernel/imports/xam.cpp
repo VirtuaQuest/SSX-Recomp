@@ -459,6 +459,62 @@ namespace imports
         return FinishRequest(overlapped, X_ERROR_SUCCESS);
     }
 
+    // A gamer picture (XUserReadGamerPicture: tile type 2 large, 3 small) into a linear A8R8G8B8 texture of
+    // height x height, rows pitch bytes apart. There is no picture on a local profile, so one is drawn: a snowy peak
+    // under a low sun on a dusk gradient, in the launcher's colours (original art, made here). Without it the
+    // front end's player badge showed an empty frame. Other tiles (achievement pictures and the like) get nothing.
+    uint32_t XamReadTileToTexture(uint32_t tileType, uint32_t titleId, uint32_t tileIdHigh, uint32_t userIndex, uint8_t* buffer,
+        uint32_t pitch, uint32_t height, uint32_t overlapped)
+    {
+        if (buffer == nullptr || height == 0 || pitch < height * 4)
+            return FinishRequest(overlapped, X_ERROR_INVALID_PARAMETER);
+        if (tileType != 2 && tileType != 3)
+            return FinishRequest(overlapped, X_ERROR_FILE_NOT_FOUND);
+
+        auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
+        for (uint32_t y = 0; y < height; y++)
+        {
+            for (uint32_t x = 0; x < height; x++)
+            {
+                // 4x4 samples a pixel for smooth edges.
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                for (int sy = 0; sy < 4; sy++)
+                {
+                    for (int sx = 0; sx < 4; sx++)
+                    {
+                        float u = (x + (sx + 0.5f) / 4.0f) / height, v = (y + (sy + 0.5f) / 4.0f) / height;
+                        // Sky: violet at the top to warm orange at the horizon.
+                        float sr = mix(0.27f, 1.00f, v), sg = mix(0.18f, 0.55f, v * v), sb = mix(0.55f, 0.35f, v);
+                        // Sun.
+                        float du = u - 0.70f, dv = v - 0.42f;
+                        if (du * du + dv * dv < 0.012f)
+                            sr = 1.0f, sg = 0.85f, sb = 0.45f;
+                        // Two peaks; the front one with a snow cap and a shaded east face.
+                        float back = 0.50f + std::abs(u - 0.25f) * 1.1f;
+                        float front = 0.30f + std::abs(u - 0.58f) * 1.4f;
+                        if (v > back)
+                            sr = 0.22f, sg = 0.30f, sb = 0.52f;
+                        if (v > front)
+                        {
+                            bool east = u > 0.58f;
+                            if (v < 0.48f + std::sin(u * 40.0f) * 0.02f)
+                                sr = east ? 0.78f : 0.97f, sg = east ? 0.86f : 0.98f, sb = 1.0f;
+                            else
+                                sr = east ? 0.10f : 0.16f, sg = east ? 0.42f : 0.55f, sb = east ? 0.55f : 0.66f;
+                        }
+                        r += sr, g += sg, b += sb;
+                    }
+                }
+                uint8_t* pixel = buffer + y * pitch + x * 4;
+                pixel[0] = 0xFF;
+                pixel[1] = uint8_t(std::clamp(r / 16.0f, 0.0f, 1.0f) * 255.0f + 0.5f);
+                pixel[2] = uint8_t(std::clamp(g / 16.0f, 0.0f, 1.0f) * 255.0f + 0.5f);
+                pixel[3] = uint8_t(std::clamp(b / 16.0f, 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+        }
+        return FinishRequest(overlapped, X_ERROR_SUCCESS);
+    }
+
     uint32_t XamUserGetDeviceContext(uint32_t userIndex, uint32_t unknown, be<uint32_t>* context)
     {
         if (userIndex != 0)
@@ -922,6 +978,7 @@ AR_IMPORT(XamUserGetSigninState);
 AR_IMPORT(XamUserGetSigninInfo);
 AR_IMPORT(XamUserGetXUID);
 AR_IMPORT(XamUserGetName);
+AR_IMPORT(XamReadTileToTexture);
 AR_IMPORT(XamUserCheckPrivilege);
 AR_IMPORT(XamUserAreUsersFriends);
 AR_IMPORT(XamUserGetDeviceContext);

@@ -27,7 +27,6 @@ AR_IMPORT_STUB(XamContentFlush);
 AR_IMPORT_STUB(XamContentGetDeviceState);
 AR_IMPORT_STUB(XamGetOverlappedResult);
 AR_IMPORT_STUB(XamParseGamerTileKey);
-AR_IMPORT_STUB(XamReadTileToTexture);
 AR_IMPORT_STUB(XamShowFriendRequestUI);
 AR_IMPORT_STUB(XamShowKeyboardUI);
 AR_IMPORT_STUB(XamShowMarketplaceDownloadItemsUI);
