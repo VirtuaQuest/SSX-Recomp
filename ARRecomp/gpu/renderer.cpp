@@ -142,6 +142,11 @@ namespace gpu
         }
         LOGF_INFO("{} shaders prepared in {:.1f} s", g_shaders.size(),
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        d3d12::SetShaderLookup([](uint64_t hash) -> const std::vector<uint8_t>*
+            {
+                auto it = g_shaders.find(hash);
+                return it != g_shaders.end() && it->second->translated && !it->second->code.empty() ? &it->second->code : nullptr;
+            });
     }
 
     static uint64_t HashWords(const uint32_t* words, size_t count)

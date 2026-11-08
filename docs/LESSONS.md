@@ -160,7 +160,10 @@ texture lookups. What mattered, roughly in order:
 5. Thread priorities: the GPU command processor runs at time critical priority and sleeps when idle.
 6. Compiler flags: RelWithDebInfo defaults to /Ob1 (only explicitly inline functions are inlined); /Ob2 made heavy
    scenes 10-20% faster. Name pipeline library entries by state key and shader bytecode, or entries from older
-   builds collide with new ones and those pipelines get recompiled every run.
+   builds collide with new ones and those pipelines get recompiled every run. Loading from the library still costs
+   about 4 ms a pipeline on a GTX 970, and SSX meets 20 new ones in each of the first frames of an event (120-200 ms
+   hitches as riding starts, 85-90 ms of it pipelines). The keys of the pipelines used are saved next to the library
+   (`pipelines.bin.keys`) and loaded on all cores before the first draw (190 in 0.15 s; `AR_NO_PIPELINE_PREWARM`).
 
 7. Where the time really goes at high frame rates: the title's render thread spent ~40% spinning in D3D's block on
    fence (frame pacing waits for the GPU to finish the previous frame), so its own work was ~6 ms a frame; the GPU

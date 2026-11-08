@@ -1,5 +1,6 @@
 #include <stdafx.h>
 #include <array>
+#include <unordered_set>
 #include "d3d12_renderer.h"
 #include "shader_compiler.h"
 #include "texture_decode.h"
@@ -211,6 +212,7 @@ namespace gpu::d3d12
     };
 
     static uint64_t HashMemory(const uint8_t* data, size_t size);
+    static void PrewarmPipelines();
 
     static uint64_t SampleHash(const uint8_t* data, size_t size)
     {
@@ -308,6 +310,11 @@ namespace gpu::d3d12
         uint32_t pipelinesCreated = 0;
         uint32_t pipelinesLoaded = 0;
         bool pipelineLibraryDirty = false;
+        // Keys of the pipelines the game has used, saved next to the library (<library>.keys) so the next run can load
+        // them all at startup instead of at their first draws (see PrewarmPipelines).
+        std::vector<PipelineKey> pipelineKeys;
+        std::unordered_set<uint64_t> pipelineKeyHashes;
+        bool pipelineKeysDirty = false;
         ComPtr<ID3D12CommandQueue> queue;
         // Recorded here, replayed and submitted on the submission thread.
         DeferredList list;
@@ -2114,6 +2121,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 }
             }
         }
+        PrewarmPipelines();
         g.list.Start(!AR_ENV("AR_SINGLE_THREAD"));
         if (!AR_ENV("AR_SINGLE_THREAD"))
             LOGF_INFO("command submission runs on its own thread");
@@ -3486,25 +3494,34 @@ float4 main(float4 position : SV_Position) : SV_Target
         return { code.data(), code.size() };
     }
 
-    static ID3D12PipelineState* GetPipeline(const PipelineKey& key, const HostShader& vertexShader, const HostShader* pixelShader,
-        bool streamOutput = false)
+    static uint64_t PipelineKeyHash(const PipelineKey& key)
     {
         uint64_t hash = 0xCBF29CE484222325ull;
         size_t hashed = key.depthBias == 0 && key.slopeBias == 0.0f ? offsetof(PipelineKey, depthBias) : sizeof(key);
         for (size_t i = 0; i < hashed; i++)
             hash = (hash ^ reinterpret_cast<const uint8_t*>(&key)[i]) * 0x100000001B3ull;
-        if (streamOutput)
-            hash ^= 0x50534F5354524D31ull;
+        return hash;
+    }
 
-        auto& pipeline = g.pipelines[hash];
-        if (pipeline)
-            return pipeline.Get();
+    // Library names include the shaders' bytecode: the same key gives a different pipeline when the translator
+    // changes, and a stale entry under the name can't be replaced (it was recompiled on every run).
+    static std::array<wchar_t, 17> PipelineLibraryName(uint64_t hash, const std::vector<uint8_t>& vertexCode, const std::vector<uint8_t>* pixelCode)
+    {
+        uint64_t libraryHash = hash ^ HashMemory(vertexCode.data(), vertexCode.size()) * 3 ^
+            (pixelCode ? HashMemory(pixelCode->data(), pixelCode->size()) * 5 : 0);
+        std::array<wchar_t, 17> name;
+        swprintf(name.data(), name.size(), L"%016llX", (unsigned long long)libraryHash);
+        return name;
+    }
 
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    static void BuildPipelineDesc(const PipelineKey& key, const std::vector<uint8_t>& vertexCode, const std::vector<uint8_t>* pixelCode,
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc)
+    {
+        desc = {};
         desc.pRootSignature = g.rootSignature.Get();
-        desc.VS = Bytecode(*vertexShader.code);
-        if (pixelShader)
-            desc.PS = Bytecode(*pixelShader->code);
+        desc.VS = Bytecode(vertexCode);
+        if (pixelCode)
+            desc.PS = Bytecode(*pixelCode);
         if (key.geometryShader)
             desc.GS = Bytecode(key.geometryShader == 2 ? g.pointGeometryShader : g.rectangleGeometryShader);
 
@@ -3559,6 +3576,21 @@ float4 main(float4 position : SV_Position) : SV_Target
             desc.RTVFormats[i] = key.renderTargetFormats[i];
         desc.DSVFormat = key.depthFormat;
         desc.SampleDesc.Count = 1;
+    }
+
+    static ID3D12PipelineState* GetPipeline(const PipelineKey& key, const HostShader& vertexShader, const HostShader* pixelShader,
+        bool streamOutput = false)
+    {
+        uint64_t hash = PipelineKeyHash(key);
+        if (streamOutput)
+            hash ^= 0x50534F5354524D31ull;
+
+        auto& pipeline = g.pipelines[hash];
+        if (pipeline)
+            return pipeline.Get();
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+        BuildPipelineDesc(key, *vertexShader.code, pixelShader ? pixelShader->code : nullptr, desc);
 
         // Diagnostics: the position output also streamed out (AR_SHADOW_SO); not kept in the library.
         static const D3D12_SO_DECLARATION_ENTRY soEntry{ 0, "SV_Position", 0, 0, 4, 0 };
@@ -3574,13 +3606,13 @@ float4 main(float4 position : SV_Position) : SV_Target
             return pipeline.Get();
         }
 
-        // Library names include the shaders' bytecode: the same key gives a different pipeline when the translator
-        // changes, and a stale entry under the name can't be replaced (it was recompiled on every run).
-        uint64_t libraryHash = hash ^ HashMemory(vertexShader.code->data(), vertexShader.code->size()) * 3 ^
-            (pixelShader ? HashMemory(pixelShader->code->data(), pixelShader->code->size()) * 5 : 0);
-        wchar_t name[17];
-        swprintf(name, 17, L"%016llX", (unsigned long long)libraryHash);
-        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->LoadGraphicsPipeline(name, &desc, IID_PPV_ARGS(&pipeline))))
+        if (g.pipelineKeyHashes.insert(hash).second)
+        {
+            g.pipelineKeys.push_back(key);
+            g.pipelineKeysDirty = true;
+        }
+        auto name = PipelineLibraryName(hash, *vertexShader.code, pixelShader ? pixelShader->code : nullptr);
+        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->LoadGraphicsPipeline(name.data(), &desc, IID_PPV_ARGS(&pipeline))))
         {
             g.pipelinesLoaded++;
             return pipeline.Get();
@@ -3594,9 +3626,103 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
 
         g.pipelinesCreated++;
-        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->StorePipeline(name, pipeline.Get())))
+        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->StorePipeline(name.data(), pipeline.Get())))
             g.pipelineLibraryDirty = true;
         return pipeline.Get();
+    }
+
+    static const std::vector<uint8_t>* (*g_findShaderCode)(uint64_t hash);
+
+    void SetShaderLookup(const std::vector<uint8_t>* (*findShaderCode)(uint64_t hash))
+    {
+        g_findShaderCode = findShaderCode;
+    }
+
+    // Loads every pipeline of the saved key list from the library (or creates it) before the game draws, in parallel:
+    // loading one at its first draw cost about 4 ms on a GTX 970, 20 at a time when an event starts, which made the
+    // frames riding begins on take 120-200 ms. Pipelines whose shaders weren't prepared this run are left for their
+    // draws. AR_NO_PIPELINE_PREWARM turns it off.
+    static void PrewarmPipelines()
+    {
+        std::filesystem::path keysPath = g.pipelineCachePath;
+        keysPath += ".keys";
+        if (g.pipelineCachePath.empty() || !g_findShaderCode || AR_ENV("AR_NO_PIPELINE_PREWARM"))
+            return;
+        std::ifstream file(keysPath, std::ios::binary | std::ios::ate);
+        if (!file)
+            return;
+        std::vector<PipelineKey> keys(size_t(file.tellg()) / sizeof(PipelineKey));
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(keys.data()), keys.size() * sizeof(PipelineKey));
+
+        struct Work
+        {
+            PipelineKey key;
+            uint64_t hash;
+            const std::vector<uint8_t>* vertexCode;
+            const std::vector<uint8_t>* pixelCode;
+            ComPtr<ID3D12PipelineState> pipeline;
+            bool loaded = false;
+        };
+        std::vector<Work> work;
+        for (const auto& key : keys)
+        {
+            uint64_t hash = PipelineKeyHash(key);
+            if (!g.pipelineKeyHashes.insert(hash).second)
+                continue;
+            g.pipelineKeys.push_back(key);
+            const std::vector<uint8_t>* vertexCode = g_findShaderCode(key.vertexShader);
+            const std::vector<uint8_t>* pixelCode = key.pixelShader ? g_findShaderCode(key.pixelShader) : nullptr;
+            if (vertexCode && (pixelCode || !key.pixelShader))
+                work.push_back({ key, hash, vertexCode, pixelCode });
+        }
+
+        // Loading different pipelines from a library on several threads at once is allowed; storing isn't, so
+        // pipelines missing from the library are created here and stored afterwards.
+        auto start = std::chrono::steady_clock::now();
+        std::atomic<size_t> next = 0;
+        std::vector<std::thread> threads;
+        for (uint32_t i = 0; i < std::max(1u, std::thread::hardware_concurrency()); i++)
+        {
+            threads.emplace_back([&]
+                {
+                    for (size_t index; (index = next++) < work.size();)
+                    {
+                        Work& item = work[index];
+                        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+                        BuildPipelineDesc(item.key, *item.vertexCode, item.pixelCode, desc);
+                        auto name = PipelineLibraryName(item.hash, *item.vertexCode, item.pixelCode);
+                        if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->LoadGraphicsPipeline(name.data(), &desc, IID_PPV_ARGS(&item.pipeline))))
+                            item.loaded = true;
+                        else
+                            g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&item.pipeline));
+                    }
+                });
+        }
+        for (auto& thread : threads)
+            thread.join();
+
+        uint32_t loaded = 0, created = 0;
+        for (auto& item : work)
+        {
+            if (!item.pipeline)
+                continue;
+            if (item.loaded)
+            {
+                loaded++;
+            }
+            else
+            {
+                created++;
+                auto name = PipelineLibraryName(item.hash, *item.vertexCode, item.pixelCode);
+                if (g.pipelineLibrary && SUCCEEDED(g.pipelineLibrary->StorePipeline(name.data(), item.pipeline.Get())))
+                    g.pipelineLibraryDirty = true;
+            }
+            g.pipelines[item.hash] = std::move(item.pipeline);
+        }
+        LOGF_INFO("{} pipelines ready before the first draw ({} loaded, {} created, {} of {} keys skipped) in {:.2f} s",
+            loaded + created, loaded, created, keys.size() - loaded - created, keys.size(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     }
 
     static ID3D12PipelineState* GetBlitPipeline(DXGI_FORMAT format, bool present, bool depth)
@@ -5872,6 +5998,20 @@ float4 main(float4 position : SV_Position) : SV_Target
     // Writes the pipeline library when pipelines were added (every few seconds of play).
     static void SavePipelineCache()
     {
+        if (g.pipelineKeysDirty && !g.pipelineCachePath.empty())
+        {
+            g.pipelineKeysDirty = false;
+            std::filesystem::path keysPath = g.pipelineCachePath;
+            keysPath += ".keys";
+            auto temp = keysPath;
+            temp += ".tmp";
+            {
+                std::ofstream file(temp, std::ios::binary);
+                file.write(reinterpret_cast<const char*>(g.pipelineKeys.data()), g.pipelineKeys.size() * sizeof(PipelineKey));
+            }
+            std::error_code ec;
+            std::filesystem::rename(temp, keysPath, ec);
+        }
         if (!g.pipelineLibrary || !g.pipelineLibraryDirty)
             return;
 
@@ -6015,19 +6155,28 @@ float4 main(float4 position : SV_Position) : SV_Target
             auto now = std::chrono::steady_clock::now();
             double frameTime = std::chrono::duration<double, std::milli>(now - lastPresent).count();
             lastPresent = now;
-            static uint32_t lastCreated, lastDraws;
-            static double lastDrawTime, lastWait, lastPrepare, lastTextures;
+            static uint32_t lastCreated, lastDraws, lastLoaded;
+            static double lastDrawTime, lastWait, lastPrepare, lastTextures, lastVertices, lastIndices, lastConstants, lastPipeline, lastTargets, lastRecord;
             if (frameTime > 100.0 && g.frameNumber > 120)
-                LOGF_INFO("hitch: tick {} frame {} took {:.0f} ms ({} pipelines created, {} draws in {:.1f} ms, textures {:.1f} ms, prepare {:.1f} ms, "
-                    "GPU wait {:.1f} ms)", uint32_t(GetTickCount() & 0x7FFFFFFF), g.frameNumber, frameTime, g.pipelinesCreated - lastCreated, g_profile.draws - lastDraws,
+                LOGF_INFO("hitch: tick {} frame {} took {:.0f} ms ({} pipelines created, {} loaded, {} draws in {:.1f} ms, textures {:.1f} ms, prepare {:.1f} ms, "
+                    "GPU wait {:.1f} ms; with AR_PROFILE vertices {:.1f}, indices {:.1f}, constants {:.1f}, pipeline {:.1f}, targets {:.1f}, record {:.1f})",
+                    uint32_t(GetTickCount() & 0x7FFFFFFF), g.frameNumber, frameTime, g.pipelinesCreated - lastCreated, g.pipelinesLoaded - lastLoaded, g_profile.draws - lastDraws,
                     g_profile.draw - lastDrawTime, g_profile.textures - lastTextures, g_profile.prepare - lastPrepare,
-                    g_profile.presentWait - lastWait);
+                    g_profile.presentWait - lastWait, g_profile.vertices - lastVertices, g_profile.indices - lastIndices,
+                    g_profile.constants - lastConstants, g_profile.pipeline - lastPipeline, g_profile.targets - lastTargets, g_profile.record - lastRecord);
             lastCreated = g.pipelinesCreated;
+            lastLoaded = g.pipelinesLoaded;
             lastDraws = g_profile.draws;
             lastDrawTime = g_profile.draw;
             lastWait = g_profile.presentWait;
             lastPrepare = g_profile.prepare;
             lastTextures = g_profile.textures;
+            lastVertices = g_profile.vertices;
+            lastIndices = g_profile.indices;
+            lastConstants = g_profile.constants;
+            lastPipeline = g_profile.pipeline;
+            lastTargets = g_profile.targets;
+            lastRecord = g_profile.record;
         }
         static auto lastReport = std::chrono::steady_clock::now();
         if (g.frameNumber % 300 == 150)

@@ -97,6 +97,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_LAYOUT_BOUND`, `AR_LOG_LAYOUT=<frame>` | Layout conversions of whole render targets instead of their written rows; that frame's conversions (size, format, why) |
 | `AR_NO_EARLY_DEPTH` | Pixel shaders output depth rounded to the guest's 24 bit float again (`xe_depth_24`), which costs early depth rejection |
+| `AR_NO_PIPELINE_PREWARM` | Pipelines from the saved key list (`pipelines.bin.keys`) are loaded at their first draws instead of at startup |
 | `AR_NO_FAST_MUL` | Every shader multiplication keeps shader model 3 rules (zero times anything is zero), not only those of values that may be infinite or NaN; slower, as the selects stop multiply-adds from fusing |
 | `AR_NO_GEOMETRIC_SAMPLES` | 1x and 4x MSAA views of the same EDRAM reorder their samples as the console stores them (a layout conversion each switch) instead of keeping host texels at their geometric positions |
 | `AR_NO_LAYOUT_SWAP` | Layout conversions copy the target and draw back into it, instead of drawing into a scratch that takes its place (or, for depth with stencil in use and no SV_StencilRef, through an R32F target) |

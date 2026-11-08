@@ -23,6 +23,8 @@ namespace gpu::d3d12
     };
 
     void Draw(const be<uint32_t>* registers, const DrawCall& draw, const HostShader& vertexShader, const HostShader* pixelShader);
+    // How the renderer finds a prepared shader's DXIL by its hash (for loading saved pipelines at startup).
+    void SetShaderLookup(const std::vector<uint8_t>* (*findShaderCode)(uint64_t hash));
     void Present(const be<uint32_t>* registers, const SwapInfo& swap);
 
     // Diagnostics: whether the current frame is traced (AR_TRACE_FRAME / AR_TRACE_FRAMES).
