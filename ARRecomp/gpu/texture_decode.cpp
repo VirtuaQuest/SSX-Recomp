@@ -56,6 +56,14 @@ namespace gpu
         return IsPhysicalAddress(address) ? VirtualToPhysical(address) : address & (GUEST_PHYSICAL_SIZE - 1);
     }
 
+    uint32_t TextureFetch::MipAddress() const
+    {
+        uint32_t address = words[5] & 0xFFFFF000;
+        if (address == 0)
+            return 0;
+        return IsPhysicalAddress(address) ? VirtualToPhysical(address) : address & (GUEST_PHYSICAL_SIZE - 1);
+    }
+
     uint32_t TextureFetch::Width() const
     {
         return Dimension() == 0 ? (words[2] & 0xFFFFFF) + 1 : Dimension() == 2 ? (words[2] & 0x7FF) + 1 : (words[2] & 0x1FFF) + 1;

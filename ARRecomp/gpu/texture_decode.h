@@ -21,6 +21,8 @@ namespace gpu
         uint32_t Height() const;
         uint32_t Depth() const;
         uint32_t Swizzle() const { return (words[3] >> 1) & 0xFFF; }
+        uint32_t MipMaxLevel() const { return (words[4] >> 6) & 0xF; }
+        uint32_t MipAddress() const;   // Physical, 0 without one.
     };
 
     struct DecodedTexture

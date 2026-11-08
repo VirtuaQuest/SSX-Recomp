@@ -1315,6 +1315,9 @@ XeOutput main(uint vertexId : SV_VertexID)
     [unroll] for (int t = 0; t < 4; t++)
     {
         float4 color = xe_color[t] * xe_color_exp_bias[t];
+        // 7e3 render targets (bit 4 + t) hold 0 to 31.875 colour and 2 bit alpha.
+        if ((xe_gamma_targets >> (t + 4u)) & 1u)
+            color = clamp(color, 0.0f, float4(31.875f, 31.875f, 31.875f, 1.0f));
         if ((xe_gamma_targets >> t) & 1u)
             color.rgb = float3(xe_linear_to_gamma(color.r), xe_linear_to_gamma(color.g), xe_linear_to_gamma(color.b));
         output.color[t] = color;

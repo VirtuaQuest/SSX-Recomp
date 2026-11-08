@@ -71,6 +71,13 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   around the player.
 - Depth resolves hold raw depth words; textures of format 24_8 / 24_8_FLOAT fetched from them are decoded in the
   shader.
+- Games build mip chains of render results themselves: render each smaller level from the one above and resolve it
+  to its place after the fetch constant's mip address (word 5), then fetch the texture with an explicit LOD. A
+  resolved texture is one level here, so such a fetch got the sharp base level whatever LOD it asked for. Fetches with
+  mip levels over a resolve now get a texture whose levels are copied from the resolves at the mip address (in
+  address order, each at least its level's size). `AR_NO_RESOLVED_MIPS` samples the base level only.
+- 2_10_10_10_FLOAT (7e3) targets are RGBA16F on the host, which holds far more than the console's 0 to 31.875; pixel
+  shaders clamp what they write to such targets (blending can still exceed it). `AR_NO_7E3_CLAMP` turns that off.
 - Packed mips apply to linear textures too.
 
 ## GPU: shaders (microcode to HLSL)
@@ -441,3 +448,14 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   "Loading" forever: the front end waits for one. So a failure raises the success event and the real result is kept at
   +28; "Connect to EA Server" still finds the servers missing. Found from the notice's string IDs in the executable
   (`TXT_NOT_SIGN_IN_TO_FIRST_PARTY_NETWORK`), the code that builds their addresses, and a hook printing the stack.
+- Trails: everything that moved left a fading imprint, in menus and riding. SSX tone maps with a per-pixel exposure
+  that follows the scene over time: a 280x146 16 bit log-luminance texture (0CED0000) blended toward the current
+  frame's (0CEB8000, ps 28F5CFF7, about 2.5% a frame at 60 fps), then mipmapped by the title (140x73 down to 1x1,
+  resolved from 0CEE8000 on), and the tone mapping (ps 35948D63) samples it at a blurred level with setTexLOD.
+  Without the levels it read the sharp base level: exposure followed every edge, and as things moved their exposure
+  lingered where they had been for a second or two. Ruled out on the way, each with a test: depth precision of the
+  EQUAL pass that draws the scene over the G-buffer (made EQUAL pass more: no change), stale render targets (every
+  target cleared to magenta each frame: no magenta, trails unchanged), the 7e3 range (clamped: unchanged); skipping
+  ps 28F5CFF7 (the target then held the current luminance) removed the trails, and the fetch constant showed 8 mip
+  levels at a mip address the luminance chain resolves into. Comparisons need several runs: the AR_REMOTE ride takes
+  different lines from run to run, and one line that crashes into a rock shows the trails at their worst.

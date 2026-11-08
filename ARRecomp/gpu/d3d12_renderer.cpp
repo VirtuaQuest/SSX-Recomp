@@ -2495,6 +2495,97 @@ float4 main(float4 position : SV_Position) : SV_Target
         return texture.srv;
     }
 
+    // Resolved textures whose smaller levels the title resolves itself, each into its place after the fetch constant's
+    // mip address: SSX adapts exposure per pixel in a 280x146 texture, renders each smaller level from the one above and
+    // resolves it there, and its tone mapping samples a blurred level (setTexLOD). Without the levels it read the sharp
+    // base level, so exposure followed every edge, and whatever moved left imprints that faded over a second or two.
+    // The levels are the resolves of the same format at and after the mip address, in address order, each at least
+    // the level's size. Returns UINT32_MAX when there are none. AR_NO_RESOLVED_MIPS samples the base level only.
+    static uint32_t GetMippedResolvedTexture(const TextureFetch& fetch, ResolvedTexture& base, float* transform, uint32_t& rawDepth)
+    {
+        static const bool disabled = AR_ENV("AR_NO_RESOLVED_MIPS") != nullptr;
+        uint32_t mipAddress = fetch.MipAddress();
+        if (disabled || fetch.MipMaxLevel() == 0 || mipAddress == 0 || base.rawDepth || fetch.Dimension() != 1)
+            return UINT32_MAX;
+
+        uint32_t width = fetch.Width(), height = fetch.Height();
+        uint64_t span = uint64_t(base.rowBytes) * height * 2;
+        std::vector<std::pair<uint32_t, ResolvedTexture*>> candidates;
+        for (auto& [address, resolved] : g.resolvedTextures)
+        {
+            if (address >= mipAddress && address < mipAddress + span && resolved.texture.format == base.texture.format &&
+                !resolved.rawDepth && &resolved != &base)
+                candidates.emplace_back(address, &resolved);
+        }
+        std::sort(candidates.begin(), candidates.end());
+
+        std::vector<std::pair<uint32_t, ResolvedTexture*>> levels{ { fetch.BaseAddress(), &base } };
+        for (auto& [address, resolved] : candidates)
+        {
+            uint32_t level = uint32_t(levels.size());
+            if (level > fetch.MipMaxLevel())
+                break;
+            uint32_t levelWidth = std::max(1u, width >> level), levelHeight = std::max(1u, height >> level);
+            uint32_t guestWidth = resolved->texture.width / g_scale, guestHeight = resolved->texture.height / g_scale;
+            if (guestWidth < levelWidth || guestHeight < levelHeight || guestWidth > levelWidth * 2 + 32 || guestHeight > levelHeight * 2 + 32)
+                break;
+            levels.emplace_back(address, resolved);
+        }
+        if (levels.size() < 2)
+            return UINT32_MAX;
+
+        uint32_t keyWords[4] = { fetch.BaseAddress(), mipAddress, width | (height << 16), uint32_t(levels.size()) };
+        auto& composite = g.compositeTextures[HashMemory(reinterpret_cast<const uint8_t*>(keyWords), sizeof(keyWords)) ^ 0x4D495053ull];
+        uint32_t hostWidth = width * g_scale, hostHeight = height * g_scale;
+        if (composite.texture.resource && (composite.texture.format != base.texture.format || composite.texture.width != hostWidth ||
+            composite.texture.height != hostHeight || composite.texture.mipLevels != levels.size()))
+        {
+            ReleaseTexture(composite.texture);
+            composite.parts.clear();
+        }
+        if (!composite.texture.resource)
+        {
+            composite.texture = CreateTexture(hostWidth, hostHeight, 1, false, base.texture.format, D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST, uint32_t(levels.size()));
+            if (!composite.texture.resource)
+                return UINT32_MAX;
+            composite.parts.clear();
+        }
+
+        // Only levels resolved since are copied (SSX reads each level to render the next, so this runs once per level).
+        std::vector<std::pair<uint32_t, uint64_t>> versions;
+        for (auto& [address, resolved] : levels)
+            versions.emplace_back(address, resolved->version);
+        if (versions != composite.parts)
+        {
+            GpuScope scope{ 3 };
+            Transition(composite.texture, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (uint32_t level = 0; level < levels.size(); level++)
+            {
+                if (composite.parts.size() == versions.size() && composite.parts[level] == versions[level])
+                    continue;
+                Texture& source = levels[level].second->texture;
+                Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION from{ source.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_TEXTURE_COPY_LOCATION to{ composite.texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                to.SubresourceIndex = level;
+                D3D12_BOX box{ 0, 0, 0, std::min(source.width, std::max(1u, hostWidth >> level)),
+                    std::min(source.height, std::max(1u, hostHeight >> level)), 1 };
+                g.list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+            }
+            composite.parts = std::move(versions);
+            if (TraceThisFrame())
+                LOGF_INFO("mipped resolved texture 0x{:08X} {}x{} with {} levels from 0x{:08X}", fetch.BaseAddress(), width, height,
+                    levels.size(), mipAddress);
+        }
+
+        transform[0] = transform[1] = 1.0f;
+        transform[3] = 0.0f;
+        rawDepth |= 4;
+        Transition(composite.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        return composite.texture.srv;
+    }
+
     // The title's button icons and controller diagram have keyboard and mouse versions, shown while those are the input in
     // use (see tools/mkb_art/make_mkb_art.py). They're recognised by their contents, wherever the title loads them.
 #include "mkb_art.inl"
@@ -2649,6 +2740,11 @@ float4 main(float4 position : SV_Position) : SV_Target
         if (resolved && !noComposite && row + fetch.Height() > resolved->texture.height / g_scale)
         {
             if (uint32_t srv = GetCompositeTexture(fetch, *resolved, row, transform, rawDepth); srv != UINT32_MAX)
+                return srv;
+        }
+        if (resolved && row == 0)
+        {
+            if (uint32_t srv = GetMippedResolvedTexture(fetch, *resolved, transform, rawDepth); srv != UINT32_MAX)
                 return srv;
         }
         if (resolved)
@@ -3556,8 +3652,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         auto& depthStencil = desc.DepthStencilState;
         depthStencil.DepthEnable = (depth >> 1) & 1;
         depthStencil.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-        depthStencil.DepthFunc = AR_ENV("AR_NO_DEPTH_TEST") ? D3D12_COMPARISON_FUNC_ALWAYS : D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
-        depthStencil.StencilEnable = depth & 1;
+        depthStencil.DepthFunc = AR_ENV("AR_NO_DEPTH_TEST") ? D3D12_COMPARISON_FUNC_ALWAYS : D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);        depthStencil.StencilEnable = depth & 1;
         depthStencil.StencilReadMask = UINT8(key.stencilMasks & 0xFF);
         depthStencil.StencilWriteMask = UINT8((key.stencilMasks >> 8) & 0xFF);
         depthStencil.FrontFace = { D3D12_STENCIL_OP(((depth >> 11) & 7) + 1), D3D12_STENCIL_OP(((depth >> 17) & 7) + 1),
@@ -4034,6 +4129,12 @@ float4 main(float4 position : SV_Position) : SV_Target
             system.colorExpBias[i] = std::ldexp(1.0f, info.ExpBias());
             if (info.Format() == 1)
                 system.gammaTargets |= 1u << i;
+            // 2_10_10_10_FLOAT (7e3) targets are 16 bit float here, so the pixel shader clamps to what 7e3 holds (bit
+            // 4 + i): 0 to 31.875. SSX adapts exposure per pixel over time, and unclamped highlights in the thousands
+            // left dark and bright imprints of everything that moved, fading over a second. AR_NO_7E3_CLAMP turns it off.
+            static const bool no7e3Clamp = AR_ENV("AR_NO_7E3_CLAMP") != nullptr;
+            if ((info.Format() == 3 || info.Format() == 12) && !no7e3Clamp)
+                system.gammaTargets |= 16u << i;
         }
 
         uint32_t depthControl = registers[RB_DEPTHCONTROL];
@@ -5769,7 +5870,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                     static const int64_t dumpFrames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
                     bool dumpThisFrame = TraceThisFrame() ||
                         (dumpFrame >= 0 && int64_t(g.frameNumber) >= dumpFrame && int64_t(g.frameNumber) < dumpFrame + dumpFrames);
-                    if (dumpThisFrame && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || destFormat == DXGI_FORMAT_R32_FLOAT) &&
+                    if (dumpThisFrame && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                        destFormat == DXGI_FORMAT_R32_FLOAT || destFormat == DXGI_FORMAT_R16_UNORM) &&
                         (dumpOnly.empty() || std::find(dumpOnly.begin(), dumpOnly.end(), destBase) != dumpOnly.end()))
                     {
                         static int resolveIndex;
@@ -6119,6 +6221,12 @@ float4 main(float4 position : SV_Position) : SV_Target
                     uint8_t gray = uint8_t(std::clamp(std::abs(value) / scale, 0.0f, 1.0f) * 255.0f);
                     out[0] = out[1] = gray;
                     out[2] = value < 0.0f || std::isnan(value) ? 255 : gray;
+                }
+                else if (texture.format == DXGI_FORMAT_R16_UNORM)
+                {
+                    uint16_t value;
+                    memcpy(&value, row + x * 2, 2);
+                    out[0] = out[1] = out[2] = uint8_t(value >> 8);
                 }
                 else if (AR_ENV("AR_DUMP_ALPHA") && path.filename().string().rfind("resolve", 0) == 0)
                 {

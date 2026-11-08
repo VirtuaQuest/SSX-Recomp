@@ -41,7 +41,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_TRACE_FRAME=<n>`, `AR_TRACE_FRAMES=<count>` | Log every draw and resolve of these frames and dump their resolves |
 | `AR_DUMP_FRAME=<n>`, `AR_DUMP_FRAMES=<count>` | Dump resolves of these frames without logging draws |
 | `AR_DUMP_ONLY=<hex addresses, comma separated>` | Limit dumps to resolves to these addresses (use it: dumps are big) |
-| `AR_DUMP_ALPHA`, `AR_DUMP_SCALE=<value>` | Dump alpha as grey; scale for single float dumps (default 100 is white) |
+| `AR_DUMP_ALPHA`, `AR_DUMP_SCALE=<value>` | Dump alpha as grey; scale for single float dumps (default 100 is white); 16 bit single channel resolves dump as grey |
 | `AR_DUMP_SOURCES`, `AR_DUMP_TEXTURES`, `AR_DUMP_IMAGE=<path>` | Resolve sources, uploaded textures, the loaded image, the LZ decompressor's output |
 | `AR_SCREENSHOT_INTERVAL=<frames>` | Screenshot period with `--screenshots` (default 300) |
 | `AR_TRACE_PS=<hash prefix>`, `AR_TRACE_INPUTS`, `AR_TRACE_FETCH` | Constants of draws with a pixel shader, hashes of each draw's inputs, fetch details |
@@ -99,6 +99,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_EARLY_DEPTH` | Pixel shaders output depth rounded to the guest's 24 bit float again (`xe_depth_24`), which costs early depth rejection |
 | `AR_NO_PIPELINE_PREWARM` | Pipelines from the saved key list (`pipelines.bin.keys`) are loaded at their first draws instead of at startup |
 | `AR_NO_FAST_MUL` | Every shader multiplication keeps shader model 3 rules (zero times anything is zero), not only those of values that may be infinite or NaN; slower, as the selects stop multiply-adds from fusing |
+| `AR_NO_RESOLVED_MIPS` | Mip levels the title resolves itself after a texture's mip address (SSX's per-pixel exposure): such fetches read the base level only, which leaves trails |
+| `AR_NO_7E3_CLAMP` | Clamping pixel shader output to 2_10_10_10_FLOAT targets to the console's 0 to 31.875 |
 | `AR_NO_GEOMETRIC_SAMPLES` | 1x and 4x MSAA views of the same EDRAM reorder their samples as the console stores them (a layout conversion each switch) instead of keeping host texels at their geometric positions |
 | `AR_NO_LAYOUT_SWAP` | Layout conversions copy the target and draw back into it, instead of drawing into a scratch that takes its place (or, for depth with stencil in use and no SV_StencilRef, through an R32F target) |
 | `AR_GPU_TIMING` (with `AR_LOG_FPS`) | GPU time per frame by kind: layout conversions, syncs, resolves, draws |
