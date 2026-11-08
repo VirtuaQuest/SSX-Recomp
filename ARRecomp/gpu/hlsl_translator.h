@@ -64,11 +64,13 @@ namespace gpu
         void JumpTo(uint32_t cfIndex);
         static std::string BoolConstant(uint32_t index);
         bool OperandUnsafe(const xe::gpu::InstructionOperand& operand) const;
+        std::string TextureSize2D(uint32_t fetchConstant);
         void TrackStore(const xe::gpu::InstructionResult& result, bool unsafe);
         std::string Mul(const std::string& a, const std::string& b, bool unsafe) const;
         std::string Dot(const std::string& a, const std::string& b, bool unsafe) const;
 
         std::string m_body;
+        std::bitset<32> m_sizes2d; // 2D fetch constants whose sizes the prologue queries.
         std::bitset<512> m_unsafe; // Register components (register * 4 + component).
         bool m_unsafePs = false;
         bool m_analyzing = false;

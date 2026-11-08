@@ -136,10 +136,11 @@ float4 xe_swizzle(float4 value, uint swizzle)
     [unroll] for (uint i = 0u; i < 4u; i++)
     {
         // Selects, not value[source]: indexing a vector by a value known only at run time puts it in local memory
-        // (an alloca per fetch in the DXIL).
+        // (an alloca per fetch in the DXIL). Two levels of them, by the bits of the source.
         uint source = (swizzle >> (i * 3u)) & 7u;
-        result[i] = source == 0u ? value.x : source == 1u ? value.y : source == 2u ? value.z : source == 3u ? value.w :
-            (source == 5u ? 1.0f : 0.0f);
+        float2 pair = (source & 1u) ? value.yw : value.xz;
+        float component = (source & 2u) ? pair.y : pair.x;
+        result[i] = source < 4u ? component : (source == 5u ? 1.0f : 0.0f);
     }
     return result;
 }
@@ -177,45 +178,44 @@ float4 xe_texture_result(float4 value, uint4 info)
     // Depth buffer words (resolved from a depth buffer, as bytes from the low one up) fetched as depth: 24 bit unorm
     // or float (4 bit exponent, 20 bit mantissa) depth above 8 bit stencil.
     uint rawDepth = (info.w >> 8u) & 3u;
-    if (rawDepth != 0u)
+    [branch] if (rawDepth != 0u)
     {
         uint4 bytes = uint4(round(saturate(value) * 255.0f));
         uint depth24 = bytes.y | (bytes.z << 8u) | (bytes.w << 16u);
-        float depth;
-        if (rawDepth == 1u)
-        {
-            depth = float(depth24) / 16777215.0f;
-        }
-        else
-        {
-            uint exponent = depth24 >> 20u;
-            float mantissa = float(depth24 & 0xFFFFFu) / 1048576.0f;
-            depth = exponent == 0u ? mantissa * exp2(-14.0f) : (1.0f + mantissa) * exp2(float(exponent) - 15.0f);
-        }
+        // The float one is the host float with the exponent rebased by 127 - 15 and the mantissa's low bits zero
+        // (denormals: the 20 bit mantissa times 2^-34), built from its bits instead of with exp2.
+        float depth = rawDepth == 1u ? float(depth24) * (1.0f / 16777215.0f) :
+            (depth24 >> 20u) == 0u ? float(depth24) * 5.820766091346741e-11f : asfloat((depth24 << 3u) + 0x38000000u);
         value = float4(depth, depth, depth, depth);
     }
 
-    [unroll] for (uint i = 0u; i < 4u; i++)
+    // Sign, gamma, bias and exponent bias, each a branch on the draw's constants, and only when any is set.
+    [branch] if ((info.w & 0x3FF0FFu) != 0u)
     {
-        if ((info.w >> i) & 1u)
+        [unroll] for (uint i = 0u; i < 4u; i++)
         {
-            float s = value[i] * 255.0f;
-            s = s >= 127.5f ? s - 256.0f : s;
-            value[i] = max(s / 127.0f, -1.0f);
+            if ((info.w >> i) & 1u)
+            {
+                float s = value[i] * 255.0f;
+                s = s >= 127.5f ? s - 256.0f : s;
+                value[i] = max(s / 127.0f, -1.0f);
+            }
+            else if ((info.w >> (i + 4u)) & 1u)
+            {
+                value[i] = xe_gamma_to_linear(value[i]);
+            }
+            else if ((info.w >> (i + 12u)) & 1u)
+            {
+                value[i] = value[i] * 2.0f - 1.0f;
+            }
         }
-        else if ((info.w >> (i + 4u)) & 1u)
-        {
-            value[i] = xe_gamma_to_linear(value[i]);
-        }
-        else if ((info.w >> (i + 12u)) & 1u)
-        {
-            value[i] = value[i] * 2.0f - 1.0f;
-        }
+        // Exponent bias of the fetch constant (6 bit signed power of two).
+        int expAdjust = int(info.w << 10u) >> 26;
+        if (expAdjust != 0)
+            value *= exp2(float(expAdjust));
     }
-    // Exponent bias of the fetch constant (6 bit signed power of two).
-    int expAdjust = int(info.w << 10u) >> 26;
-    if (expAdjust != 0)
-        value *= exp2(float(expAdjust));
+    [branch] if ((info.z & 0xFFFu) == 0x688u)
+        return value;
     return xe_swizzle(value, info.z);
 }
 
@@ -261,6 +261,7 @@ float4 xe_cube(float4 a, float4 b)
     {
         ShaderTranslator::Reset();
         m_body.clear();
+        m_sizes2d.reset();
         m_out.clear();
         m_indent = 0;
         m_caseOpen = false;
@@ -413,6 +414,15 @@ float4 xe_cube(float4 a, float4 b)
     std::string HlslShaderTranslator::Dot(const std::string& a, const std::string& b, bool unsafe) const
     {
         return unsafe ? fmt::format("xe_dp({}, {})", a, b) : fmt::format("dot({}, {})", a, b);
+    }
+
+    // A 2D texture's size, queried once at the start of the shader instead of at every fetch (on NVIDIA a size query
+    // is a texture instruction too): xy in guest texels (resolved textures are larger by the resolution scale), zw in
+    // host texels, and the reciprocals in <name>_rcp.
+    std::string HlslShaderTranslator::TextureSize2D(uint32_t fetchConstant)
+    {
+        m_sizes2d.set(fetchConstant & 31);
+        return fmt::format("xe_size2d_{}", fetchConstant & 31);
     }
 
     std::string HlslShaderTranslator::OperandComponent(const InstructionOperand& operand, uint32_t component)
@@ -768,15 +778,13 @@ float4 xe_cube(float4 a, float4 b)
             case xenos::FetchOpDimension::k1D:
             case xenos::FetchOpDimension::k2D:
             {
-                // Sizes in guest texels (resolved textures are larger by the resolution scale).
-                Line("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)].GetDimensions(xe_size.x, xe_size.y);");
-                Line("xe_host_size = xe_size.xy;");
-                Line("xe_size.xy /= ((xe_texture.w >> 10u) & 1u) ? xe_resolution_scale : 1.0f;");
+                // Sizes from the prologue (see TextureSize2D).
+                std::string size = TextureSize2D(fetchConstant);
                 std::string coords = instr.dimension == xenos::FetchOpDimension::k1D ? "float2(xe_coords.x, 0.5f)" : "xe_coords.xy";
                 if (attributes.unnormalized_coordinates)
-                    coords = fmt::format("({} / xe_size.xy)", coords);
+                    coords = fmt::format("({} * {}_rcp.xy)", coords, size);
                 if (attributes.offset_x != 0.0f || attributes.offset_y != 0.0f)
-                    coords = fmt::format("({} + float2({:.6f}f, {:.6f}f) / xe_size.xy)", coords, attributes.offset_x, attributes.offset_y);
+                    coords = fmt::format("({} + float2({:.6f}f, {:.6f}f) * {}_rcp.xy)", coords, attributes.offset_x, attributes.offset_y, size);
                 // Unnormalized coordinates are already in host texels; normalized ones span the fetch's size.
                 if (attributes.unnormalized_coordinates)
                     coords = fmt::format("({} + xe_texture_transforms[{}].zw)", coords, fetchConstant);
@@ -785,7 +793,7 @@ float4 xe_cube(float4 a, float4 b)
                 // Point sampling picks the texel the coordinates are in. The host converts normalized coordinates back to
                 // texels with limited precision, so coordinates on a texel edge (games sample at whole pixel positions)
                 // can land in the previous texel; they're moved to the texel's center.
-                coords = fmt::format("(((xe_texture.w >> 11u) & 1u) ? (floor({0} * xe_host_size) + 0.5f) / xe_host_size : {0})", coords);
+                coords = fmt::format("(((xe_texture.w >> 11u) & 1u) ? (floor({0} * {1}.zw) + 0.5f) * {1}_rcp.zw : {0})", coords, size);
                 value = sample("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)]", coords);
                 break;
             }
@@ -824,15 +832,14 @@ float4 xe_cube(float4 a, float4 b)
             Line("// getWeights tf{}", fetchConstant);
             Line("xe_texture = xe_textures[{}];", fetchConstant);
             Line("xe_coords = {};", Operand(instr.operands[0]));
-            Line("xe_textures_2d[NonUniformResourceIndex(xe_texture.x)].GetDimensions(xe_size.x, xe_size.y);");
-            Line("xe_size.xy /= ((xe_texture.w >> 10u) & 1u) ? xe_resolution_scale : 1.0f;");
+            std::string size = TextureSize2D(fetchConstant);
             std::string coords = instr.dimension == xenos::FetchOpDimension::k1D ? "float2(xe_coords.x, 0.5f)" : "xe_coords.xy";
             if (attributes.unnormalized_coordinates)
-                coords = fmt::format("({} / xe_size.xy + xe_texture_transforms[{}].zw)", coords, fetchConstant);
+                coords = fmt::format("({} * {}_rcp.xy + xe_texture_transforms[{}].zw)", coords, size, fetchConstant);
             else
                 coords = fmt::format("({} * xe_texture_transforms[{}].xy + xe_texture_transforms[{}].zw)", coords, fetchConstant, fetchConstant);
-            StoreResult(instr.result, fmt::format("float4(frac({} * xe_size.xy + float2({:.6f}f, {:.6f}f) - 0.5f), 0.0f, 0.0f)",
-                coords, attributes.offset_x, attributes.offset_y));
+            StoreResult(instr.result, fmt::format("float4(frac({} * {}.xy + float2({:.6f}f, {:.6f}f) - 0.5f), 0.0f, 0.0f)",
+                coords, size, attributes.offset_x, attributes.offset_y));
             break;
         }
 
@@ -1240,7 +1247,6 @@ XeOutput main(uint vertexId : SV_VertexID)
     float4 xe_temp2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 xe_coords = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float3 xe_size = float3(1.0f, 1.0f, 1.0f);
-    float2 xe_host_size = float2(1.0f, 1.0f);
     uint4 xe_texture = uint4(0u, 0u, 0u, 0u);
     float xe_ps = 0.0f;
     float xe_ps_next = 0.0f;
@@ -1259,6 +1265,17 @@ XeOutput main(uint vertexId : SV_VertexID)
     uint xe_call_return[4] = { 0xFFFFu, 0xFFFFu, 0xFFFFu, 0xFFFFu };
 
     uint xe_pc = 0u;
+)";
+        for (uint32_t index = 0; index < 32; index++)
+        {
+            if (!m_sizes2d[index])
+                continue;
+            out += fmt::format("    float4 xe_size2d_{0}, xe_size2d_{0}_rcp;\n", index);
+            out += fmt::format("    xe_textures_2d[NonUniformResourceIndex(xe_textures[{0}].x)].GetDimensions(xe_size2d_{0}.z, xe_size2d_{0}.w);\n", index);
+            out += fmt::format("    xe_size2d_{0}.xy = xe_size2d_{0}.zw / (((xe_textures[{0}].w >> 10u) & 1u) ? xe_resolution_scale : 1.0f);\n", index);
+            out += fmt::format("    xe_size2d_{0}_rcp = 1.0f / xe_size2d_{0};\n", index);
+        }
+        out += R"(
     [loop] while (xe_pc != 0xFFFFu)
     {
         [forcecase] switch (xe_pc)

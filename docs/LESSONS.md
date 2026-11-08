@@ -134,6 +134,16 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   for SSX's quarter resolution effects, which draw 4x at 560 over it; the 1040 shadow maps three). Keeping samples
   geometric (see EDRAM) removed them: 1.5 ms at 1x, and at 2x 27.6-29.8 -> 22-26 ms, 30 -> 40 fps. Screenshots of
   menus, the helicopter and riding, at 1x and 2x, show no difference beyond animation timing.
+- The shadow filter (ps D99D2942, 4 ms at 2x) cost the same with every fetch at one texel and with fewer multiplies,
+  so neither texture traffic nor its own arithmetic; replaced by a trivial shader (the draw kept), it cost almost
+  nothing. The time was in what each fetch did after sampling: its 17 fetches read raw depth (a resolved depth
+  buffer and the shadow cascades), which skipped the fast path, so each decoded depth with `exp2` and then ran
+  the per component sign loop and a swizzle of chained selects, all on uniform values but per pixel. Now each stage
+  is a branch on the draw's constants, float depth is built from its bits (`asfloat((d << 3) + 0x38000000)`,
+  exact), and the swizzle selects by the source's two bits: 3.9 -> 1.65 ms, 2x 21.5-23.3 -> 17.1-18.7 ms a frame,
+  1x 6.9-8.6 -> 5.6-7.2. Texture sizes are also queried once per fetch constant at the start of a shader, not at
+  every fetch (a size query is a texture instruction on NVIDIA; 19 -> 3 in that shader, divisions 103 -> 11), which
+  was worth about 1 ms at 2x. ARShaderTool has its own copy of the translator: rebuild it before reading DXIL.
 
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:
