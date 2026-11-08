@@ -87,6 +87,13 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
 
 ## Performance
 
+- SSX on a GTX 970 is GPU bound (Anarchy Reigns was CPU bound): 15-16 ms of GPU time a frame riding at 1x, a third
+  of it MSAA layout conversions. Its depth buffers switch between 4x MSAA and single sampled draws several times a
+  frame (22 conversions a frame), and each converted a whole 2048 row target. The sample orders keep 4x4 blocks in
+  place, so conversions now stop at the rows written since the target was made (draw scissors, clears, syncs; the
+  creation clear is uniform, the same in any layout): 5.0 -> 3.0 ms at 1x, 20 -> 11 ms at 2x, 13 ms a frame in all.
+  Render scale 2 is still about 20 fps on that GPU (draws 26-35 ms).
+
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:
 

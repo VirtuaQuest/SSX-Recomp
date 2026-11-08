@@ -94,6 +94,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_NATIVE_RESET` | Guest strip indices with the host's restart value |
 | `AR_NO_COMPOSITE` | Assembling textures from consecutive resolves |
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
+| `AR_NO_LAYOUT_BOUND`, `AR_LOG_LAYOUT=<frame>` | Layout conversions of whole render targets instead of their written rows; that frame's conversions (size, format, why) |
+| `AR_GPU_TIMING` (with `AR_LOG_FPS`) | GPU time per frame by kind: layout conversions, syncs, resolves, draws |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
 | `AR_NO_DEPTH_24` | Keeping depth to the guest's precision (see LESSONS) |
 | `AR_NO_DEPTH_CLIP`, `AR_NO_DEPTH_TEST` | Depth clipping (clamps instead), depth testing |

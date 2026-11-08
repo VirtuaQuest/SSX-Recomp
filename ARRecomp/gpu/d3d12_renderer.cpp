@@ -101,6 +101,9 @@ namespace gpu::d3d12
         // Render targets: the sample layout their texels are in. 0 is EDRAM order (as single sampled surfaces see
         // it); 1 and 2 are as rasterized with 2x and 4x MSAA (a sample per texel, samples of a pixel adjacent).
         uint32_t layout = 0;
+        // Render targets: rows (guest samples) below which they've been written. Below it they hold their creation
+        // clear, the same in any layout, so layout conversions stop there.
+        uint32_t usedRows = 0;
         uint64_t poolKey = 0; // Its description, for reuse once released (0: not pooled).
         uint32_t mipLevels = 1;
     };
@@ -2927,13 +2930,29 @@ float4 main(float4 position : SV_Position) : SV_Target
     }
 
     // Reorders a render target's texels into another sample layout, through a scratch copy.
-    static void ConvertLayout(Texture& texture, uint32_t layout)
+    static void ConvertLayout(Texture& texture, uint32_t layout, const char* why = "")
     {
         static const bool disabled = AR_ENV("AR_NO_LAYOUT") != nullptr;
         if (disabled || texture.layout == layout || !texture.resource)
             return;
         SHADOW_EVENT("layout {} -> {} ({}x{})", texture.layout, layout, texture.width, texture.height);
+        // AR_LOG_LAYOUT=<frame>: the conversions of that frame.
+        static const int64_t logFrame = AR_ENV("AR_LOG_LAYOUT") ? atoll(AR_ENV("AR_LOG_LAYOUT")) : -1;
+        if (int64_t(g.frameNumber) == logFrame)
+            LOGF_INFO("LAYOUT {} -> {}: {}x{} format {} {} from {}", texture.layout, layout, texture.width, texture.height, uint32_t(texture.format),
+                texture.dsv != UINT32_MAX ? "depth" : "color", why);
         GpuScope scope{ 0 };
+
+        // The sample orders keep each 4x4 block of samples in place, so rows up to the written ones (rounded to 4)
+        // convert on their own, and a target never written is uniform. AR_NO_LAYOUT_BOUND converts whole targets.
+        static const bool unbounded = AR_ENV("AR_NO_LAYOUT_BOUND") != nullptr;
+        uint32_t rows = unbounded ? RENDER_TARGET_HEIGHT : std::min(RENDER_TARGET_HEIGHT, (texture.usedRows + 3) & ~3u);
+        if (rows == 0)
+        {
+            texture.layout = layout;
+            return;
+        }
+        uint32_t hostRows = std::min(texture.height, rows * g_scale);
 
         bool depth = texture.dsv != UINT32_MAX;
         auto& scratch = g.layoutScratch[{ uint32_t(texture.format), texture.width, texture.height }];
@@ -2948,7 +2967,23 @@ float4 main(float4 position : SV_Position) : SV_Target
 
         Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(scratch, D3D12_RESOURCE_STATE_COPY_DEST);
-        g.list->CopyResource(scratch.resource.Get(), texture.resource.Get());
+        if (hostRows >= texture.height)
+        {
+            g.list->CopyResource(scratch.resource.Get(), texture.resource.Get());
+        }
+        else
+        {
+            // Depth-stencil copies must be whole subresources.
+            if (depth)
+                g.list->CopyResource(scratch.resource.Get(), texture.resource.Get());
+            else
+            {
+                D3D12_TEXTURE_COPY_LOCATION source{ texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_TEXTURE_COPY_LOCATION dest{ scratch.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_BOX box{ 0, 0, 0, texture.width, hostRows, 1 };
+                g.list->CopyTextureRegion(&dest, 0, 0, 0, &source, &box);
+            }
+        }
         Transition(scratch, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         if (depth)
@@ -2963,7 +2998,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             auto rtv = CpuRtv(texture.rtv);
             g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         }
-        SetViewportAndScissor(texture.width, texture.height, { 0, 0, LONG(texture.width), LONG(texture.height) });
+        SetViewportAndScissor(texture.width, texture.height, { 0, 0, LONG(texture.width), LONG(hostRows) });
         g.list->SetPipelineState(GetLayoutPipeline(texture.format, depth));
         g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         struct
@@ -3000,6 +3035,9 @@ float4 main(float4 position : SV_Position) : SV_Target
     {
         if (rect.left >= rect.right || rect.top >= rect.bottom)
             return;
+
+        if (auto target = g.renderTargets.find(key); target != g.renderTargets.end())
+            target->second.usedRows = std::max(target->second.usedRows, uint32_t(std::clamp<LONG>(rect.bottom, 0, LONG(RENDER_TARGET_HEIGHT))));
 
         auto& writes = g.renderTargetWrites[key];
         uint64_t stamp = g.renderTargetStamps[key];
@@ -3081,8 +3119,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             if (ShadowSyncLog(key) && key.depth == otherKey->depth)
                 LOGF_INFO("SY {} base {:X} pitch {} format {} <- base {:X} format {} (whole rows)", g.frameNumber, key.base, key.pitch,
                     key.format, otherKey->base, otherKey->format);
-            ConvertLayout(texture, 0);
-            ConvertLayout(*other, 0);
+            ConvertLayout(texture, 0, "sync target");
+            ConvertLayout(*other, 0, "sync source");
             // The other target's row 0 is at this one's row `rows` (in samples).
             int32_t rows = (int32_t(otherKey->base) - int32_t(key.base)) / int32_t(pitchTiles) * 16;
             uint32_t sourceTop = uint32_t(std::max(0, -rows)), destTop = uint32_t(std::max(0, rows));
@@ -3109,6 +3147,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 written.bottom = std::min<LONG>(written.bottom + rows, LONG(destTop + height));
                 if (written.top >= written.bottom || written.left >= written.right)
                     continue;
+                texture.usedRows = std::max(texture.usedRows, uint32_t(written.bottom));
 
                 if (TraceThisFrame() || ShadowSyncLog(key))
                     LOGF_INFO("  {} base {:X} format {} <- {} base {:X} format {}: rows {} rect {},{}-{},{} frame {}", key.depth ? "depth" : "color",
@@ -3159,6 +3198,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
             else if (key.depth)
             {
+                // Rows the other target never wrote come over as its creation clear, uniform.
+                texture.usedRows = std::max(texture.usedRows, uint32_t(std::clamp<int32_t>(rows + int32_t(other->usedRows), 0, int32_t(RENDER_TARGET_HEIGHT))));
                 Transition(*other, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 auto dsv = CpuDsv(texture.dsv);
@@ -3178,6 +3219,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             }
             else
             {
+                texture.usedRows = std::max(texture.usedRows, uint32_t(std::clamp<int32_t>(rows + int32_t(other->usedRows), 0, int32_t(RENDER_TARGET_HEIGHT))));
                 Transition(*other, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 Transition(texture, D3D12_RESOURCE_STATE_COPY_DEST);
                 D3D12_TEXTURE_COPY_LOCATION source{ other->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
@@ -3742,7 +3784,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             colorTargets[i] = GetRenderTarget(info.Base(), pitch, info.Format(), false);
             if (!colorTargets[i])
                 return;
-            ConvertLayout(*colorTargets[i], SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples());
+            ConvertLayout(*colorTargets[i], SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples(), "draw color");
 
             key.renderTargetCount = uint8_t(i + 1);
             key.renderTargetFormats[i] = colorTargets[i]->format;
@@ -3759,7 +3801,7 @@ float4 main(float4 position : SV_Position) : SV_Target
             depthTarget = GetRenderTarget(info.Base(), pitch, info.Format(), true);
             if (!depthTarget)
                 return;
-            ConvertLayout(*depthTarget, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples());
+            ConvertLayout(*depthTarget, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples(), "draw depth");
             key.depthFormat = depthTarget->format;
         }
         else
@@ -5178,7 +5220,7 @@ float4 main(float4 position : SV_Position) : SV_Target
         }
         if (!source)
             return;
-        ConvertLayout(*source, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples());
+        ConvertLayout(*source, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples(), "resolve");
 
         D3D12_RECT rect{ x0, y0, x1, y1 };
         uint32_t destBase = registers[RB_COPY_DEST_BASE] & 0x1FFFFFFF;
