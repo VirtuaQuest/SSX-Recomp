@@ -453,9 +453,15 @@ namespace gpu
         uint32_t bppLog2 = std::countr_zero(info.bytesPerBlock);
         uint8_t block[16];
 
+        // Tiled 3D textures are tiled in 32x16x4 blocks through the whole volume (Xenia's Tiled3D), not slice by slice
+        // as 2D: decoded as 2D slices, the 128x128x256 volume SSX's snow terrain looks up came out scrambled, and whole
+        // patches of slope got the wrong normals (flat polygons with straight edges). AR_NO_TILED_3D decodes slices as 2D.
+        static const bool tiled3dOff = AR_ENV("AR_NO_TILED_3D") != nullptr;
+        bool tiled3d = fetch.Tiled() && fetch.Dimension() == 2 && !tiled3dOff;
+
         for (uint32_t z = 0; z < slices; z++)
         {
-            const uint8_t* slice = base + size_t(layout.sliceBytes) * z;
+            const uint8_t* slice = tiled3d ? base : base + size_t(layout.sliceBytes) * z;
             uint8_t* destSlice = out.data.data() + size_t(out.rowPitch) * out.rowCount * z;
 
             for (uint32_t y = 0; y < layout.heightBlocks; y++)
@@ -463,7 +469,10 @@ namespace gpu
                 uint8_t* destRow = destSlice + size_t(out.rowPitch) * y;
                 for (uint32_t x = 0; x < layout.widthBlocks; x++)
                 {
-                    size_t offset = fetch.Tiled()
+                    size_t offset = tiled3d
+                        ? size_t(xe::gpu::texture_address::Tiled3D(int32_t(x + offsetX), int32_t(y + offsetY), int32_t(z), layout.pitchBlocks,
+                            layout.heightAligned, bppLog2))
+                        : fetch.Tiled()
                         ? size_t(xe::gpu::texture_address::Tiled2D(int32_t(x + offsetX), int32_t(y + offsetY), layout.pitchBlocks, bppLog2))
                         : size_t(y + offsetY) * layout.rowPitchBytes + size_t(x + offsetX) * info.bytesPerBlock;
 
