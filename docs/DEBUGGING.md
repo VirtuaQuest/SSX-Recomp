@@ -9,7 +9,7 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 |---|---|
 | `--game <iso or folder>` | Game files |
 | `--xex`, `--user` | Executable and user data folder overrides |
-| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60\|120`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--draw-distance F`, `--sharpen 0-3`, `--ultrawide`, `--vsync`, `--shadows on\|off` | Video settings (what the launcher passes) |
+| `--resolution WxH`, `--display windowed\|borderless\|fullscreen`, `--fps 30\|60`, `--render-scale 1-4`, `--antialiasing 0\|1`, `--anisotropic 0\|2\|4\|8\|16`, `--texture-lod-bias F`, `--sharpen 0-3`, `--ultrawide`, `--vsync` | Video settings (what the launcher passes) |
 | `--online`, `--online-peer <IPs>`, `--player-name <name>`, `--controller <1-4>` | Multiplayer between copies (see LESSONS); which controller this copy reads |
 | `--make-icon` | Takes the icon from the game, unseen and silent, into `user/game_icon.ico`, then exits (Setup uses this) |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
@@ -111,6 +111,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_LOG_XMA`, `AR_NO_XMA` | XMA contexts as the title sets them up; the decoder off (silent) |
 | `AR_CACHE_DRIVE` | Mounts `cache:` (user/cache); off by default, see LESSONS |
 | `AR_NO_HW_THREADS`, `AR_LOG_HW_THREADS` | Guest hardware threads pinned to host logical processors; where threads go |
+| `AR_NO_TICKER_SLEEP`, `AR_LOG_TICKERS` | SSX's ticker threads yield instead of sleeping a millisecond (`kernel/title_hooks.cpp`); log each ticker's interval |
 | `AR_NO_KEYSTROKE_DEVICES` | Keystroke reads ignore their device flags (pad keys go to keyboard-only reads too) |
 | `AR_CRASH_DUMP=<registers>` | 1 KB of guest memory where these registers (numbers, comma separated) point, after a crash |
 | `AR_NO_TEXTURE_EXP_BIAS`, `AR_NO_BIASED_FETCH` | Fetch constants' exponent bias; unsigned biased components (then read as unsigned) |

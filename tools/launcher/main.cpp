@@ -32,8 +32,8 @@ namespace
 
     constexpr const wchar_t* DISPLAY_MODES[] = { L"Windowed", L"Borderless fullscreen", L"Fullscreen" };
     constexpr const wchar_t* DISPLAY_ARGS[] = { L"windowed", L"borderless", L"fullscreen" };
-    constexpr int FRAME_RATES[] = { 30, 60, 120 };
-    constexpr const wchar_t* FRAME_RATE_LABELS[] = { L"30 FPS (original)", L"60 FPS (experimental)", L"120 FPS (experimental)" };
+    constexpr int FRAME_RATES[] = { 30, 60 }; // SSX holds itself to 60 at most (at the 120 setting: 60 swaps a second from 240 vblanks).
+    constexpr const wchar_t* FRAME_RATE_LABELS[] = { L"30 FPS (original)", L"60 FPS" };
     constexpr const wchar_t* SCALE_LABELS[] = { L"1x (1280 x 720, original)", L"2x (2560 x 1440)", L"3x (3840 x 2160)", L"4x (5120 x 2880)" };
     constexpr const wchar_t* AA_LABELS[] = { L"Off", L"FXAA" };
     constexpr const wchar_t* ANISOTROPIC_LABELS[] = { L"As the game asks (original)", L"2x", L"4x", L"8x", L"16x" };

@@ -31,7 +31,7 @@ static void PrintUsage()
         "  --user  Folder for save data and caches (default: ./user).\n"
         "  --resolution WxH       Window or display resolution (default 1280x720).\n"
         "  --display MODE         windowed, borderless or fullscreen (default windowed).\n"
-        "  --fps N                Frame rate: 30 (default), 60 or 120.\n"
+        "  --fps N                Frame rate: 30 (default) or 60.\n"
         "  --antialiasing N       Anti-aliasing: 0 off (default), 1 FXAA.\n"
         "  --anisotropic N        Anisotropic filtering: 0 as the game asks (default), 2, 4, 8 or 16.\n"
         "  --texture-lod-bias F   Texture detail: 0 default, below 0 sharper.\n"
@@ -120,7 +120,7 @@ int main(int argc, char* argv[])
         else if (arg == "--player-name" && i + 1 < argc)
             _putenv_s("AR_PLAYER_NAME", argv[++i]);
         else if (arg == "--fps" && i + 1 < argc)
-            gpu::g_videoSettings.frameRate = std::clamp(atoi(argv[++i]), 30, 120);
+            gpu::g_videoSettings.frameRate = std::clamp(atoi(argv[++i]), 30, 60); // SSX holds itself to 60 at most.
         else if (arg == "--render-scale" && i + 1 < argc)
             gpu::g_videoSettings.renderScale = std::clamp(atoi(argv[++i]), 1, 4);
         else if (arg == "--antialiasing" && i + 1 < argc)
@@ -129,16 +129,12 @@ int main(int argc, char* argv[])
             gpu::g_videoSettings.anisotropy = std::clamp(atoi(argv[++i]), 0, 16);
         else if (arg == "--texture-lod-bias" && i + 1 < argc)
             gpu::g_videoSettings.textureLodBias = std::clamp(float(atof(argv[++i])), -3.0f, 3.0f);
-        else if (arg == "--draw-distance" && i + 1 < argc)
-            gpu::g_videoSettings.drawDistance = std::clamp(float(atof(argv[++i])), 1.0f, 1000.0f);
         else if (arg == "--sharpen" && i + 1 < argc)
             gpu::g_videoSettings.sharpen = std::clamp(atoi(argv[++i]), 0, 3);
         else if (arg == "--ultrawide")
             gpu::g_videoSettings.ultrawide = true;
         else if (arg == "--vsync")
             gpu::g_videoSettings.vsync = true;
-        else if (arg == "--shadows" && i + 1 < argc)
-            gpu::g_videoSettings.shadows = std::string_view(argv[++i]) != "off";
         else if (arg == "--mouse-sensitivity" && i + 1 < argc)
             mouseSensitivity = std::clamp(float(atof(argv[++i])), 0.05f, 20.0f);
         else if (arg == "--invert-mouse")

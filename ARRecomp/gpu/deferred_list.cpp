@@ -275,7 +275,22 @@ namespace gpu::d3d12
         case Type::Present:
         {
             auto& d = *reinterpret_cast<const PresentData*>(data);
+            // AR_LOG_FPS: how long Present blocks (a frame rate held at the display's refresh shows here).
+            static const bool logTime = AR_ENV("AR_LOG_FPS") != nullptr;
+            auto start = std::chrono::steady_clock::now();
             swapChain->Present(d.syncInterval, d.flags);
+            if (logTime)
+            {
+                static double total;
+                static uint32_t count;
+                total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                if (++count == 300)
+                {
+                    LOGF_INFO("Present blocked {:.2f} ms a frame (sync {}, flags 0x{:X})", total / count, d.syncInterval, d.flags);
+                    total = 0;
+                    count = 0;
+                }
+            }
             break;
         }
         }

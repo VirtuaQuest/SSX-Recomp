@@ -3674,15 +3674,6 @@ float4 main(float4 position : SV_Position) : SV_Target
                     return;
             }
         }
-        // Shadows off (--shadows off): draws into the title's shadow map depth buffer (EDRAM base 128, pitch 1040, where
-        // its three cascades are rendered) are skipped, except the rectangles that clear it, so the maps stay empty and
-        // nothing is in shadow. This also hides the far cascade's flicker (the title adds some casters only on some
-        // frames).
-        if (!g_videoSettings.shadows && draw.initiator.PrimType() != PrimitiveType::RectangleList &&
-            SurfaceInfo{ registers[RB_SURFACE_INFO] }.Pitch() == 1040 && DepthInfo{ registers[RB_DEPTH_INFO] }.Base() == 128 &&
-            (registers[RB_DEPTHCONTROL] & 6) != 0)
-            return;
-
         // AR_SKIP_VS: the same for vertex shaders.
         static const std::vector<std::string> skippedVertexShaders = []
             {

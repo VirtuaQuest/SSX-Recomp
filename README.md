@@ -36,8 +36,8 @@ All of this stays on your PC, and nothing is downloaded:
 
 ## Playing
 
-The launcher sets the resolution, windowed, borderless or fullscreen display, the frame rate (30 as on the console, 60
-or 120; the game keeps its speed at any of them), the internal render scale (up to 2160p), anisotropic filtering,
+The launcher sets the resolution, windowed, borderless or fullscreen display, the frame rate (30 as on the console, or 60
+at the same game speed; SSX holds itself to 60 at most), the internal render scale (up to 2160p), anisotropic filtering,
 texture detail, sharpening and vsync. A controller works as on the console. Keyboard and mouse are merged into the first
 controller (WASD the left stick, IJKL or the mouse the trick stick, Space A, arrows the d-pad, Escape Start).
 

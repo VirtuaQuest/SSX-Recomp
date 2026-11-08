@@ -320,7 +320,9 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
 - Kernel: mutants (`NtCreateMutant`, `NtReleaseMutant`), WSA events, `XamCreateEnumeratorHandle`. `NtOpenFile` takes share
   access before the options (as NT's does); with them swapped, DeleteFile/MoveFile's share mode 7 read as "directory".
   XContentCreate/Delete of this XDK call XAM ordinals 625/624 through `XexGetProcedureAddress`; they're host functions
-  at the last words of `.text` (data, never code), see `FindDynamicExport` in `kernel/imports/ex.cpp`.
+  at the last words of `.text` (data, never code), see `FindDynamicExport` in `kernel/imports/ex.cpp`. The warnings
+  for XAM ordinals 36 and 80 are harmless: those lookups (833D3230, 833D2FB8) run only when the system version is at
+  least 0x200A3200 and fall back to the imported function when they fail.
 - Audio: SSX drives XMA contexts itself. `kernel/imports/xma.cpp` finds frames (15 bit lengths, across packets and
   buffers) and decodes each in a packet of its own with FFmpeg's XMA2 decoder; FFmpeg's skipped first frame becomes
   silence so sample counts stay exact.
@@ -347,6 +349,15 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   `AR_REMOTE` script at 30 and 60 fps and a screenshot per real second: the tutorial's scripted events (leaving the
   helicopter to the first spin prompt) are 10.1 s apart in both, and the 60 run presents 59 frames a second. (A first
   60 run started 8 s late and played the intro slowly: something else had the PC busy; check before comparing.)
+  It holds itself to 60: at the 90 and 120 settings it still calls VdSwap 60 times a second (240 vblanks a second,
+  Present not blocking, 0.3 ms of GPU work a frame in menus), so the launcher offers 30 and 60 only. Riding the
+  Whitehorn ground tutorial runs at 57-60 at 60 on the i7-6700 (5-7 ms of GPU work, 1000-1400 draws).
+- Ticker threads: `sub_83047120` runs periodic tickers (a 30 Hz and a 60 Hz one) that wait between ticks with a sleep of
+  the milliseconds in 821A80D8, 0 as shipped: a bare yield, so each spun a host core. Set to 1, the process went from
+  4.6 to 3.7 logical CPUs while riding, at the same frame rate and game speed (race timer against real time: the same
+  with and without; the timer stands still for a few seconds at some tutorial moments either way).
+- Two more threads stay busy by design: the GPU command processor polls for 50 ms after its last work (latency), and
+  `sub_82A51280` (mftb) is read about 1700 times a frame by profiling code, not a wait loop.
 - The terrain's white ridgelines and speckle, and a white halo round the rider, were FXAA without the texture exponent
   bias (see GPU: shaders). Found by putting intermediate values of the terrain shader on screen (`AR_SHOW_EXPR`): they
   were right, and a resolve dump per post-process pass showed the outlines appear in FXAA's pass (ps 7069403B).
