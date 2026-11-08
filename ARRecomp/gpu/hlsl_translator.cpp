@@ -1030,7 +1030,7 @@ float4 xe_cube(float4 a, float4 b)
         out = fmt::format("#define XE_REGISTER_COUNT {}\n", registerCount);
         // AR_SHOW_EXPR=<HLSL float4>: what draws picked by AR_HIGHLIGHT_PS output instead of magenta, to look at a value
         // the shader computes. XE_R(n) is temporary register n as the shader leaves it (clamped to the shader's count).
-        static const char* showExpression = AR_ENV("AR_SHOW_EXPR");
+        static const char* showExpression = getenv("AR_SHOW_EXPR");
         out += "#define XE_R(n) xe_r[min(n, XE_REGISTER_COUNT - 1)]\n";
         out += fmt::format("#define XE_HIGHLIGHT_COLOR ({})\n", showExpression ? showExpression : "float4(1.0f, 0.0f, 1.0f, 1.0f)");
         out += HLSL_PRELUDE;
