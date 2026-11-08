@@ -2982,6 +2982,17 @@ float4 main(float4 position : SV_Position) : SV_Target
             texture.layout = layout;
             return;
         }
+        // Between 1x and 4x nothing moves: the host draws both geometrically (a 1x texel at its pixel, a 4x sample at
+        // 2 * pixel + sample), and the console's order only swaps the middle two columns and rows of each 4x4 block,
+        // which a game sees just by reading one view's samples through the other. Keeping them where they are makes a
+        // low resolution 4x pass over a full resolution 1x depth buffer test each sample against the depth at its own
+        // position, and saves SSX 34 conversions a frame riding (its effects and shadow maps alternate 1x and 4x). AR_NO_GEOMETRIC_SAMPLES reorders as the console stores.
+        static const bool reorder = AR_ENV("AR_NO_GEOMETRIC_SAMPLES") != nullptr;
+        if (!reorder && (texture.layout | layout) == 2)
+        {
+            texture.layout = layout;
+            return;
+        }
         uint32_t hostRows = std::min(texture.height, rows * g_scale);
 
         bool depth = texture.dsv != UINT32_MAX;

@@ -59,6 +59,10 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
 - MSAA targets are kept with a host sample per texel. The EDRAM sample order for 4x is
   `u = 4*(x>>1) | 2*sampleX | (x&1)` (same for v); convert layouts when a target is used at a different sample count
   (games clear a 1x surface through a 4x alias of the same memory because it covers 4 samples per pixel).
+  Between 1x and 4x that order only swaps the middle two columns and rows of each 4x4 block, and the host draws both
+  views geometrically (a 4x sample at `2 * pixel + sample`), so those switches no longer move anything: the result
+  differs from the console only where a game reads one view's samples through the other, and there it is the
+  geometrically right one. 2x keeps its conversion (its order mixes x and y). `AR_NO_GEOMETRIC_SAMPLES` converts.
 - Resolves are address aware: games render in strips and point each strip's resolve at its rows of one texture.
 - Resolves to the same address with different sizes happen every frame; pool released textures instead of creating
   new ones (creating and destroying resources was 14% of the GPU thread).
@@ -126,6 +130,10 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   A first try per register and flow-insensitive guarded almost everything (a reciprocal in `r0.y` tainted `r0`).
   Result: 29-31.5 -> 27.6-29.8 ms at 2x, the hot shaders keep about half their guards (the divide by w chain).
   `AR_NO_FAST_MUL` guards every multiplication again.
+- The layout conversions were all between 1x and 4x (34 a frame riding: the 1120 wide depth buffer five round trips
+  for SSX's quarter resolution effects, which draw 4x at 560 over it; the 1040 shadow maps three). Keeping samples
+  geometric (see EDRAM) removed them: 1.5 ms at 1x, and at 2x 27.6-29.8 -> 22-26 ms, 30 -> 40 fps. Screenshots of
+  menus, the helicopter and riding, at 1x and 2x, show no difference beyond animation timing.
 
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:
