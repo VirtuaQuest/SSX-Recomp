@@ -105,9 +105,16 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   6.8-7.4 ms at 1x (GPU 9.4-10.2 ms riding) and 2x went from about 22 to 30 fps. SSX's painted snow markings and
   trails showed no fighting without the rounding; `AR_NO_EARLY_DEPTH` brings it back. (SSX's depth tests are
   mostly GEQUAL: reversed depth.)
-- Tried and no faster on that GPU, so not kept: writing the pixel parameter register with constant indices instead
-  of `xe_r[xe_param_gen_register]`, and texture indices without `NonUniformResourceIndex`. `AR_GPU_PASSES=2` shows
+- Texture indices without `NonUniformResourceIndex` were no faster on that GPU, so it stays. `AR_GPU_PASSES=2` shows
   where draw time goes: SSX's 4x4 shadow filter passes (17 fetches a pixel, full screen) are the costliest single draws.
+- Read the DXIL of a translated shader (ARShaderTool `--hlsl`, then `dxc -T ps_6_6 -O2 -Fc`) before guessing: the
+  helpers indexed vectors and the register array by values known only at run time (`value[source]` in the fetch
+  swizzle, `xe_r[xe_param_gen_register]`), and each such index is an alloca, local memory: 19 in the shadow filter.
+  Fixing only the parameter register had measured nothing because the swizzle's allocas were still there. With both
+  gone, and one branch on the draw's constants skipping the fetch result's sign, gamma, depth and bias code when none
+  applies, the frame at 2x went 32-36 -> 29-31.5 ms riding (one shader 3.2 -> 1.8 ms). The shadow filter itself
+  didn't get faster (4 ms at 2x, measured by skipping it with `AR_SKIP_PS`): at 2x the shadow maps are scaled too, as
+  every EDRAM target is, so it and the caster draws (depth only, 6 ms at 2x) grow with the square of the scale.
 
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:

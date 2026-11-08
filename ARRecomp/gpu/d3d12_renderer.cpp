@@ -4907,10 +4907,10 @@ float4 main(float4 position : SV_Position) : SV_Target
             memcpy(state.rtvs, rtvs, sizeof(rtvs));
             state.dsv = dsv;
         }
-        // AR_GPU_PASSES=2: by pixel shader instead (bit 63 set, the hash's low 63 bits).
+        // AR_GPU_PASSES=2: by pixel shader instead (the label is its hash, 0 for none).
         if (PassTiming() == 2 && g.timestampHeap && g.timestampsUsed[g.frameIndex] < State::TIMESTAMPS_PER_FRAME)
         {
-            uint64_t label = (pixelShader ? pixelShader->hash : 0) | (1ull << 63);
+            uint64_t label = pixelShader ? pixelShader->hash : 0;
             auto& marks = g.passMarks[g.frameIndex];
             if (marks.empty() || marks.back().label != label)
             {
@@ -6044,9 +6044,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                 for (size_t i = 0; i < passes.size() && i < 16; i++)
                 {
                     uint64_t label = passes[i].first;
-                    if (label >> 63)
+                    if (PassTiming() == 2)
                     {
-                        LOGF_INFO("  pixel shader {:016X}: {:.2f} ms, {} draws a frame", label & ~(1ull << 63), passes[i].second.first / 300,
+                        LOGF_INFO("  pixel shader {:016X}: {:.2f} ms, {} draws a frame", label, passes[i].second.first / 300,
                             passes[i].second.second / 300);
                         continue;
                     }

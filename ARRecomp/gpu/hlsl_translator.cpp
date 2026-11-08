@@ -135,8 +135,11 @@ float4 xe_swizzle(float4 value, uint swizzle)
     float4 result;
     [unroll] for (uint i = 0u; i < 4u; i++)
     {
+        // Selects, not value[source]: indexing a vector by a value known only at run time puts it in local memory
+        // (an alloca per fetch in the DXIL).
         uint source = (swizzle >> (i * 3u)) & 7u;
-        result[i] = source < 4u ? value[source] : (source == 5u ? 1.0f : 0.0f);
+        result[i] = source == 0u ? value.x : source == 1u ? value.y : source == 2u ? value.z : source == 3u ? value.w :
+            (source == 5u ? 1.0f : 0.0f);
     }
     return result;
 }
@@ -167,6 +170,10 @@ float xe_linear_to_gamma(float l)
 // Applies the fetch constant's per component sign (signed, unsigned biased or gamma) and swizzle to a sampled value.
 float4 xe_texture_result(float4 value, uint4 info)
 {
+    // Most fetches have no sign, gamma, raw depth or exponent bias and the identity swizzle: one branch on the draw's
+    // constants instead of a dozen per fetch.
+    [branch] if ((info.w & 0x3FF3FFu) == 0u && (info.z & 0xFFFu) == 0x688u)
+        return value;
     // Depth buffer words (resolved from a depth buffer, as bytes from the low one up) fetched as depth: 24 bit unorm
     // or float (4 bit exponent, 20 bit mantissa) depth above 8 bit stencil.
     uint rawDepth = (info.w >> 8u) & 3u;
@@ -1069,11 +1076,16 @@ XeOutput main(XeInput input)
     {
         // Pixel position (negative x for back faces; for points, negative y) and point sprite coordinates.
         float2 pixel = floor(input.position.xy / xe_resolution_scale);
+        float4 paramGen;
         if (xe_flags & XE_FLAG_POINT)
-            xe_r[xe_param_gen_register] = float4(abs(pixel.x), -abs(pixel.y), saturate(input.extra.zw));
+            paramGen = float4(abs(pixel.x), -abs(pixel.y), saturate(input.extra.zw));
         else
             // Back faces set the sign bit of x (also for x = 0); the magnitude stays the pixel position.
-            xe_r[xe_param_gen_register] = float4(input.frontFace ? pixel.x : asfloat(asuint(pixel.x) | 0x80000000u), pixel.y, 0.0f, 0.0f);
+            paramGen = float4(input.frontFace ? pixel.x : asfloat(asuint(pixel.x) | 0x80000000u), pixel.y, 0.0f, 0.0f);
+        // Written by constant indices: xe_r[xe_param_gen_register] would put every register in local memory.
+        [unroll] for (int i = 0; i < XE_REGISTER_COUNT; i++)
+            if (i == xe_param_gen_register)
+                xe_r[i] = paramGen;
     }
     float4 xe_color[4] = { float4(0.0f, 0.0f, 0.0f, 0.0f), float4(0.0f, 0.0f, 0.0f, 0.0f),
         float4(0.0f, 0.0f, 0.0f, 0.0f), float4(0.0f, 0.0f, 0.0f, 0.0f) };
