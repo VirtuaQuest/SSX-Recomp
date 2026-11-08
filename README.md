@@ -41,7 +41,9 @@ at the same game speed; SSX holds itself to 60 at most), the internal render sca
 texture detail, sharpening and vsync. A controller works as on the console. Keyboard and mouse are merged into the first
 controller (WASD the left stick, IJKL or the mouse the trick stick, Space A, arrows the d-pad, Escape Start).
 
-Saves are in `run\user`.
+No Xbox Live or EA account is needed. The profile is a local one, and saves go to `run\user\content` on your PC (back
+that folder up to keep your progress). The game no longer stops at boot to say you aren't signed in to Xbox LIVE and
+the EA servers; those services are gone, so "Connect to EA Server" in the menu still reports that it can't reach them.
 
 ## Sharing
 

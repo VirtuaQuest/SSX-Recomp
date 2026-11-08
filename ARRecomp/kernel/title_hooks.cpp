@@ -26,3 +26,23 @@ PPC_FUNC(sub_83047120)
     }
     __imp__sub_83047120(ctx, base);
 }
+
+// When SSX's sign-in to the EA servers ends (the state machine at sub_824B1098, at boot and from "Connect to EA
+// Server"), sub_824ADB28(self, result) keeps the result at self+28 and raises the front end's fe_signin_success (result
+// 0) or fe_signin_failed event. The latter brings up "You must be signed in to Xbox LIVE and the EA Servers in order to
+// access the online features of this title" (TXT_NOT_SIGN_IN_TO_FIRST_PARTY_NETWORK, result 2), which came up on every
+// boot: there is no Live and the servers are gone. The boot flow waits on one of the two events (with neither it stays
+// on "Loading"), so a failure now raises fe_signin_success and keeps the real result. The menus still read the online
+// state on their own: "Connect to EA Server" stays, and choosing it still says the servers can't be reached. Saves are
+// local content either way (user/content). AR_NO_SIGNIN_BYPASS brings the notice back.
+PPC_FUNC_IMPL(__imp__sub_824ADB28);
+PPC_FUNC(sub_824ADB28)
+{
+    static const bool bypass = AR_ENV("AR_NO_SIGNIN_BYPASS") == nullptr;
+    uint32_t self = ctx.r3.u32, result = ctx.r4.u32;
+    if (bypass && result != 0)
+        ctx.r4.u64 = 0;
+    __imp__sub_824ADB28(ctx, base);
+    if (bypass && result != 0)
+        PPC_STORE_U32(self + 28, result);
+}

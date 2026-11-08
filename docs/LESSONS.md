@@ -368,3 +368,10 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
 - The terrain's white ridgelines and speckle, and a white halo round the rider, were FXAA without the texture exponent
   bias (see GPU: shaders). Found by putting intermediate values of the terrain shader on screen (`AR_SHOW_EXPR`): they
   were right, and a resolve dump per post-process pass showed the outlines appear in FXAA's pass (ps 7069403B).
+- Sign-in notice: at boot SSX signs in to the EA servers (state machine `sub_824B1098`, state 10 = done, result at +68)
+  and hands the result to `sub_824ADB28`, which raises the front end's `fe_signin_success` or `fe_signin_failed`
+  (handler table in `sub_8259F3B0`, message 0x7A2E5D3A). The failure was a notice on every boot. Reporting the profile
+  as signed in to Live changed nothing (the EA servers are what fails), and raising neither event left the boot on
+  "Loading" forever: the front end waits for one. So a failure raises the success event and the real result is kept at
+  +28; "Connect to EA Server" still finds the servers missing. Found from the notice's string IDs in the executable
+  (`TXT_NOT_SIGN_IN_TO_FIRST_PARTY_NETWORK`), the code that builds their addresses, and a hook printing the stack.
