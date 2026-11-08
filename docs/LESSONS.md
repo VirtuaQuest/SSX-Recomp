@@ -93,6 +93,13 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   place, so conversions now stop at the rows written since the target was made (draw scissors, clears, syncs; the
   creation clear is uniform, the same in any layout): 5.0 -> 3.0 ms at 1x, 20 -> 11 ms at 2x, 13 ms a frame in all.
   Render scale 2 is still about 20 fps on that GPU (draws 26-35 ms).
+- The conversions then still copied: a depth-stencil copy must be the whole subresource (2048 rows, 8 bytes a texel
+  for D32S8). Now the conversion draws from the target into a scratch that is fast-cleared first, and the two swap
+  resources and views (nothing keeps a render target's views beyond a use). Without SV_StencilRef (NVIDIA) the shader
+  can't write stencil, so targets whose stencil was ever used (draws with stencil on, depth clears with a stencil
+  value) go through an R32F color target and back with depth writes only, leaving stencil in place as the copy did.
+  Swapping those dropped the stencil (rainbow banding on SSX's cliffs); a stencil plane copy was slower than the whole
+  copy. 3.1 -> 1.5 ms a frame at 1x (GPU 13-14 -> 11.4-12.4 ms riding), 11 -> 6 ms at 2x (22-23 fps).
 
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:

@@ -104,6 +104,8 @@ namespace gpu::d3d12
         // Render targets: rows (guest samples) below which they've been written. Below it they hold their creation
         // clear, the same in any layout, so layout conversions stop there.
         uint32_t usedRows = 0;
+        // Depth render targets: stencil may be other than its creation clear (0) somewhere.
+        bool stencilUsed = false;
         uint64_t poolKey = 0; // Its description, for reuse once released (0: not pooled).
         uint32_t mipLevels = 1;
     };
@@ -2939,8 +2941,9 @@ float4 main(float4 position : SV_Position) : SV_Target
         // AR_LOG_LAYOUT=<frame>: the conversions of that frame.
         static const int64_t logFrame = AR_ENV("AR_LOG_LAYOUT") ? atoll(AR_ENV("AR_LOG_LAYOUT")) : -1;
         if (int64_t(g.frameNumber) == logFrame)
-            LOGF_INFO("LAYOUT {} -> {}: {}x{} format {} {} from {}", texture.layout, layout, texture.width, texture.height, uint32_t(texture.format),
-                texture.dsv != UINT32_MAX ? "depth" : "color", why);
+            LOGF_INFO("LAYOUT {} -> {}: {}x{} format {} {} from {}, {} rows written{}", texture.layout, layout, texture.width, texture.height,
+                uint32_t(texture.format), texture.dsv != UINT32_MAX ? "depth" : "color", why, texture.usedRows,
+                texture.stencilUsed ? ", stencil used" : "");
         GpuScope scope{ 0 };
 
         // The sample orders keep each 4x4 block of samples in place, so rows up to the written ones (rounded to 4)
@@ -2955,6 +2958,56 @@ float4 main(float4 position : SV_Position) : SV_Target
         uint32_t hostRows = std::min(texture.height, rows * g_scale);
 
         bool depth = texture.dsv != UINT32_MAX;
+        static const bool noSwap = AR_ENV("AR_NO_LAYOUT_SWAP") != nullptr;
+        struct
+        {
+            uint32_t sourceIndex;
+            uint32_t stencilIndex;
+            uint32_t fromLayout;
+            uint32_t toLayout;
+            uint32_t resolutionScale;
+        } constants{};
+        D3D12_RECT converted{ 0, 0, LONG(texture.width), LONG(hostRows) };
+
+        // Without SV_StencilRef (NVIDIA) the shader can't write stencil, so a depth target whose stencil is in use
+        // can't be swapped: its depth goes into a float color target in the new layout, then back with depth writes
+        // only, and stencil stays where it is (as the copy left it). Two draws over the written rows instead of a
+        // whole copy and a draw.
+        if (!noSwap && depth && texture.stencilUsed && !g.stencilRefSupported)
+        {
+            auto& floats = g.layoutScratch[{ uint32_t(DXGI_FORMAT_R32_FLOAT), texture.width, texture.height }];
+            if (!floats.resource)
+            {
+                floats = CreateTexture(texture.width, texture.height, 1, false, DXGI_FORMAT_R32_FLOAT,
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                if (!floats.resource)
+                    return;
+            }
+            Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            Transition(floats, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto rtv = CpuRtv(floats.rtv);
+            g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            SetViewportAndScissor(texture.width, texture.height, converted);
+            g.list->SetPipelineState(GetLayoutPipeline(DXGI_FORMAT_R32_FLOAT, false));
+            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            constants = { texture.srv, texture.stencilSrv, texture.layout, layout, g_scale };
+            g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+            g.list->DrawInstanced(3, 1, 0, 0);
+
+            Transition(floats, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            auto dsv = CpuDsv(texture.dsv);
+            g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+            SetViewportAndScissor(texture.width, texture.height, converted);
+            g.list->SetPipelineState(GetLayoutPipeline(texture.format, true));
+            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            constants = { floats.srv, floats.srv, layout, layout, g_scale }; // The same layout: a straight copy.
+            g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
+            g.list->DrawInstanced(3, 1, 0, 0);
+            texture.layout = layout;
+            return;
+        }
+
         auto& scratch = g.layoutScratch[{ uint32_t(texture.format), texture.width, texture.height }];
         if (!scratch.resource)
         {
@@ -2965,17 +3018,31 @@ float4 main(float4 position : SV_Position) : SV_Target
                 return;
         }
 
-        Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Transition(scratch, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (hostRows >= texture.height)
+        // The conversion renders the target's texels into the scratch, which then becomes the target (the two swap
+        // resources and views), instead of copying the target into the scratch and rendering back: a depth copy has
+        // to be the whole 2048 row subresource, 17 MB at 1x for SSX's 1040 and 1120 sample wide D32S8 targets, 20 or
+        // so times a frame. The scratch is cleared first (a fast clear), so the rows past the converted ones hold the
+        // creation clear, and so does stencil when the shader can't write it: only targets whose stencil was never
+        // used come here then (a stencil plane copy was slower than the whole copy on a GTX 970). AR_NO_LAYOUT_SWAP
+        // always copies.
+        bool swap = !noSwap;
+        Texture* destination = &texture;
+        uint32_t sourceView = scratch.srv, sourceStencil = scratch.stencilSrv;
+        if (swap)
         {
-            g.list->CopyResource(scratch.resource.Get(), texture.resource.Get());
+            destination = &scratch;
+            sourceView = texture.srv;
+            sourceStencil = texture.stencilSrv;
+            Transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
         else
         {
-            // Depth-stencil copies must be whole subresources.
-            if (depth)
+            Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Transition(scratch, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (hostRows >= texture.height || depth) // Depth-stencil copies must be whole subresources.
+            {
                 g.list->CopyResource(scratch.resource.Get(), texture.resource.Get());
+            }
             else
             {
                 D3D12_TEXTURE_COPY_LOCATION source{ texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
@@ -2983,34 +3050,44 @@ float4 main(float4 position : SV_Position) : SV_Target
                 D3D12_BOX box{ 0, 0, 0, texture.width, hostRows, 1 };
                 g.list->CopyTextureRegion(&dest, 0, 0, 0, &source, &box);
             }
+            Transition(scratch, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
-        Transition(scratch, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         if (depth)
         {
-            Transition(texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-            auto dsv = CpuDsv(texture.dsv);
+            Transition(*destination, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            auto dsv = CpuDsv(destination->dsv);
+            if (swap)
+                g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
             g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
         }
         else
         {
-            Transition(texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            auto rtv = CpuRtv(texture.rtv);
+            Transition(*destination, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto rtv = CpuRtv(destination->rtv);
+            if (swap)
+            {
+                const float black[4] = {};
+                g.list->ClearRenderTargetView(rtv, black, 0, nullptr);
+            }
             g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         }
-        SetViewportAndScissor(texture.width, texture.height, { 0, 0, LONG(texture.width), LONG(hostRows) });
+        SetViewportAndScissor(texture.width, texture.height, converted);
         g.list->SetPipelineState(GetLayoutPipeline(texture.format, depth));
         g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        struct
-        {
-            uint32_t sourceIndex;
-            uint32_t stencilIndex;
-            uint32_t fromLayout;
-            uint32_t toLayout;
-            uint32_t resolutionScale;
-        } constants{ scratch.srv, scratch.stencilSrv, texture.layout, layout, g_scale };
+        constants = { sourceView, sourceStencil, texture.layout, layout, g_scale };
         g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS, UploadConstants(constants));
         g.list->DrawInstanced(3, 1, 0, 0);
+
+        if (swap)
+        {
+            std::swap(texture.resource, scratch.resource);
+            std::swap(texture.state, scratch.state);
+            std::swap(texture.srv, scratch.srv);
+            std::swap(texture.stencilSrv, scratch.stencilSrv);
+            std::swap(texture.rtv, scratch.rtv);
+            std::swap(texture.dsv, scratch.dsv);
+        }
         texture.layout = layout;
     }
 
@@ -3251,6 +3328,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             return nullptr;
 
         LOGF_INFO("render target: EDRAM base {}, pitch {}, format {}{}", base, pitch, format, depth ? " (depth)" : "");
+        texture.usedRows = 0; // Cleared whole below; a pooled texture still has its last use's.
+        texture.stencilUsed = false;
         if (depth)
         {
             g.list->ClearDepthStencilView(CpuDsv(texture.dsv), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
@@ -3803,6 +3882,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 return;
             ConvertLayout(*depthTarget, SurfaceInfo{ registers[RB_SURFACE_INFO] }.MsaaSamples(), "draw depth");
             key.depthFormat = depthTarget->format;
+            if (depthControl & 1)
+                depthTarget->stencilUsed = true;
         }
         else
         {
@@ -5533,6 +5614,8 @@ float4 main(float4 position : SV_Position) : SV_Target
                 Transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 g.list->ClearDepthStencilView(CpuDsv(depth->dsv), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                     float(clear >> 8) / 16777215.0f, UINT8(clear & 0xFF), 1, &hostRect);
+                if (clear & 0xFF)
+                    depth->stencilUsed = true;
                 RecordWrite({ info.Base(), pitch * sampleScale.x, info.Format(), true }, depthRect);
             }
         }

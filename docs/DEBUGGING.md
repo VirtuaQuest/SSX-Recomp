@@ -95,6 +95,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_COMPOSITE` | Assembling textures from consecutive resolves |
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_LAYOUT_BOUND`, `AR_LOG_LAYOUT=<frame>` | Layout conversions of whole render targets instead of their written rows; that frame's conversions (size, format, why) |
+| `AR_NO_LAYOUT_SWAP` | Layout conversions copy the target and draw back into it, instead of drawing into a scratch that takes its place (or, for depth with stencil in use and no SV_StencilRef, through an R32F target) |
 | `AR_GPU_TIMING` (with `AR_LOG_FPS`) | GPU time per frame by kind: layout conversions, syncs, resolves, draws |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |
 | `AR_NO_DEPTH_24` | Keeping depth to the guest's precision (see LESSONS) |
