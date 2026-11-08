@@ -573,12 +573,14 @@ namespace imports
     {
         std::lock_guard lock(g_mutex);
         ContextData data{};
+        // The input buffers aren't valid until the title says so (XMASetInputBuffer0Valid): SSX initializes a
+        // context, enables it and only then fills the buffers and marks them valid. Valid from here, the decoder read
+        // whatever the buffers still held, usually the last sound's packets, decoded with this sound's channel count:
+        // FFmpeg's errors by the thousand, and noise.
         data.SetInputBuffer(0, init->inputBuffer0 != 0 ? VirtualToPhysical(init->inputBuffer0) : 0);
         data.SetInputPacketCount(0, init->inputBuffer0PacketCount);
-        data.SetInputValid(0, init->inputBuffer0 != 0);
         data.SetInputBuffer(1, init->inputBuffer1 != 0 ? VirtualToPhysical(init->inputBuffer1) : 0);
         data.SetInputPacketCount(1, init->inputBuffer1PacketCount);
-        data.SetInputValid(1, init->inputBuffer1 != 0);
         data.SetInputReadOffset(init->inputBufferReadOffset);
         data.w[7] = init->outputBuffer != 0 ? VirtualToPhysical(init->outputBuffer) : 0;
         data.SetOutputBlockCount(init->outputBufferBlockCount);
@@ -641,12 +643,16 @@ namespace imports
 
     uint32_t XMASetInputBuffer0Valid(uint32_t context)
     {
+        if (g_log)
+            LOGF_INFO("XMA {:08X}: input 0 valid", context);
         Change(context, [](ContextData& data) { data.SetInputValid(0, true); });
         return X_STATUS_SUCCESS;
     }
 
     uint32_t XMASetInputBuffer1Valid(uint32_t context)
     {
+        if (g_log)
+            LOGF_INFO("XMA {:08X}: input 1 valid", context);
         Change(context, [](ContextData& data) { data.SetInputValid(1, true); });
         return X_STATUS_SUCCESS;
     }
@@ -655,6 +661,8 @@ namespace imports
 
     uint32_t XMASetOutputBufferValid(uint32_t context)
     {
+        if (g_log)
+            LOGF_INFO("XMA {:08X}: output valid", context);
         Change(context, [](ContextData& data) { data.SetOutputValid(true); });
         return X_STATUS_SUCCESS;
     }
@@ -673,6 +681,8 @@ namespace imports
 
     uint32_t XMAEnableContext(uint32_t context)
     {
+        if (g_log)
+            LOGF_INFO("XMA {:08X}: enable", context);
         std::lock_guard lock(g_mutex);
         auto it = g_contexts.find(context);
         if (it != g_contexts.end())
@@ -684,6 +694,8 @@ namespace imports
     // The decoder works under the same lock, so once this returns it isn't using the context.
     uint32_t XMADisableContext(uint32_t context, uint32_t wait)
     {
+        if (g_log)
+            LOGF_INFO("XMA {:08X}: disable", context);
         std::lock_guard lock(g_mutex);
         auto it = g_contexts.find(context);
         if (it != g_contexts.end())

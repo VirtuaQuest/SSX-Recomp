@@ -126,6 +126,12 @@ public:
             m_peak = 0.0f;
         }
 
+        // AR_DUMP_AUDIO=<file>: the mix as sent, raw 32 bit float stereo at AUDIO_SAMPLE_RATE (to check without
+        // listening, e.g. ffmpeg -f f32le -ar 48000 -ac 2 -i <file> ...).
+        static FILE* dump = []() -> FILE* { const char* path = getenv("AR_DUMP_AUDIO"); return path ? fopen(path, "wb") : nullptr; }();
+        if (dump)
+            fwrite(buffer.data(), sizeof(float), buffer.size(), dump);
+
         XAUDIO2_BUFFER submission{};
         submission.AudioBytes = sizeof(buffer);
         submission.pAudioData = reinterpret_cast<const BYTE*>(buffer.data());

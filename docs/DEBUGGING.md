@@ -115,7 +115,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | Switch | |
 |---|---|
 | `AR_TRACE_IMPORTS=<prefixes>` | Logs calls of imports whose names start with these (comma separated), e.g. `Xam,XMsg` |
-| `AR_LOG_XMA`, `AR_NO_XMA` | XMA contexts as the title sets them up; the decoder off (silent) |
+| `AR_LOG_XMA`, `AR_NO_XMA` | XMA contexts as the title sets them up (init, buffers, valid bits, enable and disable); the decoder off (silent) |
+| `AR_DUMP_AUDIO=<file>` | The final mix as raw 32 bit float stereo at 48 kHz (`ffmpeg -f f32le -ar 48000 -ac 2 -i <file> ...`), to check audio without listening |
 | `AR_CACHE_DRIVE` | Mounts `cache:` (user/cache); off by default, see LESSONS |
 | `AR_NO_HW_THREADS`, `AR_LOG_HW_THREADS` | Guest hardware threads pinned to host logical processors; where threads go |
 | `AR_NO_TICKER_SLEEP`, `AR_LOG_TICKERS` | SSX's ticker threads yield instead of sleeping a millisecond (`kernel/title_hooks.cpp`); log each ticker's interval |

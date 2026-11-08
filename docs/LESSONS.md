@@ -384,6 +384,15 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
 - Audio: SSX drives XMA contexts itself. `kernel/imports/xma.cpp` finds frames (15 bit lengths, across packets and
   buffers) and decodes each in a packet of its own with FFmpeg's XMA2 decoder; FFmpeg's skipped first frame becomes
   silence so sample counts stay exact.
+- XMA input buffers become valid only when the title says so. SSX initializes a context, marks the output valid,
+  sets the buffers and enables it, and only then fills the buffers and calls `XMASetInputBuffer0Valid`. Marked
+  valid at init, they were decoded in between with the last sound's packets still in them, often a stereo sound on a
+  context now set up for mono: 2500 FFmpeg errors in two minutes ("num_vec_coeffs too large", "would have to skip"),
+  broadband noise over gameplay and a peak level at clipping. Found by dumping the packets each context consumed and
+  the single-frame packets fed to FFmpeg, decoding them with the FFmpeg command line (an XMA2 WAV around them), and
+  seeing the failing packets decode cleanly as stereo; then logging the order of the title's calls (`AR_LOG_XMA`).
+  Note when checking a stream offline that FFmpeg stops at its first error rather than reporting many, and that a
+  fresh decoder fails on most frames given alone (they depend on the frames before).
 - Textures: block compressed textures that aren't whole blocks (991x981) are decompressed to RGBA8; upload rows must be
   256 byte aligned (an unaligned copy made the command list fail to close and removed the device, 0x887A0001, after
   which every creation failed). 2D textures now get their stored mip levels (until the packed ones): without them the
