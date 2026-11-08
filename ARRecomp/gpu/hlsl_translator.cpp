@@ -350,6 +350,71 @@ float4 xe_cube(float4 a, float4 b)
         return value;
     }
 
+    // Whether an operand may be an infinity or NaN: it reads a register component that may hold one at this point (in
+    // program order) or anywhere in the shader. Constants, interpolators and fetched values count as finite.
+    bool HlslShaderTranslator::OperandUnsafe(const InstructionOperand& operand) const
+    {
+        if (m_guardAll)
+            return true;
+        if (operand.storage_source != InstructionStorageSource::kRegister)
+            return false;
+        if (operand.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute)
+            return m_unsafe.any();
+        for (uint32_t i = 0; i < operand.component_count; i++)
+        {
+            SwizzleSource component = operand.components[i];
+            if (component <= SwizzleSource::kW && m_unsafe[(operand.storage_index & 127) * 4 + uint32_t(component)])
+                return true;
+        }
+        return false;
+    }
+
+    // Records a register write of a value that may (or can't) be infinite or NaN. While analyzing, the set only
+    // grows. In program order (shaders without jumps, calls or loops), a finite value written unconditionally clears
+    // the components it writes.
+    void HlslShaderTranslator::TrackStore(const InstructionResult& result, bool unsafe)
+    {
+        if (result.storage_target != InstructionStorageTarget::kRegister || result.GetUsedWriteMask() == 0 ||
+            (!m_analyzing && !m_programOrder))
+            return;
+        // Saturated results are finite (saturate turns NaN into 0), and so are the constants 0 and 1.
+        unsafe = unsafe && !result.is_clamped;
+        std::bitset<512> before = m_unsafe;
+        if (result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute)
+        {
+            if (unsafe)
+                m_unsafe.set();
+        }
+        else
+        {
+            bool conditional = m_execConditional || m_predicated;
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                if (!(result.GetUsedWriteMask() & (1u << i)))
+                    continue;
+                uint32_t bit = (result.storage_index & 127) * 4 + i;
+                if (unsafe && result.components[i] <= SwizzleSource::kW)
+                    m_unsafe.set(bit);
+                else if (!m_analyzing && !conditional)
+                    m_unsafe.reset(bit);
+            }
+        }
+        m_unsafeChanged |= m_unsafe != before;
+    }
+
+    // Shader model 3 multiplication makes zero times anything zero, also infinity and NaN, and xe_mul does that with
+    // a select, which also keeps the host from fusing a multiply and an add. Operands that can't be infinite or NaN
+    // multiply plainly: 0 times a finite value is 0 anyway.
+    std::string HlslShaderTranslator::Mul(const std::string& a, const std::string& b, bool unsafe) const
+    {
+        return unsafe ? fmt::format("xe_mul({}, {})", a, b) : fmt::format("({} * {})", a, b);
+    }
+
+    std::string HlslShaderTranslator::Dot(const std::string& a, const std::string& b, bool unsafe) const
+    {
+        return unsafe ? fmt::format("xe_dp({}, {})", a, b) : fmt::format("dot({}, {})", a, b);
+    }
+
     std::string HlslShaderTranslator::OperandComponent(const InstructionOperand& operand, uint32_t component)
     {
         return fmt::format("{}.{}", Operand(operand), COMPONENTS[component]);
@@ -378,6 +443,8 @@ float4 xe_cube(float4 a, float4 b)
     // Writes a float4 value through the result's write mask; components can also be set to 0 or 1.
     void HlslShaderTranslator::StoreResult(const InstructionResult& result, const std::string& value)
     {
+        TrackStore(result, m_storeUnsafe);
+        m_storeUnsafe = false;
         uint32_t mask = result.GetUsedWriteMask();
         std::string target = ResultTarget(result);
         if (mask == 0 || target.empty())
@@ -408,6 +475,7 @@ float4 xe_cube(float4 a, float4 b)
 
     void HlslShaderTranslator::BeginPredicate(bool predicated, bool condition)
     {
+        m_predicated = predicated;
         if (!predicated)
             return;
 
@@ -418,6 +486,7 @@ float4 xe_cube(float4 a, float4 b)
 
     void HlslShaderTranslator::EndPredicate(bool predicated)
     {
+        m_predicated = false;
         if (!predicated)
             return;
 
@@ -795,6 +864,9 @@ float4 xe_cube(float4 a, float4 b)
 
         auto v = [&](uint32_t i) { return Operand(instr.vector_operands[i]); };
         auto s = [&](uint32_t i, uint32_t component) { return OperandComponent(instr.scalar_operands[i], component); };
+        auto vu = [&](uint32_t i) { return i < instr.vector_operand_count && OperandUnsafe(instr.vector_operands[i]); };
+        auto su = [&](uint32_t i) { return i < instr.scalar_operand_count && OperandUnsafe(instr.scalar_operands[i]); };
+        bool vectorUnsafe = false, scalarUnsafe = false;
 
         if (hasVector)
         {
@@ -806,7 +878,7 @@ float4 xe_cube(float4 a, float4 b)
             switch (instr.vector_opcode)
             {
             case AluVectorOpcode::kAdd: value = fmt::format("{} + {}", a, b); break;
-            case AluVectorOpcode::kMul: value = fmt::format("xe_mul({}, {})", a, b); break;
+            case AluVectorOpcode::kMul: value = Mul(a, b, vu(0) || vu(1)); break;
             case AluVectorOpcode::kMax: value = a == b ? a : fmt::format("max({}, {})", a, b); break;
             case AluVectorOpcode::kMin: value = a == b ? a : fmt::format("min({}, {})", a, b); break;
             case AluVectorOpcode::kSeq: value = fmt::format("float4({} == {})", a, b); break;
@@ -816,14 +888,18 @@ float4 xe_cube(float4 a, float4 b)
             case AluVectorOpcode::kFrc: value = fmt::format("frac({})", a); break;
             case AluVectorOpcode::kTrunc: value = fmt::format("trunc({})", a); break;
             case AluVectorOpcode::kFloor: value = fmt::format("floor({})", a); break;
-            case AluVectorOpcode::kMad: value = fmt::format("xe_mul({}, {}) + {}", a, b, c); break;
+            case AluVectorOpcode::kMad: value = fmt::format("{} + {}", Mul(a, b, vu(0) || vu(1)), c); break;
             case AluVectorOpcode::kCndEq: value = fmt::format("select({} == 0.0f, {}, {})", a, b, c); break;
             case AluVectorOpcode::kCndGe: value = fmt::format("select({} >= 0.0f, {}, {})", a, b, c); break;
             case AluVectorOpcode::kCndGt: value = fmt::format("select({} > 0.0f, {}, {})", a, b, c); break;
-            case AluVectorOpcode::kDp4: value = fmt::format("xe_dp({}, {}).xxxx", a, b); break;
-            case AluVectorOpcode::kDp3: value = fmt::format("xe_dp(float4(({}).xyz, 0.0f), float4(({}).xyz, 0.0f)).xxxx", a, b); break;
+            case AluVectorOpcode::kDp4: value = fmt::format("({}).xxxx", Dot(a, b, vu(0) || vu(1))); break;
+            case AluVectorOpcode::kDp3:
+                value = fmt::format("({}).xxxx", Dot(fmt::format("float4(({}).xyz, 0.0f)", a), fmt::format("float4(({}).xyz, 0.0f)", b),
+                    vu(0) || vu(1)));
+                break;
             case AluVectorOpcode::kDp2Add:
-                value = fmt::format("(xe_dp(float4(({}).xy, 0.0f, 0.0f), float4(({}).xy, 0.0f, 0.0f)) + ({}).x).xxxx", a, b, c);
+                value = fmt::format("({} + ({}).x).xxxx", Dot(fmt::format("float4(({}).xy, 0.0f, 0.0f)", a),
+                    fmt::format("float4(({}).xy, 0.0f, 0.0f)", b), vu(0) || vu(1)), c);
                 break;
             case AluVectorOpcode::kCube: value = fmt::format("xe_cube({}, {})", a, b); break;
             case AluVectorOpcode::kMax4:
@@ -860,7 +936,7 @@ float4 xe_cube(float4 a, float4 b)
             case AluVectorOpcode::kDst:
                 Line("xe_temp = {};", a);
                 Line("xe_temp2 = {};", b);
-                value = "float4(1.0f, xe_mul(xe_temp.y, xe_temp2.y), xe_temp.z, xe_temp2.w)";
+                value = fmt::format("float4(1.0f, {}, xe_temp.z, xe_temp2.w)", Mul("xe_temp.y", "xe_temp2.y", vu(0) || vu(1)));
                 break;
             case AluVectorOpcode::kMaxA:
                 Line("xe_temp = {};", a);
@@ -874,6 +950,13 @@ float4 xe_cube(float4 a, float4 b)
             }
 
             Line("xe_vector = {};", value);
+
+            // Comparisons, kills and predicate sets give finite values; anything else may carry its operands'.
+            bool compares = instr.vector_opcode == AluVectorOpcode::kSeq || instr.vector_opcode == AluVectorOpcode::kSgt ||
+                instr.vector_opcode == AluVectorOpcode::kSge || instr.vector_opcode == AluVectorOpcode::kSne ||
+                (instr.vector_opcode >= AluVectorOpcode::kSetpEqPush && instr.vector_opcode <= AluVectorOpcode::kSetpGePush) ||
+                (instr.vector_opcode >= AluVectorOpcode::kKillEq && instr.vector_opcode <= AluVectorOpcode::kKillNe);
+            vectorUnsafe = !compares && (vu(0) || vu(1) || vu(2));
         }
 
         if (hasScalar)
@@ -883,8 +966,8 @@ float4 xe_cube(float4 a, float4 b)
             {
             case AluScalarOpcode::kAdds: value = fmt::format("{} + {}", s(0, 0), s(0, 1)); break;
             case AluScalarOpcode::kAddsPrev: value = fmt::format("{} + xe_ps", s(0, 0)); break;
-            case AluScalarOpcode::kMuls: value = fmt::format("xe_mul({}, {})", s(0, 0), s(0, 1)); break;
-            case AluScalarOpcode::kMulsPrev: value = fmt::format("xe_mul({}, xe_ps)", s(0, 0)); break;
+            case AluScalarOpcode::kMuls: value = Mul(s(0, 0), s(0, 1), su(0)); break;
+            case AluScalarOpcode::kMulsPrev: value = Mul(s(0, 0), "xe_ps", su(0) || m_unsafePs || m_guardAll); break;
             case AluScalarOpcode::kMulsPrev2:
                 Line("xe_temp.xy = float2({}, {});", s(0, 0), s(0, 1));
                 value = "(xe_ps == -3.402823466e+38f || isinf(xe_ps) || isnan(xe_ps) || isinf(xe_temp.y) || isnan(xe_temp.y) || xe_temp.y <= 0.0f) ? -3.402823466e+38f : xe_mul(xe_temp.x, xe_ps)";
@@ -978,7 +1061,7 @@ float4 xe_cube(float4 a, float4 b)
             case AluScalarOpcode::kSqrt: value = fmt::format("sqrt({})", s(0, 0)); break;
             case AluScalarOpcode::kMulsc0:
             case AluScalarOpcode::kMulsc1:
-                value = fmt::format("xe_mul({}, {})", s(0, 0), s(1, 0)); break;
+                value = Mul(s(0, 0), s(1, 0), su(0) || su(1)); break;
             case AluScalarOpcode::kAddsc0:
             case AluScalarOpcode::kAddsc1:
                 value = fmt::format("{} + {}", s(0, 0), s(1, 0)); break;
@@ -995,14 +1078,46 @@ float4 xe_cube(float4 a, float4 b)
             }
 
             Line("xe_ps_next = {};", value);
+
+            switch (instr.scalar_opcode)
+            {
+            // Results that can be infinite or NaN from finite operands (or the largest float, which overflows to one).
+            case AluScalarOpcode::kExp: case AluScalarOpcode::kLog: case AluScalarOpcode::kLogc:
+            case AluScalarOpcode::kRcp: case AluScalarOpcode::kRcpc: case AluScalarOpcode::kRcpf:
+            case AluScalarOpcode::kRsq: case AluScalarOpcode::kRsqc: case AluScalarOpcode::kRsqf:
+            case AluScalarOpcode::kSqrt: case AluScalarOpcode::kMulsPrev2: case AluScalarOpcode::kSetpClr:
+                scalarUnsafe = true;
+                break;
+            case AluScalarOpcode::kSeqs: case AluScalarOpcode::kSgts: case AluScalarOpcode::kSges: case AluScalarOpcode::kSnes:
+            case AluScalarOpcode::kSetpEq: case AluScalarOpcode::kSetpNe: case AluScalarOpcode::kSetpGt: case AluScalarOpcode::kSetpGe:
+            case AluScalarOpcode::kKillsEq: case AluScalarOpcode::kKillsGt: case AluScalarOpcode::kKillsGe:
+            case AluScalarOpcode::kKillsNe: case AluScalarOpcode::kKillsOne:
+                break;
+            case AluScalarOpcode::kAddsPrev: case AluScalarOpcode::kMulsPrev: case AluScalarOpcode::kSubsPrev:
+            case AluScalarOpcode::kRetainPrev:
+                scalarUnsafe = su(0) || m_unsafePs;
+                break;
+            default:
+                scalarUnsafe = su(0) || su(1);
+                break;
+            }
         }
 
         if (hasVector)
+        {
+            m_storeUnsafe = vectorUnsafe;
             StoreResult(instr.vector_and_constant_result, "xe_vector");
+        }
         if (hasScalar)
         {
             Line("xe_ps = xe_ps_next;");
+            m_storeUnsafe = scalarUnsafe;
             StoreResult(instr.scalar_result, "xe_ps.xxxx");
+            m_unsafeChanged |= scalarUnsafe && !m_unsafePs;
+            if (m_analyzing || (m_programOrder && (m_execConditional || instr.is_predicated)))
+                m_unsafePs |= scalarUnsafe;
+            else if (m_programOrder)
+                m_unsafePs = scalarUnsafe;
         }
 
         if (writesPredicate)
@@ -1217,6 +1332,24 @@ XeOutput main(uint vertexId : SV_VertexID)
     {
         HlslShaderTranslator translator;
         auto* translation = shader.GetOrCreateTranslation(0);
+        // First find which register components may hold infinities or NaN anywhere, translating until that set stops
+        // growing (loops can carry a value back to earlier instructions). Shaders addressing registers by a0 or aL guard every
+        // multiplication, and AR_NO_FAST_MUL does everywhere.
+        static const bool guardAll = getenv("AR_NO_FAST_MUL") != nullptr;
+        translator.SetGuardAllMultiplies(guardAll || shader.uses_register_dynamic_addressing());
+        for (int pass = 0; pass < 16; pass++)
+        {
+            translator.SetAnalyzing(true);
+            translator.TranslateAnalyzedShader(*translation);
+            if (!translator.UnsafeChanged())
+                break;
+        }
+        // Without jumps, calls or loops the instructions run in program order, so the final translation can follow
+        // values from the start instead (registers are reused: a component may be a reciprocal at one point and a
+        // texture sample later).
+        translator.SetAnalyzing(false);
+        if (shader.label_addresses().empty())
+            translator.FollowProgramOrder();
         if (!translator.TranslateAnalyzedShader(*translation))
             return {};
 

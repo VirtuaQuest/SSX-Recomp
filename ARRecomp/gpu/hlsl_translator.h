@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bitset>
 #include <string>
 #include "xenia/gpu/shader_translator.h"
 
@@ -24,6 +25,13 @@ namespace gpu
     {
     public:
         std::string TakeSource() { return std::move(m_out); }
+
+        // Which register components may hold an infinity or NaN (see TranslateShaderToHlsl): while analyzing,
+        // translation only grows that set; afterwards, multiplications of values that can't be either are plain.
+        void SetAnalyzing(bool analyzing) { m_analyzing = analyzing; m_unsafeChanged = false; }
+        bool UnsafeChanged() const { return m_unsafeChanged; }
+        void FollowProgramOrder() { m_programOrder = true; m_unsafe.reset(); m_unsafePs = false; }
+        void SetGuardAllMultiplies(bool all) { m_guardAll = all; }
 
     protected:
         void Reset() override;
@@ -55,8 +63,20 @@ namespace gpu
         void OpenCase(uint32_t cfIndex);
         void JumpTo(uint32_t cfIndex);
         static std::string BoolConstant(uint32_t index);
+        bool OperandUnsafe(const xe::gpu::InstructionOperand& operand) const;
+        void TrackStore(const xe::gpu::InstructionResult& result, bool unsafe);
+        std::string Mul(const std::string& a, const std::string& b, bool unsafe) const;
+        std::string Dot(const std::string& a, const std::string& b, bool unsafe) const;
 
         std::string m_body;
+        std::bitset<512> m_unsafe; // Register components (register * 4 + component).
+        bool m_unsafePs = false;
+        bool m_analyzing = false;
+        bool m_unsafeChanged = false;
+        bool m_guardAll = false;
+        bool m_programOrder = false;
+        bool m_predicated = false;
+        bool m_storeUnsafe = false; // For the next StoreResult.
         std::string m_out;
         int m_indent = 0;
         bool m_caseOpen = false;

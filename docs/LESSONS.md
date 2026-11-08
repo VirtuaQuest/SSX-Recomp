@@ -115,6 +115,17 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   applies, the frame at 2x went 32-36 -> 29-31.5 ms riding (one shader 3.2 -> 1.8 ms). The shadow filter itself
   didn't get faster (4 ms at 2x, measured by skipping it with `AR_SKIP_PS`): at 2x the shadow maps are scaled too, as
   every EDRAM target is, so it and the caster draws (depth only, 6 ms at 2x) grow with the square of the scale.
+- Shader model 3 multiplication (zero times anything, infinity and NaN too, is zero) as a select on every `mul`,
+  `mad` and `dp` cost 4 of 31 ms at 2x: plain multiplies measured 27.4. A cheaper test (`min(abs(a), abs(b)) == 0`)
+  saved nothing, so the cost isn't the compare: the select sits between the multiply and the add and stops them
+  fusing. The rule only matters when an operand can be infinite or NaN, so the translator now tracks which register
+  components can be: results of `rcp`, `rsq`, `log`, `exp`, `sqrt` and the scalar ops yielding the largest float, and
+  whatever is computed from them, unless saturated (constants, interpolators and fetches count as finite). Shaders
+  without jumps, calls or loops (most of SSX's pixel shaders) are followed in program order, where a finite write
+  clears a component, since registers are reused; the others use the components unsafe anywhere, to a fixed point.
+  A first try per register and flow-insensitive guarded almost everything (a reciprocal in `r0.y` tainted `r0`).
+  Result: 29-31.5 -> 27.6-29.8 ms at 2x, the hot shaders keep about half their guards (the divide by w chain).
+  `AR_NO_FAST_MUL` guards every multiplication again.
 
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:
