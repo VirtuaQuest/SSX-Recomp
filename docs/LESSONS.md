@@ -454,6 +454,18 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   "Loading" forever: the front end waits for one. So a failure raises the success event and the real result is kept at
   +28; "Connect to EA Server" still finds the servers missing. Found from the notice's string IDs in the executable
   (`TXT_NOT_SIGN_IN_TO_FIRST_PARTY_NETWORK`), the code that builds their addresses, and a hook printing the stack.
+- Offline: without EA's servers everything but Global Events and SSX Rivals works (World Tour, Explore, RiderNet's
+  badges and settings, saves). Those two are server content (event lists, entry fees, payouts, leaderboards, friends'
+  scores): no bypass opens them, only a stand-in for EA's Blaze servers would, and none exists for SSX. Even with a
+  Live sign-in reported (`--online`), SSX stops before any DNS lookup, at EA's login (XNetLogonGetTitleID and
+  MachineID). So the runtime presents the game as offline: the main menu's "Connect to EA Server" button is hidden
+  (the `showConnectToServerButton` field of `online_pass_data`, published by sub_825D38A8 through sub_82F948C8), and
+  the online messages (TXT_ONLINE_REQUIRED for Global Events, TXT_NOT_SIGN_IN_TO_FIRST_PARTY_NETWORK,
+  TXT_ACTIVITY_FEED_OFFLINE for Rivals, TXT_MAIN_MENU_GLOBAL_EVENTS_DESC) say the servers are shut down instead of
+  asking for a sign-in, written over the English text in the lookup's result (sub_8256A878). Found from the Flash
+  movies in fecache.big (CFX: zlib compressed SWF) and the text IDs a run looks up (`AR_LOG_TEXT`). Field names
+  like these are built from a base register plus offsets, so look for them by following address arithmetic, not only
+  lis/addi pairs.
 - Trails: everything that moved left a fading imprint, in menus and riding. SSX tone maps with a per-pixel exposure
   that follows the scene over time: a 280x146 16 bit log-luminance texture (0CED0000) blended toward the current
   frame's (0CEB8000, ps 28F5CFF7, about 2.5% a frame at 60 fps), then mipmapped by the title (140x73 down to 1x1,

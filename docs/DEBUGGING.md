@@ -126,6 +126,8 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_CACHE_DRIVE` | Mounts `cache:` (user/cache); off by default, see LESSONS |
 | `AR_NO_HW_THREADS`, `AR_LOG_HW_THREADS` | Guest hardware threads pinned to host logical processors; where threads go |
 | `AR_NO_TICKER_SLEEP`, `AR_LOG_TICKERS` | SSX's ticker threads yield instead of sleeping a millisecond (`kernel/title_hooks.cpp`); log each ticker's interval |
+| `AR_NO_OFFLINE_MODE` | SSX's main menu shows "Connect to EA Server" again, and its online messages say to sign in to Xbox LIVE (`kernel/title_hooks.cpp`) |
+| `AR_LOG_TEXT` | Every localized text lookup of SSX's (ID and English text), to find what a screen shows |
 | `AR_NO_SIGNIN_BYPASS` | SSX shows its "You must be signed in to Xbox LIVE and the EA Servers" notice at boot again (`kernel/title_hooks.cpp`) |
 | `AR_NO_KEYSTROKE_DEVICES` | Keystroke reads ignore their device flags (pad keys go to keyboard-only reads too) |
 | `AR_CRASH_DUMP=<registers>` | 1 KB of guest memory where these registers (numbers, comma separated) point, after a crash |
