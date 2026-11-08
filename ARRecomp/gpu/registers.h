@@ -47,6 +47,7 @@ namespace gpu::reg
     constexpr uint32_t RB_BLENDCONTROL0 = 0x2201;
     constexpr uint32_t RB_COLORCONTROL = 0x2202;
     constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204;
+    constexpr uint32_t PA_CL_UCP_0_X = 0x2388; // Six user clip planes, X Y Z W each.
     constexpr uint32_t PA_SU_SC_MODE_CNTL = 0x2205;
     constexpr uint32_t PA_CL_VTE_CNTL = 0x2206;
     constexpr uint32_t RB_MODECONTROL = 0x2208;

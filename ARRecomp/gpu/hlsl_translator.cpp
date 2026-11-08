@@ -24,13 +24,14 @@ cbuffer XeSystemConstants : register(b0)
     uint xe_alpha_func;
     uint xe_gamma_targets;
     float xe_resolution_scale; // Internal resolution scale: host pixels per guest pixel in each direction.
-    float xe_padding;
+    uint xe_user_clip_mask; // User clip planes in use (PA_CL_CLIP_CNTL ucp_ena).
     float4 xe_color_exp_bias;
     uint4 xe_textures[32];          // Descriptor index, sampler index, swizzle, sign/gamma flags.
     int4 xe_vertex_data_offsets[24]; // Byte offset from a guest address to the draw's vertex data.
     float4 xe_texture_transforms[32]; // UV scale (xy) and offset (zw) onto the host texture.
     float4 xe_point; // Point sprites: constant diameter (xy), per-vertex diameter range (zw), in pixels.
     float4 xe_point_ndc; // NDC radius of a point one pixel in diameter (xy).
+    float4 xe_user_clip_planes[6]; // PA_CL_UCP_n, against the guest's clip space position.
 };
 
 cbuffer XeFloatConstants : register(b1)
@@ -1222,6 +1223,8 @@ struct XeOutput
     float4 position : SV_Position;
     float4 interpolators[16] : TEXCOORD0;
     float4 extra : TEXCOORD16; // Point diameter (x, negative when the shader doesn't write it).
+    float4 clip0 : SV_ClipDistance0; // User clip planes 0-3 and 4-5 (1 for planes not in use).
+    float2 clip1 : SV_ClipDistance1;
 };
 
 XeOutput main(uint vertexId : SV_VertexID)
@@ -1339,6 +1342,13 @@ XeOutput main(uint vertexId : SV_VertexID)
     if (xe_flags & XE_FLAG_Z_NOT_DIVIDED)
         position.z *= position.w;
     output.position = float4(position.xyz * xe_ndc_scale.xyz + position.w * xe_ndc_offset.xyz, position.w);
+    // User clip planes, in the guest's clip space: SSX cuts terrain and rail pieces with plane 0, and without it
+    // they showed as extra polygons over the slopes and outlines on rails.
+    float xe_clip[6];
+    [unroll] for (uint p = 0u; p < 6u; p++)
+        xe_clip[p] = ((xe_user_clip_mask >> p) & 1u) ? dot(position, xe_user_clip_planes[p]) : 1.0f;
+    output.clip0 = float4(xe_clip[0], xe_clip[1], xe_clip[2], xe_clip[3]);
+    output.clip1 = float2(xe_clip[4], xe_clip[5]);
     output.interpolators = xe_o;
     output.extra = float4(xe_point_size.x, 0.0f, 0.0f, 0.0f);
 )";

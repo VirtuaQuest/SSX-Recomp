@@ -64,15 +64,16 @@ namespace gpu::d3d12
         uint32_t alphaFunc;
         uint32_t gammaTargets;
         float resolutionScale;
-        float padding;
+        uint32_t userClipMask;
         float colorExpBias[4];
         uint32_t textures[32][4];
         int32_t vertexDataOffsets[96];
         float textureTransforms[32][4]; // UV scale and offset, for textures inside larger resolved textures.
         float point[4]; // Constant diameter x, y, per-vertex diameter minimum, maximum.
         float pointNdc[4]; // NDC radius per pixel of diameter x, y.
+        float userClipPlanes[6][4];
     };
-    static_assert(sizeof(SystemConstants) == 2448);
+    static_assert(sizeof(SystemConstants) == 2544);
 
     enum RootParameter : uint32_t
     {
@@ -1281,6 +1282,8 @@ struct Vertex
     float4 position : SV_Position;
     float4 interpolators[16] : TEXCOORD0;
     float4 extra : TEXCOORD16;
+    float4 clip0 : SV_ClipDistance0;
+    float2 clip1 : SV_ClipDistance1;
 };
 
 // Rectangle lists give three corners of each rectangle; the fourth is opposite the corner where the two shorter
@@ -1303,6 +1306,8 @@ void main(triangle Vertex input[3], inout TriangleStream<Vertex> stream)
     [unroll] for (uint i = 0u; i < 16u; i++)
         fourth.interpolators[i] = input[a].interpolators[i] + input[b].interpolators[i] - input[corner].interpolators[i];
     fourth.extra = input[corner].extra;
+    fourth.clip0 = input[a].clip0 + input[b].clip0 - input[corner].clip0;
+    fourth.clip1 = input[a].clip1 + input[b].clip1 - input[corner].clip1;
 
     stream.Append(input[corner]);
     stream.Append(input[a]);
@@ -1325,6 +1330,8 @@ struct Vertex
     float4 position : SV_Position;
     float4 interpolators[16] : TEXCOORD0;
     float4 extra : TEXCOORD16;
+    float4 clip0 : SV_ClipDistance0;
+    float2 clip1 : SV_ClipDistance1;
 };
 
 [maxvertexcount(4)]
@@ -4635,10 +4642,50 @@ float4 main(float4 position : SV_Position) : SV_Target
         static const int highlightPrimitive = AR_ENV("AR_HIGHLIGHT_PRIM") ? atoi(AR_ENV("AR_HIGHLIGHT_PRIM")) : -1;
         if (int(draw.initiator.PrimType()) == highlightPrimitive)
             system.flags |= 16;
-        // AR_HIGHLIGHT_PS=<hash prefix>: draws with that pixel shader output solid magenta.
-        static const char* highlightShader = AR_ENV("AR_HIGHLIGHT_PS");
-        if (highlightShader && pixelShader && fmt::format("{:016X}", pixelShader->hash).rfind(highlightShader, 0) == 0)
-            system.flags |= 16;
+        // User clip planes (PA_CL_CLIP_CNTL ucp_ena, planes from PA_CL_UCP_0_X on), as in Xenia: none while clipping is
+        // disabled, and cull-only planes (whole primitives) are left alone. AR_NO_USER_CLIP_PLANES turns them off.
+        {
+            static const bool noUserClip = AR_ENV("AR_NO_USER_CLIP_PLANES") != nullptr;
+            uint32_t clipControl = registers[PA_CL_CLIP_CNTL];
+            uint32_t mask = clipControl & 0x3F;
+            if (noUserClip || (clipControl & (1u << 16)) || (clipControl & (1u << 17)))
+            {
+                if (mask && (clipControl & (1u << 17)) && !(clipControl & (1u << 16)) && g.warnedFormats.insert(0x400).second)
+                    LOGF_WARNING("cull-only user clip planes are not supported (clip control {:08X})", clipControl);
+                mask = 0;
+            }
+            system.userClipMask = mask;
+            for (uint32_t i = 0; i < 6; i++)
+            {
+                if ((mask >> i) & 1)
+                {
+                    for (uint32_t c = 0; c < 4; c++)
+                        system.userClipPlanes[i][c] = RegisterFloat(registers, PA_CL_UCP_0_X + i * 4 + c);
+                }
+            }
+        }
+        // AR_HIGHLIGHT_PS=<hash prefixes, comma separated>: draws with those pixel shaders output solid magenta.
+        static const std::vector<std::string> highlightShaders = []
+            {
+                std::vector<std::string> list;
+                if (const char* text = AR_ENV("AR_HIGHLIGHT_PS"))
+                {
+                    std::stringstream stream(text);
+                    std::string item;
+                    while (std::getline(stream, item, ','))
+                        list.push_back(item);
+                }
+                return list;
+            }();
+        if (pixelShader && !highlightShaders.empty())
+        {
+            std::string hash = fmt::format("{:016X}", pixelShader->hash);
+            for (const auto& prefix : highlightShaders)
+            {
+                if (hash.rfind(prefix, 0) == 0)
+                    system.flags |= 16;
+            }
+        }
         // AR_NO_DEPTH_24: depth keeps the host's precision (decals fight with the surfaces under them). Shadow maps have no decals.
         static const bool depth24 = !AR_ENV("AR_NO_DEPTH_24");
         if (depth24 && key.depthFormat == DXGI_FORMAT_D32_FLOAT_S8X24_UINT && DepthInfo{ registers[RB_DEPTH_INFO] }.Base() != 128)
@@ -5020,6 +5067,13 @@ float4 main(float4 position : SV_Position) : SV_Target
                 }
             }
             LOGF_INFO("  colorcontrol {:08X} clip {:08X}", uint32_t(registers[RB_COLORCONTROL]), uint32_t(registers[PA_CL_CLIP_CNTL]));
+            for (uint32_t i = 0; i < 6; i++)
+            {
+                if ((registers[PA_CL_CLIP_CNTL] >> i) & 1)
+                    LOGF_INFO("  user clip plane {}: {} {} {} {}", i, RegisterFloat(registers, PA_CL_UCP_0_X + i * 4),
+                        RegisterFloat(registers, PA_CL_UCP_0_X + i * 4 + 1), RegisterFloat(registers, PA_CL_UCP_0_X + i * 4 + 2),
+                        RegisterFloat(registers, PA_CL_UCP_0_X + i * 4 + 3));
+            }
             LOGF_INFO("  line {:08X} point {:08X} {:08X}", uint32_t(registers[0x2282]), uint32_t(registers[PA_SU_POINT_SIZE]),
                 uint32_t(registers[PA_SU_POINT_MINMAX]));
             LOGF_INFO("  surface {:08X} color {:08X} depth {:08X} window {:08X} vport {} {} {} {}", uint32_t(registers[RB_SURFACE_INFO]),
