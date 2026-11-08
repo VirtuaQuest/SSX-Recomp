@@ -72,6 +72,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_PROFILE` | Per-stage draw timing every 300 frames (adds clock reads per draw) |
 | `AR_LOG_FPS` | Frame rate every 300 frames and the GPU thread's busy time every 5 s, without the per-stage cost |
 | `AR_GPU_TIMING` | GPU time per frame, split into layout conversions, render target syncs, resolves, composites and draws |
+| `AR_GPU_PASSES=1` or `=2` (with `AR_GPU_TIMING`) | Also the 16 costliest render target bindings (1) or pixel shaders (2): GPU ms and draws a frame, from a timestamp where each starts (work between them, resolves and conversions, counts too) |
 | `AR_HOST_PROFILE=<thread name part>` | Samples host threads, e.g. `command` for the GPU thread (no spaces) |
 | `AR_THREAD_PROFILE` | Samples guest threads (slows the game; don't judge frame rates with it) |
 | `AR_LOG_SWAP_LATENCY`, `AR_LOG_FENCES`, `AR_LOG_GPU_WAITS`, `AR_LOG_IBS` | Swap latency, fences, waits, indirect buffers |
@@ -95,6 +96,7 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_COMPOSITE` | Assembling textures from consecutive resolves |
 | `AR_NO_COLOR_TO_DEPTH`, `AR_NO_LAYOUT` | Colour to depth EDRAM aliasing, MSAA layout conversion |
 | `AR_NO_LAYOUT_BOUND`, `AR_LOG_LAYOUT=<frame>` | Layout conversions of whole render targets instead of their written rows; that frame's conversions (size, format, why) |
+| `AR_NO_EARLY_DEPTH` | Pixel shaders output depth rounded to the guest's 24 bit float again (`xe_depth_24`), which costs early depth rejection |
 | `AR_NO_LAYOUT_SWAP` | Layout conversions copy the target and draw back into it, instead of drawing into a scratch that takes its place (or, for depth with stencil in use and no SV_StencilRef, through an R32F target) |
 | `AR_GPU_TIMING` (with `AR_LOG_FPS`) | GPU time per frame by kind: layout conversions, syncs, resolves, draws |
 | `AR_NO_POINT_SNAP`, `AR_NO_FILTER_OVERRIDE` | Point sample snapping, instruction filter overrides |

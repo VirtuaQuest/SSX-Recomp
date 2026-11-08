@@ -100,6 +100,14 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   value) go through an R32F color target and back with depth writes only, leaving stencil in place as the copy did.
   Swapping those dropped the stencil (rainbow banding on SSX's cliffs); a stencil plane copy was slower than the whole
   copy. 3.1 -> 1.5 ms a frame at 1x (GPU 13-14 -> 11.4-12.4 ms riding), 11 -> 6 ms at 2x (22-23 fps).
+- Every pixel shader wrote depth (`SV_DepthLessEqual`, rounded to the guest's 24 bit float for Anarchy Reigns'
+  decals). Even the conservative output cost early depth rejection on the GTX 970: without it, draws 8.8-9.7 ->
+  6.8-7.4 ms at 1x (GPU 9.4-10.2 ms riding) and 2x went from about 22 to 30 fps. SSX's painted snow markings and
+  trails showed no fighting without the rounding; `AR_NO_EARLY_DEPTH` brings it back. (SSX's depth tests are
+  mostly GEQUAL: reversed depth.)
+- Tried and no faster on that GPU, so not kept: writing the pixel parameter register with constant indices instead
+  of `xe_r[xe_param_gen_register]`, and texture indices without `NonUniformResourceIndex`. `AR_GPU_PASSES=2` shows
+  where draw time goes: SSX's 4x4 shadow filter passes (17 fetches a pixel, full screen) are the costliest single draws.
 
 The host renderer is CPU bound: about 5000 draws a frame, each needing state translation, constants, vertex data and
 texture lookups. What mattered, roughly in order:

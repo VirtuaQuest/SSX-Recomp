@@ -491,7 +491,15 @@ namespace gpu::d3d12
         std::vector<MirrorCopy> mirrorCopies;
         uint64_t mirrorUploadStart = 0, mirrorCacheStart = 0; // Where this submission's writes started.
         uint64_t mirrorBytes = 0;
-        std::vector<uint8_t> scopeCategories[FRAME_COUNT];
+        std::vector<std::pair<uint8_t, uint32_t>> scopeCategories[FRAME_COUNT]; // Category and first timestamp.
+        // AR_GPU_PASSES: a timestamp where each render target binding starts (timestamp, binding, draws).
+        struct PassMark
+        {
+            uint32_t timestamp;
+            uint64_t label;
+            uint32_t draws;
+        };
+        std::vector<PassMark> passMarks[FRAME_COUNT];
         uint32_t scopeDepth = 0;
         // Released textures by description with the frame they were released in. Creating and destroying resources
         // is slow (games resolve different sizes to the same address every frame), so they are reused.
@@ -521,6 +529,7 @@ namespace gpu::d3d12
     struct Profile
     {
         double draw, textures, vertices, present, presentWait, gpu, gpuScopes[4];
+        std::map<uint64_t, std::pair<double, uint32_t>> passes; // AR_GPU_PASSES: GPU ms and draws by render target binding.
         double constants, indices, pipeline, record, targets, setup, prepare;
         uint32_t draws, flushes, textureLookups, textureMisses, textureUploads;
         double textureHash, textureDecode;
@@ -830,9 +839,18 @@ namespace gpu::d3d12
                 const auto& categories = g.scopeCategories[g.frameIndex];
                 for (size_t i = 0; i < categories.size(); i++)
                 {
-                    uint64_t scopeStart = times[2 + i * 2], scopeEnd = times[3 + i * 2];
+                    uint64_t scopeStart = times[categories[i].second], scopeEnd = times[categories[i].second + 1];
                     if (scopeEnd > scopeStart)
-                        g_profile.gpuScopes[categories[i]] += double(scopeEnd - scopeStart) * 1000.0 / double(g.timestampFrequency);
+                        g_profile.gpuScopes[categories[i].first] += double(scopeEnd - scopeStart) * 1000.0 / double(g.timestampFrequency);
+                }
+                const auto& marks = g.passMarks[g.frameIndex];
+                for (size_t i = 0; i < marks.size(); i++)
+                {
+                    uint64_t passStart = times[marks[i].timestamp], passEnd = i + 1 < marks.size() ? times[marks[i + 1].timestamp] : end;
+                    auto& pass = g_profile.passes[marks[i].label];
+                    if (passEnd > passStart)
+                        pass.first += double(passEnd - passStart) * 1000.0 / double(g.timestampFrequency);
+                    pass.second += marks[i].draws;
                 }
                 D3D12_RANGE written{ 0, 0 };
                 g.timestampReadback->Unmap(0, &written);
@@ -1062,12 +1080,21 @@ namespace gpu::d3d12
         {
             g.timestampsUsed[g.frameIndex] = 2;
             g.scopeCategories[g.frameIndex].clear();
+            g.passMarks[g.frameIndex].clear();
             g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME);
         }
     }
 
     // AR_GPU_TIMING: GPU time of a kind of work (0 layout conversions, 1 render target syncs, 2 resolves, 3 composite
     // textures); nested scopes count for the outermost one.
+    // AR_GPU_PASSES (with AR_GPU_TIMING): GPU time by render target binding (1) or by pixel shader (2), from a
+    // timestamp where each starts; the time until the next one counts, resolves and conversions between included.
+    static int PassTiming()
+    {
+        static const int mode = AR_ENV("AR_GPU_PASSES") ? atoi(AR_ENV("AR_GPU_PASSES")) : 0;
+        return mode;
+    }
+
     struct GpuScope
     {
         uint8_t category;
@@ -1078,7 +1105,7 @@ namespace gpu::d3d12
                 return;
             index = g.timestampsUsed[g.frameIndex];
             g.timestampsUsed[g.frameIndex] += 2;
-            g.scopeCategories[g.frameIndex].push_back(category);
+            g.scopeCategories[g.frameIndex].push_back({ category, index });
             g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME + index);
         }
         ~GpuScope()
@@ -4864,10 +4891,36 @@ float4 main(float4 position : SV_Position) : SV_Target
             state.dsv.ptr != dsv.ptr)
         {
             g.list->OMSetRenderTargets(key.renderTargetCount, rtvs, FALSE, depthTarget ? &dsv : nullptr);
+            if (PassTiming() == 1 && g.timestampHeap && g.timestampsUsed[g.frameIndex] < State::TIMESTAMPS_PER_FRAME)
+            {
+                ColorInfo color{ registers[RB_COLOR_INFO] };
+                SurfaceInfo surface{ registers[RB_SURFACE_INFO] };
+                uint64_t label = uint64_t(surface.Pitch() & 0x3FFF) | (uint64_t(surface.MsaaSamples() & 3) << 14) |
+                    (uint64_t(color.Base() & 0xFFF) << 16) | (uint64_t(color.Format() & 0x3F) << 28) |
+                    (uint64_t(DepthInfo{ registers[RB_DEPTH_INFO] }.Base() & 0xFFF) << 34) | (uint64_t(depthTarget ? 1 : 0) << 60) |
+                    (uint64_t(key.renderTargetCount & 7) << 61);
+                uint32_t index = g.timestampsUsed[g.frameIndex]++;
+                g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME + index);
+                g.passMarks[g.frameIndex].push_back({ index, label, 0 });
+            }
             state.renderTargetCount = key.renderTargetCount;
             memcpy(state.rtvs, rtvs, sizeof(rtvs));
             state.dsv = dsv;
         }
+        // AR_GPU_PASSES=2: by pixel shader instead (bit 63 set, the hash's low 63 bits).
+        if (PassTiming() == 2 && g.timestampHeap && g.timestampsUsed[g.frameIndex] < State::TIMESTAMPS_PER_FRAME)
+        {
+            uint64_t label = (pixelShader ? pixelShader->hash : 0) | (1ull << 63);
+            auto& marks = g.passMarks[g.frameIndex];
+            if (marks.empty() || marks.back().label != label)
+            {
+                uint32_t index = g.timestampsUsed[g.frameIndex]++;
+                g.list->EndQuery(g.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.frameIndex * State::TIMESTAMPS_PER_FRAME + index);
+                marks.push_back({ index, label, 0 });
+            }
+        }
+        if (!g.passMarks[g.frameIndex].empty())
+            g.passMarks[g.frameIndex].back().draws++;
 
         uint32_t viewportWidth = pitch * g_scale, viewportHeight = RENDER_TARGET_HEIGHT * g_scale;
         D3D12_RECT scissor = Scaled(ScaleRect(GetScissor(registers), sampleScale));
@@ -5986,6 +6039,22 @@ float4 main(float4 position : SV_Position) : SV_Target
                 LOGF_INFO("GPU time per frame: {:.2f} ms (layout conversions {:.2f}, render target syncs {:.2f}, resolves {:.2f}, "
                     "composite textures {:.2f}, draws and the rest {:.2f})", g_profile.gpu / 300, scopes[0] / 300, scopes[1] / 300,
                     scopes[2] / 300, scopes[3] / 300, (g_profile.gpu - scopes[0] - scopes[1] - scopes[2] - scopes[3]) / 300);
+                std::vector<std::pair<uint64_t, std::pair<double, uint32_t>>> passes(g_profile.passes.begin(), g_profile.passes.end());
+                std::sort(passes.begin(), passes.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+                for (size_t i = 0; i < passes.size() && i < 16; i++)
+                {
+                    uint64_t label = passes[i].first;
+                    if (label >> 63)
+                    {
+                        LOGF_INFO("  pixel shader {:016X}: {:.2f} ms, {} draws a frame", label & ~(1ull << 63), passes[i].second.first / 300,
+                            passes[i].second.second / 300);
+                        continue;
+                    }
+                    LOGF_INFO("  pass color {} at {} format {}, depth {} at {}, pitch {}, msaa {}: {:.2f} ms, {} draws a frame",
+                        uint32_t(label >> 61) & 7, uint32_t(label >> 16) & 0xFFF, uint32_t(label >> 28) & 0x3F,
+                        (label >> 60) & 1 ? "yes" : "no", uint32_t(label >> 34) & 0xFFF, uint32_t(label & 0x3FFF), uint32_t(label >> 14) & 3,
+                        passes[i].second.first / 300, passes[i].second.second / 300);
+                }
             }
             g_profile = {};
         }

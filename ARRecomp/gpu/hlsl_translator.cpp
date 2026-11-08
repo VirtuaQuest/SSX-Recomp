@@ -53,7 +53,8 @@ static const uint XE_FLAG_DEPTH_24 = 32u; // The guest's depth buffer is 24 bit 
 
 // The guest's float depth has 20 bits of mantissa and the host's 23, so surfaces almost in the same plane, as decals are, come out equal there and
 // the one drawn later wins, while here the difference survives and which one wins changes with the camera. Keeps only the bits the guest has, rounding down
-// like the guest words made from host depth, so depth restored from those words compares equal too (and early rejection still works: SV_DepthLessEqual).
+// like the guest words made from host depth, so depth restored from those words compares equal too. Only with AR_NO_EARLY_DEPTH: on a GTX 970 any depth output,
+// SV_DepthLessEqual too, cost early rejection.
 float xe_depth_24(float depth)
 {
     return depth < 6.103515625e-05f ? floor(depth * 17179869184.0f) / 17179869184.0f : asfloat(asuint(depth) & 0xFFFFFFF8u);
@@ -1050,7 +1051,13 @@ struct XeOutput
 {
     float4 color[4] : SV_Target0;
 )";
-            out += current_shader().writes_depth() ? "    float depth : SV_Depth;\n" : "    float depth : SV_DepthLessEqual;\n";
+            // Depth is output only by shaders that write it. Rounding every pixel's depth to the guest's 24 bit float
+            // (xe_depth_24, for Anarchy Reigns' decals) cost early depth rejection on a GTX 970 even as
+            // SV_DepthLessEqual: 2.3 ms of SSX's 9 ms of draws at 1x. AR_NO_EARLY_DEPTH rounds again.
+            static const bool roundDepth = getenv("AR_NO_EARLY_DEPTH") != nullptr;
+            bool depthOutput = current_shader().writes_depth() || roundDepth;
+            if (depthOutput)
+                out += current_shader().writes_depth() ? "    float depth : SV_Depth;\n" : "    float depth : SV_DepthLessEqual;\n";
             out += R"(};
 
 XeOutput main(XeInput input)
@@ -1169,7 +1176,8 @@ XeOutput main(uint vertexId : SV_VertexID)
         output.color[t] = color;
     }
 )";
-            out += "    output.depth = (xe_flags & XE_FLAG_DEPTH_24) ? xe_depth_24(xe_depth) : xe_depth;\n";
+            if (current_shader().writes_depth() || getenv("AR_NO_EARLY_DEPTH"))
+                out += "    output.depth = (xe_flags & XE_FLAG_DEPTH_24) ? xe_depth_24(xe_depth) : xe_depth;\n";
         }
         else
         {
