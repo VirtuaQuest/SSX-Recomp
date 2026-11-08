@@ -185,6 +185,8 @@ namespace gpu::reg
         uint32_t value;
 
         uint32_t Endian() const { return value & 7; }
+        bool Array() const { return (value >> 3) & 1; }      // Into a slice of a 3D texture.
+        uint32_t Slice() const { return (value >> 4) & 7; }  // That slice, within the 8 the destination address starts.
         uint32_t Format() const { return (value >> 7) & 0x3F; } // ColorFormat, same values as TextureFormat.
         int32_t ExpBias() const { return int32_t(value << 10) >> 26; }
         bool Swap() const { return (value >> 24) & 1; }

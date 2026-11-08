@@ -191,6 +191,7 @@ namespace gpu::d3d12
         uint32_t rowBytes;
         bool rawDepth = false; // Holds depth buffer words (from depth resolves), 8 bit stencil in the low byte.
         uint64_t version = 0;  // Changes with every resolve into it.
+        int32_t volumeSlice = -1; // A slice of a 3D texture (0-7 after its address; kept at 1x, see Resolve).
     };
 
     // Resolved textures that follow each other in memory, fetched as one texture (shadow map cascades resolved one
@@ -274,6 +275,7 @@ namespace gpu::d3d12
         uint64_t checkedFrame = UINT64_MAX;
         int keyboardArt = -1; // A controller atlas with a keyboard and mouse version (index into KEYBOARD_ART).
         int gameFont = -1; // One of the title's fonts the overlay draws text with.
+        std::vector<std::pair<uint32_t, uint64_t>> volumeParts; // Slices resolved into a 3D texture, as copied in.
     };
 
     struct PipelineKey
@@ -2728,6 +2730,60 @@ float4 main(float4 position : SV_Position) : SV_Target
         return art.texture;
     }
 
+    // Copies slices resolved into a 3D texture's memory (see Resolve) over its host copy, which is decoded from guest
+    // memory that resolves don't write. Slice z of a tiled volume: groups of 8 slices follow each other (Tiled3D puts
+    // 4 slices in each macro tile and alternates banks every 4), each group pitch * height * 8 texels; a resolve's
+    // address is its group's and its slice field the slice in it. Copied again when a slice is resolved again.
+    static void ApplyVolumeResolves(const TextureFetch& fetch, CachedTexture& entry)
+    {
+        Texture& volume = entry.texture;
+        uint32_t base = fetch.BaseAddress(), width = fetch.Width(), height = fetch.Height(), depth = fetch.Depth();
+        uint32_t bytesPerTexel = BytesPerPixel(volume.format);
+        D3D12_RESOURCE_DESC desc = volume.resource->GetDesc();
+        if (!fetch.Tiled() || bytesPerTexel == 0 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.DepthOrArraySize != depth)
+            return;
+        uint64_t groupBytes = uint64_t((std::max(fetch.Pitch(), width) + 31) & ~31u) * ((height + 31) & ~31u) * 8 * bytesPerTexel;
+        uint64_t end = uint64_t(base) + groupBytes * ((depth + 7) / 8);
+
+        std::vector<std::pair<uint32_t, ResolvedTexture*>> slices;
+        for (auto& [key, resolved] : g.resolvedTextures)
+        {
+            if (resolved.volumeSlice < 0 || (key & ~0xFFFu) < base || (key & ~0xFFFu) >= end || resolved.texture.format != volume.format ||
+                resolved.texture.width < width || resolved.texture.height < height)
+                continue;
+            slices.emplace_back(key, &resolved);
+        }
+        if (slices.empty())
+            return;
+        std::sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<std::pair<uint32_t, uint64_t>> versions;
+        for (auto& [key, resolved] : slices)
+            versions.emplace_back(key, resolved->version);
+        if (versions == entry.volumeParts)
+            return;
+
+        GpuScope scope{ 3 };
+        Transition(volume, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (size_t i = 0; i < slices.size(); i++)
+        {
+            if (std::find(entry.volumeParts.begin(), entry.volumeParts.end(), versions[i]) != entry.volumeParts.end())
+                continue;
+            auto [key, resolved] = slices[i];
+            uint32_t z = uint32_t(((key & ~0xFFFu) - base) / groupBytes) * 8 + uint32_t(resolved->volumeSlice);
+            if (z >= depth)
+                continue;
+            Transition(resolved->texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION from{ resolved->texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            D3D12_TEXTURE_COPY_LOCATION to{ volume.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            D3D12_BOX box{ 0, 0, 0, width, height, 1 };
+            g.list->CopyTextureRegion(&to, 0, 0, z, &from, &box);
+            if (TraceThisFrame())
+                LOGF_INFO("volume 0x{:08X}: slice {} from the resolve to 0x{:08X} slice {}", base, z, key & ~0xFFFu, resolved->volumeSlice);
+        }
+        entry.volumeParts = std::move(versions);
+        Transition(volume, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
     static uint32_t GetTextureUncached(const TextureFetch& fetch, uint32_t dimension, float* transform, uint32_t& rawDepth)
     {
         rawDepth = 0;
@@ -2832,6 +2888,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (!firstUpload && AR_ENV("AR_TRACE_FRAME") && changeLogs++ < 40)
                     LOGF_INFO("texture {:08X} changed in frame {}", fetch.BaseAddress(), g.frameNumber);
                 UploadTexture(entry.texture, decoded);
+                entry.volumeParts.clear(); // Resolved slices go in again over the new contents.
                 entry.keyboardArt = FindKeyboardArt(decoded, fetch.BaseAddress());
                 NoteGameFont(entry, decoded, fetch.BaseAddress());
 
@@ -2841,6 +2898,15 @@ float4 main(float4 position : SV_Position) : SV_Target
                 static const int64_t dumpTextureFrames = AR_ENV("AR_DUMP_TEXTURE_FRAMES") ? atoll(AR_ENV("AR_DUMP_TEXTURE_FRAMES")) : INT64_MAX / 2;
                 bool dumpTexture = firstUpload && dumpTexturesFrom >= 0 && int64_t(g.frameNumber) >= dumpTexturesFrom &&
                     int64_t(g.frameNumber) < dumpTexturesFrom + dumpTextureFrames;
+                if (dumpTexture && decoded.depth > 1)
+                {
+                    // Volumes and cube maps as they are decoded: slices one after another, rows of rowPitch bytes.
+                    std::error_code ec;
+                    std::filesystem::create_directories("screenshots", ec);
+                    std::ofstream file(fmt::format("screenshots/volume_{:08X}_{}x{}x{}_pitch{}_format{}.raw", fetch.BaseAddress(), decoded.width,
+                        decoded.height, decoded.depth, decoded.rowPitch, int(decoded.format)), std::ios::binary);
+                    file.write(reinterpret_cast<const char*>(decoded.data.data()), decoded.data.size());
+                }
                 if (dumpTexture && decoded.format != DXGI_FORMAT_R8G8B8A8_UNORM && decoded.depth <= 1)
                 {
                     struct DdsHeader
@@ -2895,6 +2961,8 @@ float4 main(float4 position : SV_Position) : SV_Target
             if (art.resource)
                 return art.srv;
         }
+        if (dimension == 2 && entry.texture.resource)
+            ApplyVolumeResolves(fetch, entry);
         return entry.texture.resource ? entry.texture.srv : nullSrv;
     }
 
@@ -5741,10 +5809,28 @@ float4 main(float4 position : SV_Position) : SV_Target
 
                 // Resolves can write into part of a texture resolved before (games render in strips and point each
                 // strip's resolve at its rows), so they go to the resolved texture holding the address when it fits.
+                // Resolves into a slice of a 3D texture (SSX renders its snow terrain's 128x128 material patches and
+                // resolves each into a slice of a 128x128x256 volume the terrain looks up): kept apart per slice, at 1x
+                // (averaging the scaled samples) so they copy into the volume as they are (ApplyVolumeResolves).
+                // AR_NO_VOLUME_RESOLVES treats them as 2D resolves, which the volume never sees.
+                static const bool noVolumeResolves = AR_ENV("AR_NO_VOLUME_RESOLVES") != nullptr;
+                bool volumeSlice = destInfo.Array() && !depthSource && !noVolumeResolves;
+                uint32_t scale = volumeSlice ? 1 : g_scale;
+                uint32_t resolvedKey = volumeSlice ? (destBase | 0x800u | destInfo.Slice()) : destBase;
+
                 uint32_t row = 0;
-                ResolvedTexture* target = FindResolved(destBase, rowBytes, row);
-                if (target && (target->texture.format != destFormat || target->texture.width != destWidth * g_scale ||
-                    row + uint32_t(y1) > target->texture.height / g_scale || (row == 0 && target->texture.height != destHeight * g_scale)))
+                ResolvedTexture* target = nullptr;
+                if (volumeSlice)
+                {
+                    auto found = g.resolvedTextures.find(resolvedKey);
+                    target = found != g.resolvedTextures.end() ? &found->second : nullptr;
+                }
+                else
+                {
+                    target = FindResolved(destBase, rowBytes, row);
+                }
+                if (target && (target->texture.format != destFormat || target->texture.width != destWidth * scale ||
+                    row + uint32_t(y1) > target->texture.height / scale || (row == 0 && target->texture.height != destHeight * scale)))
                 {
                     target = nullptr;
                 }
@@ -5752,8 +5838,9 @@ float4 main(float4 position : SV_Position) : SV_Target
                 if (!target)
                 {
                     ResolvedTexture created;
-                    created.texture = CreateTexture(destWidth * g_scale, destHeight * g_scale, 1, false, destFormat,
+                    created.texture = CreateTexture(destWidth * scale, destHeight * scale, 1, false, destFormat,
                         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    created.volumeSlice = volumeSlice ? int32_t(destInfo.Slice()) : -1;
                     created.format = destInfo.Format();
                     created.rowBytes = rowBytes;
                     row = 0;
@@ -5764,7 +5851,16 @@ float4 main(float4 position : SV_Position) : SV_Target
 
                         // Resolved textures inside the new one's memory become part of it.
                         uint64_t end = uint64_t(destBase) + uint64_t(rowBytes) * destHeight;
-                        for (auto it = g.resolvedTextures.begin(); it != g.resolvedTextures.end();)
+                        if (volumeSlice)
+                        {
+                            if (auto old = g.resolvedTextures.find(resolvedKey); old != g.resolvedTextures.end())
+                            {
+                                ReleaseTexture(old->second.texture);
+                                g.resolvedTextures.erase(old);
+                            }
+                            end = 0; // Nothing below is inside.
+                        }
+                        for (auto it = g.resolvedTextures.begin(); it != g.resolvedTextures.end() && !volumeSlice;)
                         {
                             auto& inner = it->second;
                             bool inside = it->first >= destBase && it->first < end && inner.rowBytes == rowBytes &&
@@ -5791,7 +5887,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                             }
                         }
 
-                        target = &g.resolvedTextures.insert_or_assign(destBase, std::move(created)).first->second;
+                        target = &g.resolvedTextures.insert_or_assign(resolvedKey, std::move(created)).first->second;
                     }
                 }
 
@@ -5809,9 +5905,10 @@ float4 main(float4 position : SV_Position) : SV_Target
                         int32_t sampleScale[2];
                         uint32_t resolutionScale;
                     } constants{ { 0, -int32_t(row) }, source->srv, destInfo.Swap() ? 1u : 0u };
-                    constants.resolutionScale = g_scale;
-                    constants.sampleScale[0] = int32_t(sampleScale.x);
-                    constants.sampleScale[1] = int32_t(sampleScale.y);
+                    // At 1x (volume slices) each texel averages its block of the scaled samples.
+                    constants.resolutionScale = scale;
+                    constants.sampleScale[0] = int32_t(sampleScale.x) * int32_t(g_scale / scale);
+                    constants.sampleScale[1] = int32_t(sampleScale.y) * int32_t(g_scale / scale);
                     float scale = std::ldexp(1.0f, destInfo.ExpBias());
                     for (float& value : constants.scale)
                         value = scale;
@@ -5834,7 +5931,7 @@ float4 main(float4 position : SV_Position) : SV_Target
                     auto rtv = CpuRtv(resolved.texture.rtv);
                     g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                     D3D12_RECT destRect{ rect.left, rect.top + LONG(row), rect.right, rect.bottom + LONG(row) };
-                    SetViewportAndScissor(resolved.texture.width, resolved.texture.height, Scaled(destRect));
+                    SetViewportAndScissor(resolved.texture.width, resolved.texture.height, volumeSlice ? destRect : Scaled(destRect));
                     g.list->SetPipelineState(GetBlitPipeline(destFormat, false, depthSource));
                     g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     g.list->SetGraphicsRootConstantBufferView(ROOT_SYSTEM_CONSTANTS,
@@ -5922,14 +6019,17 @@ float4 main(float4 position : SV_Position) : SV_Target
                     // AR_DUMP_FRAME / AR_DUMP_FRAMES dump resolves like a traced frame without logging every draw.
                     static const int64_t dumpFrame = AR_ENV("AR_DUMP_FRAME") ? atoll(AR_ENV("AR_DUMP_FRAME")) : -1;
                     static const int64_t dumpFrames = AR_ENV("AR_DUMP_FRAMES") ? atoll(AR_ENV("AR_DUMP_FRAMES")) : 1;
+                    // AR_DUMP_EVERY=<n>: only every nth frame of them.
+                    static const int64_t dumpEvery = AR_ENV("AR_DUMP_EVERY") ? std::max(1ll, atoll(AR_ENV("AR_DUMP_EVERY"))) : 1;
                     bool dumpThisFrame = TraceThisFrame() ||
-                        (dumpFrame >= 0 && int64_t(g.frameNumber) >= dumpFrame && int64_t(g.frameNumber) < dumpFrame + dumpFrames);
+                        (dumpFrame >= 0 && int64_t(g.frameNumber) >= dumpFrame && int64_t(g.frameNumber) < dumpFrame + dumpFrames &&
+                            (int64_t(g.frameNumber) - dumpFrame) % dumpEvery == 0);
                     if (dumpThisFrame && (destFormat == DXGI_FORMAT_R8G8B8A8_UNORM || destFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                         destFormat == DXGI_FORMAT_R32_FLOAT || destFormat == DXGI_FORMAT_R16_UNORM) &&
                         (dumpOnly.empty() || std::find(dumpOnly.begin(), dumpOnly.end(), destBase) != dumpOnly.end()))
                     {
                         static int resolveIndex;
-                        SaveScreenshot(resolved.texture, destWidth * g_scale, destHeight * g_scale, fmt::format("screenshots/resolve_{:06}_{:02}_{:08X}.bmp", g.frameNumber, resolveIndex++ % 100, destBase));
+                        SaveScreenshot(resolved.texture, destWidth * scale, destHeight * scale, fmt::format("screenshots/resolve_{:06}_{:02}_{:08X}.bmp", g.frameNumber, resolveIndex++ % 100, destBase));
                     }
                 }
             }
