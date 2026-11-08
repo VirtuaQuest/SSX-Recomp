@@ -504,6 +504,22 @@ namespace
         return EndUpdateResourceW(update, !good) != FALSE && good;
     }
 
+    // A program just written (or just run) can be held for a moment by a virus scanner or its exiting process, and the
+    // icon then can't be added (it failed once in a clean build). Tries for about ten seconds; the reason goes in the log.
+    bool StampIconWithRetries(const fs::path& exe, const fs::path& icon)
+    {
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            if (StampIcon(exe, icon))
+                return true;
+            DWORD error = GetLastError();
+            if (attempt == 19)
+                WriteLog("The icon couldn't be put in " + exe.filename().string() + ": Windows error " + std::to_string(error));
+            Sleep(500);
+        }
+        return false;
+    }
+
     // A running program can't be replaced but can be renamed, so that one keeps running and the new one is built.
     void MoveAsideIfRunning(const fs::path& exe)
     {
@@ -732,8 +748,8 @@ namespace
         }
         if (Exists(icon))
         {
-            bool stamped = StampIcon(outputFolder / L"ARRecomp.exe", icon);
-            stamped &= StampIcon(outputFolder / L"ARLauncher.exe", icon);
+            bool stamped = StampIconWithRetries(outputFolder / L"ARRecomp.exe", icon);
+            stamped &= StampIconWithRetries(outputFolder / L"ARLauncher.exe", icon);
             Say(stamped ? L"The programs have the icon from your game." : L"The icon couldn't be put in the programs. They'll still work.");
         }
         else
