@@ -39,13 +39,13 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | Switch | |
 |---|---|
 | `AR_TRACE_FRAME=<n>`, `AR_TRACE_FRAMES=<count>` | Log every draw and resolve of these frames and dump their resolves |
-| `AR_DUMP_FRAME=<n>`, `AR_DUMP_FRAMES=<count>` | Dump resolves of these frames without logging draws |
+| `AR_DUMP_FRAME=<n>`, `AR_DUMP_FRAMES=<count>`, `AR_DUMP_EVERY=<n>` | Dump resolves of these frames without logging draws (every nth of them) |
 | `AR_DUMP_ONLY=<hex addresses, comma separated>` | Limit dumps to resolves to these addresses (use it: dumps are big) |
 | `AR_DUMP_ALPHA`, `AR_DUMP_SCALE=<value>` | Dump alpha as grey; scale for single float dumps (default 100 is white); 16 bit single channel resolves dump as grey |
 | `AR_DUMP_SOURCES`, `AR_DUMP_TEXTURES`, `AR_DUMP_IMAGE=<path>` | Resolve sources, uploaded textures, the loaded image, the LZ decompressor's output |
 | `AR_SCREENSHOT_INTERVAL=<frames>` | Screenshot period with `--screenshots` (default 300) |
 | `AR_TRACE_PS=<hash prefix>`, `AR_TRACE_INPUTS`, `AR_TRACE_FETCH` | Constants of draws with a pixel shader, hashes of each draw's inputs, fetch details |
-| `AR_HIGHLIGHT_PS=<prefix>`, `AR_HIGHLIGHT_PRIM=<type>` | Draw those in magenta |
+| `AR_HIGHLIGHT_PS=<prefixes>`, `AR_HIGHLIGHT_PRIM=<type>` | Draw those in magenta (prefixes comma separated). With `AR_DUMP_FRAME` and `AR_DUMP_ONLY` on a G-buffer, groups of shaders show which one draws something wrong |
 | `AR_SHOW_EXPR=<HLSL float4>` | What highlighted draws output instead of magenta, e.g. `float4(XE_R(7).yzw, 1.0f)` (register 7 as the shader leaves it; `input.position` can split the screen to show several) |
 | `AR_SKIP_PS=<prefixes>`, `AR_SKIP_VS=<prefixes>` | Skip draws by shader |
 | `AR_SHADOW_LOG` | One line per shadow map draw (S, IB), its resolves (SR), clear rectangles (SC), EDRAM syncs into it, mid-frame upload flushes (FW) and the light matrices (L), for the `AR_DUMP_FRAME` frames |
@@ -99,6 +99,9 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 | `AR_NO_EARLY_DEPTH` | Pixel shaders output depth rounded to the guest's 24 bit float again (`xe_depth_24`), which costs early depth rejection |
 | `AR_NO_PIPELINE_PREWARM` | Pipelines from the saved key list (`pipelines.bin.keys`) are loaded at their first draws instead of at startup |
 | `AR_NO_FAST_MUL` | Every shader multiplication keeps shader model 3 rules (zero times anything is zero), not only those of values that may be infinite or NaN; slower, as the selects stop multiply-adds from fusing |
+| `AR_NO_VOLUME_RESOLVES` | Resolves into slices of a 3D texture (RB_COPY_DEST_INFO bit 3) reaching the volume: SSX's snow terrain then shows flat polygons |
+| `AR_NO_TILED_3D` | Tiled 3D textures untiled through the volume (Xenia's Tiled3D) instead of as 2D slices |
+| `AR_NO_USER_CLIP_PLANES` | User clip planes (PA_CL_CLIP_CNTL ucp_ena, PA_CL_UCP_n) |
 | `AR_NO_RESOLVED_MIPS` | Mip levels the title resolves itself after a texture's mip address (SSX's per-pixel exposure): such fetches read the base level only, which leaves trails |
 | `AR_NO_7E3_CLAMP` | Clamping pixel shader output to 2_10_10_10_FLOAT targets to the console's 0 to 31.875 |
 | `AR_NO_GEOMETRIC_SAMPLES` | 1x and 4x MSAA views of the same EDRAM reorder their samples as the console stores them (a layout conversion each switch) instead of keeping host texels at their geometric positions |

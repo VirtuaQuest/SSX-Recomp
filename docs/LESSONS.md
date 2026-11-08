@@ -76,6 +76,12 @@ title; the Anarchy Reigns specifics are at the end. `git log` has the details of
   resolved texture is one level here, so such a fetch got the sharp base level whatever LOD it asked for. Fetches with
   mip levels over a resolve now get a texture whose levels are copied from the resolves at the mip address (in
   address order, each at least its level's size). `AR_NO_RESOLVED_MIPS` samples the base level only.
+- Resolves can write a slice of a 3D texture: RB_COPY_DEST_INFO bit 3, slice in bits 4-6 within the group of 8 at
+  the destination address (groups pitch x height x 8 texels apart in a tiled volume). They're kept per slice at 1x
+  and copied over the volume's host copy when it's fetched. Tiled 3D textures are tiled through the volume in
+  32x16x4 blocks (Xenia's Tiled3D), not as 2D slices.
+- User clip planes (PA_CL_CLIP_CNTL bits 0-5, PA_CL_UCP_0_X at 0x2388 on) apply to the vertex shader's clip space
+  position, as SV_ClipDistance here.
 - 2_10_10_10_FLOAT (7e3) targets are RGBA16F on the host, which holds far more than the console's 0 to 31.875; pixel
   shaders clamp what they write to such targets (blending can still exceed it). `AR_NO_7E3_CLAMP` turns that off.
 - Packed mips apply to linear textures too.
@@ -459,3 +465,9 @@ SSX (2012, title 4541096D) runs on the same runtime. What it needed, and why:
   ps 28F5CFF7 (the target then held the current luminance) removed the trails, and the fetch constant showed 8 mip
   levels at a mip address the luminance chain resolves into. Comparisons need several runs: the AR_REMOTE ride takes
   different lines from run to run, and one line that crashes into a rock shows the trails at their worst.
+- Flat polygons over the snow (lighter quads with hard edges): the snow terrain shader (ps EA2CFAEF) looks up a
+  128x128x256 RGBA8 volume (tf1) of material patches that SSX renders near the player and resolves into slices of
+  it. Slice resolves weren't recognised (the volume stayed zero) and the volume was untiled as 2D slices. Found by
+  dumping the G-buffer every 50 frames of a ride (`AR_DUMP_EVERY`), highlighting groups of shaders in it until one
+  group drew the quads, then dumping the volume (`AR_DUMP_TEXTURES` writes volumes raw): all zero. SSX also uses
+  user clip plane 0 near the camera on 150 draws a frame; those weren't applied either.
