@@ -29,6 +29,19 @@ static DWORD HostPad(uint32_t user)
 // Watches for controllers connecting and disconnecting, which titles learn about through a notification.
 static std::atomic<uint32_t> g_connectedMask{ 0xFFFFFFFF };
 
+// The real controllers among them, from the same watch. Asking Windows about an empty slot takes about 0.1 ms (it
+// looks for the device each time), and SSX reads all four slots about 55 times a second each, plus their capabilities:
+// up to half a millisecond a frame of the input thread waiting on empty slots, more with the keyboard alone (then slot
+// 0 is empty too). Empty slots are answered from this mask instead; a controller plugged in shows up at the next check,
+// within a quarter of a second. AR_NO_PAD_MASK asks Windows every time.
+static std::atomic<uint32_t> g_hostMask{ 0xFFFFFFFF };
+
+static bool HostPadMayBeConnected(uint32_t user)
+{
+    static const bool always = AR_ENV("AR_NO_PAD_MASK") != nullptr;
+    return always || ((g_hostMask.load() >> user) & 1) != 0;
+}
+
 static uint32_t QueryConnectedMask()
 {
     uint32_t mask = 0;
@@ -47,15 +60,18 @@ static void StartConnectionMonitor()
     static std::once_flag once;
     std::call_once(once, []
         {
-            g_connectedMask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled() ? 1u : 0u);
+            g_hostMask = QueryConnectedMask();
+            g_connectedMask = g_hostMask.load() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled() ? 1u : 0u);
             LOGF_INFO("controllers connected: mask 0x{:X}", g_connectedMask.load());
 
             std::thread([]
                 {
                     while (true)
                     {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                        uint32_t mask = QueryConnectedMask() | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled() ? 1u : 0u);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                        uint32_t host = QueryConnectedMask();
+                        g_hostMask = host;
+                        uint32_t mask = host | (AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled() ? 1u : 0u);
                         uint32_t previous = g_connectedMask.exchange(mask);
                         if (mask != previous)
                         {
@@ -362,7 +378,8 @@ static bool RemoteControl(XINPUT_STATE& state)
 
 static bool GetControllerState(uint32_t user, XINPUT_STATE& state)
 {
-    bool connected = XInputGetState(HostPad(user), &state) == ERROR_SUCCESS;
+    StartConnectionMonitor();
+    bool connected = HostPadMayBeConnected(user) && XInputGetState(HostPad(user), &state) == ERROR_SUCCESS;
     if (!connected)
         memset(&state, 0, sizeof(state));
 
@@ -494,7 +511,8 @@ namespace imports
         StartConnectionMonitor();
 
         XINPUT_CAPABILITIES host;
-        if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || XInputGetCapabilities(HostPad(userIndex & 0xFF), XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
+        if ((userIndex & 0xFF) >= XUSER_MAX_COUNT || !HostPadMayBeConnected(userIndex & 0xFF) ||
+            XInputGetCapabilities(HostPad(userIndex & 0xFF), XINPUT_FLAG_GAMEPAD, &host) != ERROR_SUCCESS)
         {
             if ((userIndex & 0xFF) != 0 || !(AR_ENV("AR_AUTO_PRESS") || AR_ENV("AR_REMOTE") || kbm::Enabled()))
                 return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -530,6 +548,9 @@ namespace imports
     {
         if ((userIndex & 0xFF) >= XUSER_MAX_COUNT)
             return X_ERROR_DEVICE_NOT_CONNECTED;
+        // With the keyboard standing in for controller 0 there may be no controller to shake: the title gets success.
+        if (!HostPadMayBeConnected(userIndex & 0xFF))
+            return (userIndex & 0xFF) == 0 && kbm::Enabled() ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 
         XINPUT_VIBRATION host;
         host.wLeftMotorSpeed = ByteSwap(vibration->wLeftMotorSpeed);

@@ -138,9 +138,11 @@ casters that vanish for one frame, which `altscore.py` (image based) often misse
 
 ## Keyboard and mouse
 
-SSX: every controller input has keys in `user/key_bindings.ini` (written with the defaults the first time: WASD left
-stick, IJKL or the mouse the right stick, which is the trick stick, Space A, E B, Left Shift X, Q Y, Z/C shoulders, right
-and left click the triggers, Escape Start, Tab Back, arrows the d-pad). `AR_MOUSE_STICK_GAIN` scales the mouse.
+SSX: every controller input has keys in `user/key_bindings.ini` (written with the defaults the first time, each with
+what it does in SSX: see the README's table; a file with the previous title's defaults is replaced). `--write-key-bindings`
+writes the file and exits (the launcher's "Edit keys"). `AR_MOUSE_STICK_GAIN` scales the mouse. Controller slots found
+empty by the 250 ms connection check aren't asked about (0.1 ms per call to XInput for an empty slot, SSX asks about 300
+times a second); `AR_NO_PAD_MASK` asks every time.
 `kernel/keyboard_mouse.cpp` merges them into controller 0. `AR_NO_KBM` turns them off. Runs driven by `AR_REMOTE` or
 `AR_AUTO_PRESS` leave them off unless `AR_KBM` is set, so a test window in front doesn't take your typing. The window's
 icon is the title's own, in `user/game_icon.ico` (`AR_NO_GAME_ICON` leaves it out).
