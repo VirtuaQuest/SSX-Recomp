@@ -65,6 +65,7 @@ namespace
         ID_GAME_PATH,
         ID_BROWSE,
         ID_LAUNCH,
+        ID_KEYS,
     };
 
     HWND g_resolution, g_display, g_fps, g_aa, g_anisotropic, g_textures, g_sharpen, g_vsync, g_scale, g_mouse, g_invert, g_gamePath, g_controller;
@@ -133,6 +134,46 @@ namespace
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetOpenFileNameW(&dialog))
             SetWindowTextW(g_gamePath, ToRelative(path).c_str());
+    }
+
+    // Opens the keyboard and mouse layout (user\key_bindings.ini where the game runs) for editing. The game writes it
+    // with the defaults the first time it runs; before that, it's asked to write it now.
+    void EditKeys(HWND window)
+    {
+        std::wstring folder = WorkingFolder();
+        std::wstring path = folder + L"\\user\\key_bindings.ini";
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            std::wstring exe = g_folder + L"\\ARRecomp.exe";
+            std::wstring command = L"\"" + exe + L"\" --write-key-bindings";
+            STARTUPINFOW startup{ sizeof(startup) };
+            PROCESS_INFORMATION process{};
+            if (CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, folder.c_str(), &startup, &process))
+            {
+                WaitForSingleObject(process.hProcess, 10000);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+            }
+        }
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            MessageBoxW(window, (L"Could not create " + path).c_str(), L"SSX Recompiled", MB_ICONERROR);
+            return;
+        }
+        // In Notepad, which every Windows has (an .ini file's own handler may be anything, or nothing).
+        wchar_t system[MAX_PATH];
+        GetSystemDirectoryW(system, MAX_PATH);
+        std::wstring notepad = std::wstring(system) + L"\\notepad.exe";
+        std::wstring command = L"\"" + notepad + L"\" \"" + path + L"\"";
+        STARTUPINFOW startup{ sizeof(startup) };
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(notepad.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, folder.c_str(), &startup, &process))
+        {
+            MessageBoxW(window, (L"Could not open " + path).c_str(), L"SSX Recompiled", MB_ICONERROR);
+            return;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
     }
 
     void Launch(HWND window)
@@ -254,14 +295,16 @@ namespace
 
             x = right;
             y = 96;
-            section(4, L"Controls");
+            int controlsTop = y;
+            section(5, L"Controls");
             g_controller = combo(L"Controller", ID_CONTROLLER, CONTROLLER_LABELS, std::size(CONTROLLER_LABELS), L"Controller");
             g_mouse = combo(L"Mouse sensitivity", ID_MOUSE, MOUSE_LABELS, std::size(MOUSE_LABELS), L"MouseSensitivity", 1);
             g_invert = combo(L"Mouse tricks", ID_INVERT, INVERT_LABELS, std::size(INVERT_LABELS), L"InvertMouse");
-            g_form.AddLabel(x + 2, y, columnWidth - 4, 20, L"WASD steer, Space jumps, the mouse is the trick stick.", theme::DIM, theme::Font::Small);
+            g_form.AddLabel(x + 2, y, columnWidth - 4, 20, L"WASD steer, Space jumps, flick the mouse to grab, click to boost.", theme::DIM, theme::Font::Small);
             y += 20;
-            g_form.AddLabel(x + 2, y, columnWidth - 4, 20, L"Change any key in user\\key_bindings.ini.", theme::DIM, theme::Font::Small);
-            y += 28;
+            g_form.AddLabel(x + 2, y + 8, columnWidth - 112, 20, L"Keyboard, mouse and controller all at once.", theme::DIM, theme::Font::Small);
+            g_form.AddButton(ID_KEYS, x + columnWidth - 110, y + 4, 100, 28, L"Edit keys");
+            y = controlsTop + SECTION_TOP + 5 * ROW + 4 + 12;
             section(1, L"Game");
             g_form.AddLabel(x + 2, y, 90, 28, L"Game image");
             g_gamePath = g_form.AddEdit(ID_GAME_PATH, x + 92, y, columnWidth - 92 - 86, ToRelative(ReadSetting(L"Game", L"")));
@@ -274,6 +317,8 @@ namespace
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_BROWSE)
                 Browse(window);
+            else if (LOWORD(wParam) == ID_KEYS)
+                EditKeys(window);
             else if (LOWORD(wParam) == ID_LAUNCH || LOWORD(wParam) == IDOK)
                 Launch(window);
             return 0;

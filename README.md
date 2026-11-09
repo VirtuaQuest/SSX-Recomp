@@ -38,12 +38,37 @@ All of this stays on your PC, and nothing is downloaded:
 
 The launcher sets the resolution, windowed, borderless or fullscreen display, the frame rate (30 as on the console, or 60
 at the same game speed; SSX holds itself to 60 at most), the internal render scale (up to 2160p), anisotropic filtering,
-texture detail, sharpening and vsync. A controller works as on the console. Keyboard and mouse are merged into the first
-controller (WASD the left stick, IJKL or the mouse the trick stick, Space A, arrows the d-pad, Escape Start).
+texture detail, sharpening and vsync. A controller works as on the console.
+
+### Keyboard and mouse
+
+Keyboard, mouse and controller all work at the same time, as one controller: use whichever you like at any moment, with
+nothing to switch. The default layout follows SSX's Standard controls:
+
+| Keys | Controller | On the mountain | In menus |
+|---|---|---|---|
+| W A S D | Left stick | Steer and lean; in the air, spin and flip | Move |
+| Space (Enter) | A | Jump (hold to crouch, let go to jump); in the air, back grab | Select |
+| Mouse movement (I J K L) | Right stick | Flick up to jump, flick to grab, circle to tweak | |
+| Left mouse button (Left Shift) | RT | Boost (hold); in the air, tweak | Next page |
+| Right mouse button (C) | LT | Grind | Previous page |
+| R | LB | Rewind (hold) | Previous tab |
+| Left Ctrl | RB | Open the wingsuit (hold) | Next tab |
+| Q / E / F | X / B / Y | Tricks; in the air, left / right / front grabs | E or Backspace: back |
+| Escape | Start | Pause | |
+| Arrow keys | D-pad | | Move |
+| Tab, Z, V (middle mouse) | Back, stick clicks | | |
+
+Click into the game's window to let the mouse drive the trick stick (in borderless and fullscreen it does from the
+start); Alt gives the cursor back. Every key can be changed: "Edit keys" in the launcher opens `user\key_bindings.ini`,
+which lists what each controller input does. Mouse sensitivity and inversion are in the launcher.
+
+### Online
 
 No Xbox Live or EA account is needed. The profile is a local one, and saves go to `run\user\content` on your PC (back
-that folder up to keep your progress). The game no longer stops at boot to say you aren't signed in to Xbox LIVE and
-the EA servers; those services are gone, so "Connect to EA Server" in the menu still reports that it can't reach them.
+that folder up to keep your progress). EA's servers for SSX are gone, so the game runs as an offline game: World Tour,
+Explore and RiderNet's badges and settings all work, and Global Events and SSX Rivals (which were server content) say
+that they need the servers.
 
 ## Sharing
 

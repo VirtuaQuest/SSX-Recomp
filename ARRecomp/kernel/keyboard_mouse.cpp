@@ -25,36 +25,49 @@ namespace kbm
 
     struct InputInfo
     {
-        const char* name; // In the bindings file.
-        uint16_t button;  // XINPUT_GAMEPAD bits, or 0 for triggers and sticks.
-        int keys[2];      // The defaults.
+        const char* name;   // In the bindings file.
+        uint16_t button;    // XINPUT_GAMEPAD bits, or 0 for triggers and sticks.
+        int keys[2];        // The defaults.
+        const char* action; // What it does in SSX (the Standard controls), written above it in the bindings file.
     };
 
+    // SSX's Standard controls (its manual, pages 3 and 4) laid out for one hand on WASD and one on the mouse: the
+    // mouse is the trick stick (flick up to jump, flick to grab, circle to tweak), the left button boosts, the right
+    // one grinds. Grabs also have keys around WASD (Q left, E right, F front, Space back), as the face buttons do.
     static constexpr InputInfo INPUTS[INPUT_COUNT] = {
-        { "A", XINPUT_GAMEPAD_A, { VK_SPACE, VK_RETURN } },
-        { "B", XINPUT_GAMEPAD_B, { 'E', VK_BACK } },
-        { "X", XINPUT_GAMEPAD_X, { VK_LSHIFT, 0 } },
-        { "Y", XINPUT_GAMEPAD_Y, { 'Q', 0 } },
-        { "LeftShoulder", XINPUT_GAMEPAD_LEFT_SHOULDER, { 'Z', 0 } },
-        { "RightShoulder", XINPUT_GAMEPAD_RIGHT_SHOULDER, { 'C', 0 } },
-        { "LeftTrigger", 0, { VK_RBUTTON, '1' } },
-        { "RightTrigger", 0, { VK_LBUTTON, '3' } },
-        { "Start", XINPUT_GAMEPAD_START, { VK_ESCAPE, 0 } },
-        { "Back", XINPUT_GAMEPAD_BACK, { VK_TAB, 'R' } },
-        { "LeftStickClick", XINPUT_GAMEPAD_LEFT_THUMB, { 'F', 0 } },
-        { "RightStickClick", XINPUT_GAMEPAD_RIGHT_THUMB, { VK_MBUTTON, 'G' } },
-        { "DpadUp", XINPUT_GAMEPAD_DPAD_UP, { VK_UP, 0 } },
-        { "DpadDown", XINPUT_GAMEPAD_DPAD_DOWN, { VK_DOWN, 0 } },
-        { "DpadLeft", XINPUT_GAMEPAD_DPAD_LEFT, { VK_LEFT, 0 } },
-        { "DpadRight", XINPUT_GAMEPAD_DPAD_RIGHT, { VK_RIGHT, 0 } },
-        { "LeftStickUp", 0, { 'W', 0 } },
-        { "LeftStickDown", 0, { 'S', 0 } },
-        { "LeftStickLeft", 0, { 'A', 0 } },
-        { "LeftStickRight", 0, { 'D', 0 } },
-        { "RightStickUp", 0, { 'I', VK_NUMPAD8 } },
-        { "RightStickDown", 0, { 'K', VK_NUMPAD2 } },
-        { "RightStickLeft", 0, { 'J', VK_NUMPAD4 } },
-        { "RightStickRight", 0, { 'L', VK_NUMPAD6 } },
+        { "A", XINPUT_GAMEPAD_A, { VK_SPACE, VK_RETURN }, "Jump (hold to crouch, let go to jump); in the air, grab the back of the board; menus: select" },
+        { "B", XINPUT_GAMEPAD_B, { 'E', VK_BACK }, "Trick; in the air, grab the right side of the board; menus: back" },
+        { "X", XINPUT_GAMEPAD_X, { 'Q', 0 }, "Trick; in the air, grab the left side of the board" },
+        { "Y", XINPUT_GAMEPAD_Y, { 'F', 0 }, "In the air, grab the front of the board" },
+        { "LeftShoulder", XINPUT_GAMEPAD_LEFT_SHOULDER, { 'R', VK_PRIOR }, "Rewind (hold); menus: previous tab" },
+        { "RightShoulder", XINPUT_GAMEPAD_RIGHT_SHOULDER, { VK_LCONTROL, VK_NEXT }, "Open the wingsuit (hold); menus: next tab" },
+        { "LeftTrigger", 0, { VK_RBUTTON, 'C' }, "Grind; menus: previous page" },
+        { "RightTrigger", 0, { VK_LBUTTON, VK_LSHIFT }, "Boost (hold); in the air, tweak the grab; menus: next page" },
+        { "Start", XINPUT_GAMEPAD_START, { VK_ESCAPE, 0 }, "Pause" },
+        { "Back", XINPUT_GAMEPAD_BACK, { VK_TAB, 0 }, "Back button" },
+        { "LeftStickClick", XINPUT_GAMEPAD_LEFT_THUMB, { 'Z', 0 }, "Left stick click" },
+        { "RightStickClick", XINPUT_GAMEPAD_RIGHT_THUMB, { VK_MBUTTON, 'V' }, "Right stick click" },
+        { "DpadUp", XINPUT_GAMEPAD_DPAD_UP, { VK_UP, 0 }, "Menus: up" },
+        { "DpadDown", XINPUT_GAMEPAD_DPAD_DOWN, { VK_DOWN, 0 }, "Menus: down" },
+        { "DpadLeft", XINPUT_GAMEPAD_DPAD_LEFT, { VK_LEFT, 0 }, "Menus: left" },
+        { "DpadRight", XINPUT_GAMEPAD_DPAD_RIGHT, { VK_RIGHT, 0 }, "Menus: right" },
+        { "LeftStickUp", 0, { 'W', 0 }, "Lean forward; in the air, flip forward" },
+        { "LeftStickDown", 0, { 'S', 0 }, "Lean back; in the air, flip backward" },
+        { "LeftStickLeft", 0, { 'A', 0 }, "Steer left; in the air, spin left" },
+        { "LeftStickRight", 0, { 'D', 0 }, "Steer right; in the air, spin right" },
+        { "RightStickUp", 0, { 'I', VK_NUMPAD8 }, "Trick stick up (the mouse moves it too): jump; in the air, grab the front" },
+        { "RightStickDown", 0, { 'K', VK_NUMPAD2 }, "Trick stick down: in the air, grab the back" },
+        { "RightStickLeft", 0, { 'J', VK_NUMPAD4 }, "Trick stick left: in the air, grab the left side" },
+        { "RightStickRight", 0, { 'L', VK_NUMPAD6 }, "Trick stick right: in the air, grab the right side" },
+    };
+
+    // The defaults before SSX had its own layout (the runtime's first title's): a bindings file with exactly these is
+    // one nobody changed, and gets the layout above instead.
+    static constexpr int OLD_DEFAULTS[INPUT_COUNT][2] = {
+        { VK_SPACE, VK_RETURN }, { 'E', VK_BACK }, { VK_LSHIFT, 0 }, { 'Q', 0 }, { 'Z', 0 }, { 'C', 0 }, { VK_RBUTTON, '1' },
+        { VK_LBUTTON, '3' }, { VK_ESCAPE, 0 }, { VK_TAB, 'R' }, { 'F', 0 }, { VK_MBUTTON, 'G' }, { VK_UP, 0 }, { VK_DOWN, 0 },
+        { VK_LEFT, 0 }, { VK_RIGHT, 0 }, { 'W', 0 }, { 'S', 0 }, { 'A', 0 }, { 'D', 0 }, { 'I', VK_NUMPAD8 }, { 'K', VK_NUMPAD2 },
+        { 'J', VK_NUMPAD4 }, { 'L', VK_NUMPAD6 },
     };
 
     static const char* KEY_BINDINGS_FILE = "user/key_bindings.ini";
@@ -115,12 +128,16 @@ namespace kbm
     static void SaveBindings()
     {
         std::ofstream file(KEY_BINDINGS_FILE);
-        file << "; Keys for each controller input: up to two per line, separated by a comma. Delete this file for the defaults.\n";
+        file << "; SSX keyboard and mouse layout: the keys for each controller input, up to two per line, separated by a comma.\n";
+        file << "; Keyboard, mouse and controller all work at once; use whichever you like at any moment. The mouse moves the\n";
+        file << "; right stick (the trick stick) while it's captured: click into the window; Alt lets it go.\n";
         file << "; Names: A-Z, 0-9, Space, Enter, Escape, Tab, Backspace, LeftShift, LeftCtrl, Up, Down, Left, Right, Num0-Num9,\n";
         file << "; MouseLeft, MouseRight, MouseMiddle, Mouse4, Mouse5, F1-F12 (not F10), Comma, Period, Slash, ... or None.\n";
+        file << "; Delete this file to get the defaults back.\n";
         file << "[Keys]\n";
         for (int i = 0; i < INPUT_COUNT; i++)
         {
+            file << "\n; " << INPUTS[i].action << '\n';
             file << INPUTS[i].name << " = " << NameOfKey(g_keys[i][0]);
             if (g_keys[i][1] != 0)
                 file << ", " << NameOfKey(g_keys[i][1]);
@@ -128,24 +145,44 @@ namespace kbm
         }
     }
 
-    static void LoadBindings()
+    static void UseDefaults()
     {
         for (int i = 0; i < INPUT_COUNT; i++)
         {
             g_keys[i][0] = INPUTS[i].keys[0];
             g_keys[i][1] = INPUTS[i].keys[1];
         }
+    }
+
+    // Writes the default bindings file if there is none (--write-key-bindings, for the launcher).
+    void WriteDefaultBindings()
+    {
+        if (std::filesystem::exists(KEY_BINDINGS_FILE))
+            return;
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(KEY_BINDINGS_FILE).parent_path(), ec);
+        UseDefaults();
+        SaveBindings();
+    }
+
+    static void LoadBindings()
+    {
+        UseDefaults();
         std::ifstream file(KEY_BINDINGS_FILE);
         if (!file.is_open())
         {
             SaveBindings();
             return;
         }
+        int loaded[INPUT_COUNT][2];
+        memcpy(loaded, g_keys, sizeof(loaded));
         std::string line;
         while (std::getline(file, line))
         {
+            if (size_t comment = line.find(';'); comment != std::string::npos)
+                line.resize(comment);
             size_t equals = line.find('=');
-            if (line.empty() || line[0] == ';' || line[0] == '[' || equals == std::string::npos)
+            if (line.empty() || line[0] == '[' || equals == std::string::npos)
                 continue;
             std::string name = line.substr(0, equals);
             name.erase(std::remove_if(name.begin(), name.end(), [](char c) { return isspace(uint8_t(c)); }), name.end());
@@ -167,9 +204,17 @@ namespace kbm
                 LOGF_WARNING("key bindings: can't read the keys for {}: {}", name, value);
                 continue;
             }
-            g_keys[input][0] = first;
-            g_keys[input][1] = second;
+            loaded[input][0] = first;
+            loaded[input][1] = second;
         }
+        file.close();
+        if (memcmp(loaded, OLD_DEFAULTS, sizeof(loaded)) == 0)
+        {
+            LOGF_INFO("key bindings: {} had the old defaults; it now has SSX's layout", KEY_BINDINGS_FILE);
+            SaveBindings();
+            return;
+        }
+        memcpy(g_keys, loaded, sizeof(loaded));
     }
 
     static const bool g_testInput = AR_ENV("AR_KBM_TEST") != nullptr;

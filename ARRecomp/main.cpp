@@ -39,8 +39,9 @@ static void PrintUsage()
         "  --ultrawide            A wider view on resolutions wider than 16:9, instead of bars.\n"
         "  --vsync                Wait for the display's refresh.\n"
         "  --render-scale N       Internal resolution scale: 1 (720p, default), 2 (1440p), 3 (2160p).\n"
-        "  --mouse-sensitivity N  Camera speed with the mouse (default 1).\n"
-        "  --invert-mouse         Mouse down looks up.\n"
+        "  --mouse-sensitivity N  How far mouse movement pushes the trick stick (default 1).\n"
+        "  --invert-mouse         Mouse down pushes the trick stick up.\n"
+        "  --write-key-bindings   Writes user/key_bindings.ini with the default keyboard and mouse layout if there is none, then exits.\n"
         "  --online               Multiplayer between copies of the game, experimental (ports 36000-36127).\n"
         "  --online-peer IP       Also look for games at these addresses (comma separated).\n"
         "  --player-name NAME     Your name in multiplayer.\n"
@@ -98,6 +99,11 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--controller" && i + 1 < argc)
             _putenv_s("AR_CONTROLLER", argv[++i]);
+        else if (arg == "--write-key-bindings")
+        {
+            kbm::WriteDefaultBindings();
+            return 0;
+        }
         else if (arg == "--make-icon")
         {
             _putenv_s("AR_MAKE_ICON", "1");

@@ -41,4 +41,7 @@ namespace kbm
 
     // Mouse sensitivity (--mouse-sensitivity, 1 is the default) and the mouse going down pushing the stick up.
     void SetMouseOptions(float sensitivity, bool invertY);
+
+    // Writes user/key_bindings.ini with the defaults if it doesn't exist (--write-key-bindings).
+    void WriteDefaultBindings();
 }
