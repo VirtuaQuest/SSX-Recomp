@@ -1,4 +1,4 @@
-# Makes the release zip that Recomp Launcher installs: this project's source at HEAD, with XenonRecomp and its libraries
+﻿# Makes the release zip that Recomp Launcher installs: this project's source at HEAD, with XenonRecomp and its libraries
 # (at the commits the submodules name) in thirdparty\XenonRecomp, and recomplauncher.json at the top. Only files in git go
 # in, so nothing of the game can: the player's own copy is only read on their PC, by tools\recomplauncher\prepare.cmd.
 # Usage: powershell -ExecutionPolicy Bypass -File tools\recomplauncher\make_release.ps1   ->  out\release\SSX-resled-v<VERSION>-Windows-x64.zip
@@ -19,7 +19,10 @@ function Export-Tree([string]$repo, [string]$commit, [string]$into) {
     $tar = Join-Path $out 'part.tar'
     git -C $repo archive --format=tar -o $tar $commit
     if ($LASTEXITCODE -ne 0) { throw "git archive of $commit in $repo failed" }
-    tar -x -f $tar -C $into
+    # Symbolic links (libmspack's cabextract has some) can't be made on Windows without rights, nor kept in a zip; the
+    # build uses none of them.
+    $links = @(git -C $repo ls-tree -r $commit | ForEach-Object { if ($_ -match '^120000 blob [0-9a-f]{40}\t(.+)$') { '--exclude'; $Matches[1] } })
+    tar -x -f $tar -C $into @links
     if ($LASTEXITCODE -ne 0) { throw "unpacking $repo failed" }
     Remove-Item $tar
 }
@@ -55,7 +58,7 @@ Export-Tree $root 'HEAD' $stage
 Export-Submodules @($root) (git rev-parse HEAD) $stage
 
 # What must be there for Recomp Launcher and the build.
-foreach ($f in 'recomplauncher.json', 'VERSION', 'tools\recomplauncher\prepare.cmd', 'thirdparty\XenonRecomp\XenonUtils\ppc_context.h', 'thirdparty\XenonRecomp\thirdparty\simde\simde\x86\sse.h') {
+foreach ($f in 'recomplauncher.json', 'VERSION', 'tools\recomplauncher\prepare.cmd', 'thirdparty\XenonRecomp\XenonUtils\ppc_context.h', 'thirdparty\XenonRecomp\thirdparty\simde\x86\sse.h') {
     if (-not (Test-Path (Join-Path $stage $f))) { throw "$f is missing from the release" }
 }
 # And what must never be.
