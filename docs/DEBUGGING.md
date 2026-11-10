@@ -14,6 +14,15 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 | `--make-icon` | Takes the icon from the game, unseen and silent, into `user/game_icon.ico`, then exits (Setup uses this) |
 | `--screenshots` | Saves frames and dumps to `run/screenshots` |
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
+| `--write-key-bindings` | Writes `user/key_bindings.ini` with the defaults if there's none, then exits |
+
+`AR_LOG_FILE=<path>` writes the log there as well as to the console (Recomp Launcher sets it). A build older than the
+`VERSION` file of the source it's in asks before playing, and exits with 75 on No; `AR_NO_VERSION_CHECK=1` skips that.
+`RECOMPLAUNCHER_MODE=bigpicture` starts borderless when there's no `--display`.
+
+The build without a window: `tools\recomplauncher\prepare.cmd --game <iso>` (FFmpeg if missing, then
+`out\setup\ARPrepare.exe --prepare --game <iso> [--dlc <folder>] [--any-version]`). It builds into `out\build` like
+Setup and plays from `out\build\ARRecomp`, not `run\`. See [RECOMPLAUNCHER.md](RECOMPLAUNCHER.md).
 
 ## Tests (`tools/test`)
 

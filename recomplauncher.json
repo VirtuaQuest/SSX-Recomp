@@ -1,0 +1,216 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "SSX Recompiled",
+  "repo": "VirtuaQuest/SSX-resled",
+  "requires": ["settings.args", "settings.choices", "settings.ini", "settings.bindings", "settings.groups", "exit_codes"],
+  "game": {
+    "kind": "iso_or_folder",
+    "label": "Your SSX (2012) Xbox 360 disc image (.iso) or a folder with its files: the USA release.",
+    "check": { "xdvdfs": "audiobestream.big", "file": "audiobestream.big" }
+  },
+  "prepare": {
+    "program": ["tools/recomplauncher/prepare.cmd"],
+    "args": ["--game", "{game}"],
+    "label": "Building SSX on this PC from your disc: 10 to 30 minutes, once",
+    "timeout": 7200
+  },
+  "start": {
+    "program": ["out/build/ARRecomp/ARRecomp.exe"],
+    "args": ["--game", "{game}"],
+    "env": { "AR_LOG_FILE": "{install}/out/build/ARRecomp/logs/ssx.log" }
+  },
+  "saves": [
+    "{install}/out/build/ARRecomp/user/content/00000001",
+    "{install}/out/build/ARRecomp/user/key_bindings.ini"
+  ],
+  "folders": {
+    "saves": [{ "path": "{install}/out/build/ARRecomp/user/content/00000001" }],
+    "logs": [{ "path": "{install}/out/build/ARRecomp/logs" }],
+    "user": [{ "path": "{install}/out/build/ARRecomp/user" }],
+    "build": [{ "path": "{install}/out/setup" }]
+  },
+  "actions": [
+    { "id": "open_saves", "label": "Open the saves folder", "open": "saves" },
+    { "id": "open_build_log", "label": "Open the build log", "help": "setup.log: what the last build did.", "open": "build" },
+    { "id": "clear_shaders", "label": "Clear the shader cache", "help": "The game makes it again as it plays, with a little stutter the first time.", "clear": "user/shader_cache" }
+  ],
+  "exit_codes": {
+    "0": "ok",
+    "75": "SSX Recompiled was updated, and the game hasn't been built again since. Choose your disc image again on this page to build the new version.",
+    "1": "The game couldn't start with your copy. Check that it's the SSX USA disc image and choose it again on this page."
+  },
+  "looks": { "graphics": "d3d12" },
+  "config": [
+    {
+      "id": "keys",
+      "format": "ini",
+      "file": [{ "path": "{install}/out/build/ARRecomp/user/key_bindings.ini" }]
+    }
+  ],
+  "groups": [{ "id": "Advanced", "advanced": true }],
+  "settings": [
+    {
+      "id": "resolution", "label": "Resolution", "group": "Display", "in": "args",
+      "help": "The window's size, or the screen's in full screen.",
+      "choices": [
+        { "label": "1280 x 720 (original)", "args": [] },
+        { "label": "1600 x 900", "args": ["--resolution", "1600x900"] },
+        { "label": "1920 x 1080", "args": ["--resolution", "1920x1080"] },
+        { "label": "2560 x 1440", "args": ["--resolution", "2560x1440"] },
+        { "label": "3840 x 2160", "args": ["--resolution", "3840x2160"] },
+        { "label": "2560 x 1080 (ultrawide)", "args": ["--resolution", "2560x1080", "--ultrawide"] },
+        { "label": "3440 x 1440 (ultrawide)", "args": ["--resolution", "3440x1440", "--ultrawide"] }
+      ]
+    },
+    {
+      "id": "display", "label": "Display mode", "group": "Display", "in": "args",
+      "help": "Borderless is a window that covers the whole screen. Big Picture mode starts borderless unless this says otherwise.",
+      "choices": [
+        { "label": "Game's choice", "args": [] },
+        { "label": "Windowed", "args": ["--display", "windowed"] },
+        { "label": "Borderless", "args": ["--display", "borderless"] },
+        { "label": "Full screen", "args": ["--display", "fullscreen"] }
+      ]
+    },
+    {
+      "id": "fps", "label": "Frame rate", "group": "Display", "in": "args",
+      "help": "60 runs the game at its normal speed with twice the frames. SSX holds itself to 60 at most.",
+      "choices": [
+        { "label": "30 fps (original)", "args": [] },
+        { "label": "60 fps", "args": ["--fps", "60"] }
+      ]
+    },
+    {
+      "id": "vsync", "label": "V-Sync", "group": "Display", "in": "args",
+      "help": "Stops the picture tearing.",
+      "choices": [
+        { "label": "Off", "args": [] },
+        { "label": "On", "args": ["--vsync"] }
+      ]
+    },
+    {
+      "id": "render_scale", "label": "Render scale", "group": "Graphics", "in": "args",
+      "help": "How sharp the 3D picture is drawn, from the console's 720p up. 2x needs a mid-range graphics card or better.",
+      "choices": [
+        { "label": "1x (720p, original)", "args": [] },
+        { "label": "2x (1440p)", "args": ["--render-scale", "2"] },
+        { "label": "3x (2160p)", "args": ["--render-scale", "3"] },
+        { "label": "4x (2880p)", "args": ["--render-scale", "4"] }
+      ]
+    },
+    {
+      "id": "antialiasing", "label": "Anti-aliasing", "group": "Graphics", "in": "args",
+      "help": "FXAA smooths edges for almost no cost.",
+      "choices": [
+        { "label": "Off", "args": [] },
+        { "label": "FXAA", "args": ["--antialiasing", "1"] }
+      ]
+    },
+    {
+      "id": "anisotropic", "label": "Texture filtering", "group": "Graphics", "in": "args",
+      "help": "Sharper snow and slopes seen at an angle.",
+      "choices": [
+        { "label": "As the game asks (original)", "args": [] },
+        { "label": "2x", "args": ["--anisotropic", "2"] },
+        { "label": "4x", "args": ["--anisotropic", "4"] },
+        { "label": "8x", "args": ["--anisotropic", "8"] },
+        { "label": "16x", "args": ["--anisotropic", "16"] }
+      ]
+    },
+    {
+      "id": "texture_detail", "label": "Texture detail", "group": "Graphics", "in": "args",
+      "help": "Sharper textures in the distance. Ultra may shimmer.",
+      "choices": [
+        { "label": "Original", "args": [] },
+        { "label": "High", "args": ["--texture-lod-bias", "-0.5"] },
+        { "label": "Ultra", "args": ["--texture-lod-bias", "-1"] }
+      ]
+    },
+    {
+      "id": "sharpen", "label": "Sharpening", "group": "Graphics", "in": "args",
+      "help": "Crisper detail after the picture is scaled to the window.",
+      "choices": [
+        { "label": "Off", "args": [] },
+        { "label": "Low", "args": ["--sharpen", "1"] },
+        { "label": "Medium", "args": ["--sharpen", "2"] },
+        { "label": "High", "args": ["--sharpen", "3"] }
+      ]
+    },
+    {
+      "id": "mouse_sensitivity", "label": "Mouse sensitivity", "group": "Controls", "in": "args",
+      "help": "How far moving the mouse pushes the trick stick.",
+      "choices": [
+        { "label": "Medium", "args": [] },
+        { "label": "Low", "args": ["--mouse-sensitivity", "0.5"] },
+        { "label": "High", "args": ["--mouse-sensitivity", "2"] },
+        { "label": "Very high", "args": ["--mouse-sensitivity", "4"] }
+      ]
+    },
+    {
+      "id": "invert_mouse", "label": "Mouse direction", "group": "Controls", "in": "args",
+      "help": "",
+      "choices": [
+        { "label": "Normal (mouse up is stick up)", "args": [] },
+        { "label": "Inverted", "args": ["--invert-mouse"] }
+      ]
+    },
+    {
+      "id": "keys", "label": "Keyboard and mouse", "group": "Controls", "in": "keys",
+      "help": "Keyboard, mouse and controller all work at once. Click into the game's window to let the mouse drive the trick stick; Alt gives the cursor back.",
+      "bindings": {
+        "separator": ", ",
+        "max": 2,
+        "names": {
+          "Return": "Enter", "Shift": "LeftShift", "Ctrl": "LeftCtrl",
+          "Mouse Left": "MouseLeft", "Mouse Right": "MouseRight", "Mouse Middle": "MouseMiddle", "Mouse 4": "Mouse4", "Mouse 5": "Mouse5"
+        },
+        "actions": [
+          { "label": "Jump (A)", "key": "Keys/A" },
+          { "label": "Trick, right grab (B)", "key": "Keys/B" },
+          { "label": "Trick, left grab (X)", "key": "Keys/X" },
+          { "label": "Front grab (Y)", "key": "Keys/Y" },
+          { "label": "Boost (RT)", "key": "Keys/RightTrigger" },
+          { "label": "Grind (LT)", "key": "Keys/LeftTrigger" },
+          { "label": "Rewind (LB)", "key": "Keys/LeftShoulder" },
+          { "label": "Wingsuit (RB)", "key": "Keys/RightShoulder" },
+          { "label": "Lean forward, flip forward", "key": "Keys/LeftStickUp" },
+          { "label": "Lean back, flip back", "key": "Keys/LeftStickDown" },
+          { "label": "Steer left, spin left", "key": "Keys/LeftStickLeft" },
+          { "label": "Steer right, spin right", "key": "Keys/LeftStickRight" },
+          { "label": "Trick stick up", "key": "Keys/RightStickUp" },
+          { "label": "Trick stick down", "key": "Keys/RightStickDown" },
+          { "label": "Trick stick left", "key": "Keys/RightStickLeft" },
+          { "label": "Trick stick right", "key": "Keys/RightStickRight" },
+          { "label": "Pause (Start)", "key": "Keys/Start" },
+          { "label": "Back button", "key": "Keys/Back" },
+          { "label": "Left stick click", "key": "Keys/LeftStickClick" },
+          { "label": "Right stick click", "key": "Keys/RightStickClick" },
+          { "label": "Menus: up", "key": "Keys/DpadUp" },
+          { "label": "Menus: down", "key": "Keys/DpadDown" },
+          { "label": "Menus: left", "key": "Keys/DpadLeft" },
+          { "label": "Menus: right", "key": "Keys/DpadRight" }
+        ]
+      },
+      "defaults": {
+        "Keys/A": "Space, Enter", "Keys/B": "E, Backspace", "Keys/X": "Q", "Keys/Y": "F",
+        "Keys/RightTrigger": "MouseLeft, LeftShift", "Keys/LeftTrigger": "MouseRight, C",
+        "Keys/LeftShoulder": "R, PageUp", "Keys/RightShoulder": "LeftCtrl, PageDown",
+        "Keys/LeftStickUp": "W", "Keys/LeftStickDown": "S", "Keys/LeftStickLeft": "A", "Keys/LeftStickRight": "D",
+        "Keys/RightStickUp": "I, Num8", "Keys/RightStickDown": "K, Num2", "Keys/RightStickLeft": "J, Num4", "Keys/RightStickRight": "L, Num6",
+        "Keys/Start": "Escape", "Keys/Back": "Tab", "Keys/LeftStickClick": "Z", "Keys/RightStickClick": "MouseMiddle, V",
+        "Keys/DpadUp": "Up", "Keys/DpadDown": "Down", "Keys/DpadLeft": "Left", "Keys/DpadRight": "Right"
+      }
+    },
+    {
+      "id": "controller", "label": "Controller", "group": "Advanced", "in": "args",
+      "help": "Which controller the game reads, when more than one is plugged in.",
+      "choices": [
+        { "label": "1", "args": [] },
+        { "label": "2", "args": ["--controller", "2"] },
+        { "label": "3", "args": ["--controller", "3"] },
+        { "label": "4", "args": ["--controller", "4"] }
+      ]
+    }
+  ]
+}

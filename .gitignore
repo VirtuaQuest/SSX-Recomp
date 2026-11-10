@@ -5,3 +5,5 @@ ARRecompLib/ppc/
 out/
 run/
 user/
+# FFmpeg as tools/recomplauncher/get_ffmpeg.ps1 downloads it (it's LGPL, but a build of it, not source to keep here).
+thirdparty/ffmpeg/

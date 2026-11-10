@@ -15,6 +15,11 @@ target_include_directories(ARRecomp PRIVATE
 
 target_precompile_headers(ARRecomp PRIVATE "stdafx.h")
 
+# The source's version, for the check in main.cpp that the build is of the source that's here.
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/source_version.h"
+    CONTENT "#pragma once\n#define AR_SOURCE_VERSION \"${AR_SOURCE_VERSION}\"\n")
+target_include_directories(ARRecomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
 target_link_libraries(ARRecomp PRIVATE
     ARRecompLib
     XenonUtils

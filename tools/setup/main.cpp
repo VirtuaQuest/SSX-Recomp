@@ -85,6 +85,11 @@ namespace
     std::ofstream g_logFile;
     std::mutex g_logMutex;
 
+    // Without a window (ARPrepare.exe --prepare, Recomp Launcher's setup step): what would go to the window goes to the
+    // standard output instead, as "progress <0 to 1> <what>" lines for the launcher and plain lines for a person.
+    bool g_prepare = false;
+    std::mutex g_outputMutex;
+
     std::wstring Widen(const std::string& text)
     {
         if (text.empty())
@@ -115,28 +120,72 @@ namespace
         }
     }
 
+    void PrintLine(const std::string& line)
+    {
+        HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (output == nullptr || output == INVALID_HANDLE_VALUE)
+            return;
+        std::string text = line + "\n";
+        DWORD written;
+        WriteFile(output, text.data(), DWORD(text.size()), &written, nullptr);
+    }
+
+    // The bar as a progress line: when the step changes, or at most four times a second.
+    void PrintProgress(int progress, const std::wstring& step, const std::wstring& remaining)
+    {
+        static std::wstring lastStep;
+        static std::chrono::steady_clock::time_point lastTime;
+        std::lock_guard lock(g_outputMutex);
+        auto now = std::chrono::steady_clock::now();
+        std::wstring stepName = step.substr(0, step.find(L" ("));
+        if (stepName == lastStep && now - lastTime < std::chrono::milliseconds(250))
+            return;
+        lastStep = stepName;
+        lastTime = now;
+        char number[16];
+        snprintf(number, sizeof(number), "%.3f", std::clamp(progress, 0, 1000) / 1000.0);
+        PrintLine(std::string("progress ") + number + " " + Narrow(remaining.empty() ? step : step + L", " + remaining));
+    }
+
     // A line for the window as well as the log file.
     void Say(const std::wstring& line)
     {
         WriteLog(Narrow(line));
+        if (g_prepare)
+        {
+            std::lock_guard lock(g_outputMutex);
+            PrintLine(Narrow(line));
+        }
         std::lock_guard lock(g_shared.mutex);
         g_shared.lines.push_back(line);
     }
 
     void SetStep(const std::wstring& step, int progress)
     {
-        std::lock_guard lock(g_shared.mutex);
-        g_shared.step = step;
-        g_shared.progress = progress;
+        std::wstring remaining;
+        {
+            std::lock_guard lock(g_shared.mutex);
+            g_shared.step = step;
+            g_shared.progress = progress;
+            remaining = g_shared.remaining;
+        }
+        if (g_prepare)
+            PrintProgress(progress, step, remaining);
     }
 
     void SetProgressOnly(int progress, const std::wstring& step = {}, const std::wstring& remaining = {})
     {
-        std::lock_guard lock(g_shared.mutex);
-        g_shared.progress = progress;
-        if (!step.empty())
-            g_shared.step = step;
-        g_shared.remaining = remaining;
+        std::wstring shown;
+        {
+            std::lock_guard lock(g_shared.mutex);
+            g_shared.progress = progress;
+            if (!step.empty())
+                g_shared.step = step;
+            g_shared.remaining = remaining;
+            shown = g_shared.step;
+        }
+        if (g_prepare)
+            PrintProgress(progress, shown, remaining);
     }
 
     // ---- Running programs ----
@@ -276,9 +325,22 @@ namespace
         for (const auto& entry : fs::directory_iterator(programs / L"Windows Kits\\10\\bin", ec))
             tools.sdk |= Exists(entry.path() / L"x64\\dxcompiler.dll");
 
-        fs::path xenon = GetEnv(L"XENONRECOMP_ROOT").empty() ? g_root.parent_path() / L"XenonRecomp" : fs::path(GetEnv(L"XENONRECOMP_ROOT"));
-        if (Exists(xenon / L"XenonUtils\\ppc_context.h") && !fs::is_empty(xenon / L"thirdparty\\simde", ec) && !ec)
-            tools.xenonRecomp = xenon;
+        // XenonRecomp: XENONRECOMP_ROOT, a checkout next to this folder, or the copy in thirdparty (the submodule, and what a
+        // release carries), as the build looks for it.
+        std::vector<fs::path> xenonFolders;
+        if (auto dir = GetEnv(L"XENONRECOMP_ROOT"); !dir.empty())
+            xenonFolders.push_back(dir);
+        else
+            xenonFolders = { g_root.parent_path() / L"XenonRecomp", g_root / L"thirdparty" / L"XenonRecomp" };
+        for (const fs::path& xenon : xenonFolders)
+        {
+            if (Exists(xenon / L"XenonUtils\\ppc_context.h") && !fs::is_empty(xenon / L"thirdparty\\simde", ec) && !ec)
+            {
+                tools.xenonRecomp = xenon;
+                break;
+            }
+            ec.clear();
+        }
 
         // FFmpeg decodes the game's XMA audio: a shared LGPL build (include, lib and bin folders), from FFMPEG_ROOT, a
         // thirdparty/ffmpeg folder here, or an ffmpeg* folder next to this one or in its _tools folder.
@@ -332,7 +394,7 @@ namespace
         show(1, g_tools.sdk, L"Windows SDK", L"add it in that installer");
         show(2, !g_tools.clang.empty(), L"LLVM clang-cl", L"install LLVM");
         show(3, !g_tools.cmake.empty() && !g_tools.ninja.empty(), L"CMake and Ninja", L"add CMake in VS installer");
-        show(4, !g_tools.xenonRecomp.empty(), L"XenonRecomp", L"clone next to this folder");
+        show(4, !g_tools.xenonRecomp.empty(), L"XenonRecomp", L"git submodule update --init --recursive");
         show(5, g_tools.disk, L"5 GB of disk space", L"not enough free");
         show(6, !g_tools.ffmpeg.empty(), L"FFmpeg (audio)", L"unzip a win64 lgpl-shared build next to this folder");
     }
@@ -605,6 +667,8 @@ namespace
     bool Failed(const std::wstring& message)
     {
         Say(L"Stopped: " + message);
+        if (g_prepare)
+            PrintProgress(0, L"Stopped: " + message, L"");
         return false;
     }
 
@@ -730,6 +794,16 @@ namespace
         fs::path ini = outputFolder / L"launcher.ini";
         WritePrivateProfileStringW(L"Launcher", L"Game", RelativeTo(choices.game, outputFolder).c_str(), ini.c_str());
         WritePrivateProfileStringW(L"Launcher", L"WorkingFolder", RelativeTo(g_runFolder, outputFolder).c_str(), ini.c_str());
+
+        if (g_prepare)
+        {
+            // For Recomp Launcher: the keyboard layout is there to show on the game's page, and the log has a folder. The
+            // icon is left to the game's first start (it takes it then): taking it now would open the game's window.
+            fs::create_directories(outputFolder / L"logs", ec);
+            Run(Quote(outputFolder / L"ARRecomp.exe") + L" --write-key-bindings", outputFolder, logOnly, true, g_job);
+            SetProgressOnly(BAR_ICON, L"Finishing");
+            return true;
+        }
 
         // The icon: the game's own, read from the player's executable by the game with --make-icon, in a folder of its own, so saves aren't touched.
         SetProgressOnly(BAR_COMPILE, L"Taking the icon from your game", L"");
@@ -1094,6 +1168,127 @@ namespace
                 return false;
         }
     }
+
+    void SetFolders()
+    {
+        g_outFolder = g_root / L"out";
+        g_setupFolder = g_outFolder / L"setup";
+        g_buildFolder = g_outFolder / L"build";
+        g_runFolder = g_root / L"run";
+        g_logPath = g_setupFolder / L"setup.log";
+    }
+
+    // ---- Without a window ----
+
+    // Exit codes of --prepare (also in recomplauncher.json and docs/RECOMPLAUNCHER.md).
+    enum PrepareExit
+    {
+        PREPARE_OK = 0,
+        PREPARE_USAGE = 1,
+        PREPARE_TOOLS = 2,
+        PREPARE_GAME = 3,
+        PREPARE_VERSION = 4,
+        PREPARE_BUILD = 5,
+    };
+
+    int Stop(int code, const std::wstring& message)
+    {
+        Say(L"Stopped: " + message);
+        PrintProgress(0, L"Stopped: " + message, L"");
+        return code;
+    }
+
+    // Recomp Launcher's setup step (and anyone's, from a command line): the same build as the window's Build button, with the
+    // game where it runs from out\build\ARRecomp (its saves in user there), and no window.
+    //   ARPrepare.exe --prepare --game <disc image or folder> [--dlc <folder or package>] [--any-version]
+    int Prepare(int argc, wchar_t** argv)
+    {
+        g_prepare = true;
+        std::wstring game, dlc;
+        bool anyVersion = false;
+        for (int i = 2; i < argc; i++)
+        {
+            std::wstring arg = argv[i];
+            if (arg == L"--game" && i + 1 < argc)
+                game = argv[++i];
+            else if (arg == L"--dlc" && i + 1 < argc)
+                dlc = argv[++i];
+            else if (arg == L"--any-version")
+                anyVersion = true;
+            else
+            {
+                PrintLine("Usage: ARPrepare.exe --prepare --game <disc image or folder> [--dlc <folder or package>] [--any-version]");
+                return PREPARE_USAGE;
+            }
+        }
+
+        std::error_code ec;
+        fs::create_directories(g_setupFolder, ec);
+        g_logFile.open(g_logPath, std::ios::binary | std::ios::trunc);
+        g_runFolder = g_buildFolder / L"ARRecomp";
+        g_started = std::chrono::steady_clock::now();
+
+        SetStep(L"Checking the build tools", 0);
+        g_tools = FindTools();
+        if (!g_tools.Ready())
+        {
+            std::wstring missing;
+            auto need = [&](bool good, const wchar_t* what) { if (!good) missing += (missing.empty() ? L"" : L", ") + std::wstring(what); };
+            need(!g_tools.vcvars.empty(), L"Visual Studio 2022 Build Tools with Desktop development with C++");
+            need(g_tools.sdk, L"the Windows SDK");
+            need(!g_tools.clang.empty(), L"C++ Clang tools for Windows (in the Visual Studio installer) or LLVM");
+            need(!g_tools.cmake.empty() && !g_tools.ninja.empty(), L"CMake and Ninja (C++ CMake tools in the Visual Studio installer)");
+            need(!g_tools.xenonRecomp.empty(), L"XenonRecomp in thirdparty\\XenonRecomp");
+            need(!g_tools.ffmpeg.empty(), L"FFmpeg in thirdparty\\ffmpeg");
+            need(g_tools.disk, L"5 GB of free disk space");
+            return Stop(PREPARE_TOOLS, L"this PC needs " + missing + L".");
+        }
+
+        if (game.empty())
+            return Stop(PREPARE_GAME, L"no copy of the game was given (--game).");
+        std::vector<uint8_t> xex;
+        std::wstring error;
+        if (!package::ReadGameFile(game, "default.xex", xex, error))
+            return Stop(PREPARE_GAME, error);
+        if (package::Sha1(xex.data(), xex.size()) != KNOWN_EXECUTABLE_SHA1)
+        {
+            if (!anyVersion)
+                return Stop(PREPARE_VERSION, L"this copy has a different version of SSX from the one this project was made for "
+                    L"(the USA disc). Its code is at other places, so it wouldn't work.");
+            Say(L"A different version from the one this project was made for: built anyway (--any-version).");
+        }
+
+        // Everything started goes if this does (Recomp Launcher stops its setup step by ending it).
+        g_job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+
+        if (!BuildAll({ game, dlc }))
+        {
+            Say(L"The whole log is in " + g_logPath.wstring());
+            return PREPARE_BUILD;
+        }
+        int seconds = int(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_started).count());
+        Say(L"Built in " + std::to_wstring(seconds / 60) + L" min " + std::to_wstring(seconds % 60) + L" s.");
+        PrintProgress(1000, L"Built", L"");
+        return PREPARE_OK;
+    }
+}
+
+// ARPrepare.exe: the same program for a console, without a window.
+int wmain(int argc, wchar_t** argv)
+{
+    if (!FindRoot())
+    {
+        PrintLine("This has to run from inside the project's folder.");
+        return PREPARE_USAGE;
+    }
+    SetFolders();
+    if (argc >= 2 && std::wstring(argv[1]) == L"--prepare")
+        return Prepare(argc, argv);
+    PrintLine("Usage: ARPrepare.exe --prepare --game <disc image or folder> [--dlc <folder or package>] [--any-version]");
+    return PREPARE_USAGE;
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
@@ -1104,11 +1299,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         MessageBoxW(nullptr, L"Setup has to run from inside the project's folder. Use Setup.bat there.", L"Setup", MB_ICONERROR);
         return 1;
     }
-    g_outFolder = g_root / L"out";
-    g_setupFolder = g_outFolder / L"setup";
-    g_buildFolder = g_outFolder / L"build";
-    g_runFolder = g_root / L"run";
-    g_logPath = g_setupFolder / L"setup.log";
+    SetFolders();
 
     INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&controls);

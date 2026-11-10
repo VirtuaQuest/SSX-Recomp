@@ -3,19 +3,29 @@
 A native PC port of SSX (Xbox 360, 2012) by static recompilation. This project contains no game code, art or audio. You
 build the game on your own PC from your own copy.
 
+## With Recomp Launcher
+
+In [Recomp Launcher](https://github.com/elripalda/RecompLauncher), install SSX Recompiled and pick your SSX disc image
+when it asks. The launcher checks it, builds the game on your PC from it (10 to 30 minutes, once) and then plays it
+with the settings and key bindings you choose on the game's page. The build needs Visual Studio 2022 Build Tools with
+"Desktop development with C++" and "C++ Clang tools for Windows", and about 5 GB free; FFmpeg is downloaded for you.
+How it works, and how a release is made: [docs/RECOMPLAUNCHER.md](docs/RECOMPLAUNCHER.md).
+
 ## Building
 
-You need:
+Without the launcher, you need:
 
 - Your own Xbox 360 copy of the game: a disc image (`.iso`) or a folder of its files. DLC packages are optional.
 - [Visual Studio](https://visualstudio.microsoft.com/) 2022 or its Build Tools, with "Desktop development with C++" and
   a Windows SDK. That includes CMake and Ninja.
 - [LLVM](https://llvm.org/) (`clang-cl`), or "C++ Clang tools for Windows" in the Visual Studio installer.
-- The XenonRecomp fork, in a folder named `XenonRecomp` next to this one, with its submodules
-  (`git clone --recurse-submodules`), on the `xenon-ssx` branch.
+- The XenonRecomp fork this project uses, which is a submodule (`thirdparty/XenonRecomp`, the `xenon-ssx` branch of this
+  repository): clone with `git clone --recurse-submodules`, or run `git submodule update --init --recursive`. A
+  checkout named `XenonRecomp` next to this folder is used instead when there is one. A release zip has it already.
 - FFmpeg, which decodes the game's audio: a Windows x64 **LGPL shared** build with `include`, `lib` and `bin` folders
   (for example `ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip` from BtbN's FFmpeg builds). Unzip it into
   `thirdparty\ffmpeg`, or anywhere next to this folder in a folder whose name starts with `ffmpeg`, or set `FFMPEG_ROOT`.
+  `tools\recomplauncher\get_ffmpeg.ps1` downloads and checks that one into `thirdparty\ffmpeg`.
 - About 5 GB of free disk space.
 
 Then run `Setup.bat`. Choose your game and, if you have it, your DLC folder, and press **Build**. Setup shows what it

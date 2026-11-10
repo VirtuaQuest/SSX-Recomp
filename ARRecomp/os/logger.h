@@ -3,7 +3,9 @@
 #include <fmt/core.h>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <share.h>
 
 namespace logger
 {
@@ -18,6 +20,17 @@ namespace logger
     inline Level g_minimumLevel = Level::Info;
     inline std::mutex g_mutex;
 
+    // AR_LOG_FILE: the log is written there as well (for Recomp Launcher's crash reports). Opened at the first line.
+    inline std::FILE* LogFile()
+    {
+        static std::FILE* file = []() -> std::FILE*
+            {
+                const char* path = getenv("AR_LOG_FILE");
+                return path != nullptr && *path != '\0' ? _fsopen(path, "w", _SH_DENYWR) : nullptr;
+            }();
+        return file;
+    }
+
     template<typename... Args>
     void Print(Level level, const char* function, fmt::format_string<Args...> format, Args&&... args)
     {
@@ -30,6 +43,11 @@ namespace logger
         std::lock_guard lock(g_mutex);
         fmt::print(stderr, "[{}] {}: {}\n", prefixes[int(level)], function, message);
         fflush(stderr);
+        if (std::FILE* file = LogFile())
+        {
+            fmt::print(file, "[{}] {}: {}\n", prefixes[int(level)], function, message);
+            fflush(file);
+        }
     }
 }
 

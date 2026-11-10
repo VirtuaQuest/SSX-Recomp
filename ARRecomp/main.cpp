@@ -13,6 +13,8 @@
 #include <kernel/vfs.h>
 #include <kernel/xex_loader.h>
 
+#include <source_version.h>
+
 #ifdef _WIN32
 #include <timeapi.h>
 #endif
@@ -21,6 +23,52 @@ Memory g_memory;
 
 void InstallCrashHandler();
 void InstallMemoryWatch();
+
+// The exit code when the player chose not to play a build that's older than the source next to it (recomplauncher.json
+// maps it to a message).
+static constexpr int EXIT_OLD_BUILD = 75;
+
+#define AR_WIDEN_(text) L##text
+#define AR_WIDEN(text) AR_WIDEN_(text)
+
+// A build made from an older version of the source than the one it sits in (out/build/ARRecomp inside the project): the
+// source was updated (by Recomp Launcher, or git) and not built since, so this build doesn't have the update's changes.
+// It still works as the version it is. The player is told, and can play it anyway; in Recomp Launcher's Big Picture
+// mode, where there may be no mouse to answer, it just plays. AR_NO_VERSION_CHECK turns this off.
+static bool PlayOlderBuild()
+{
+    if (getenv("AR_NO_VERSION_CHECK"))
+        return true;
+    wchar_t exe[MAX_PATH * 2];
+    if (GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe))) == 0)
+        return true;
+    std::filesystem::path root = std::filesystem::path(exe).parent_path().parent_path().parent_path().parent_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(root / "ARRecompLib" / "config" / "AR.toml", ec))
+        return true;
+    std::string source;
+    {
+        std::ifstream file(root / "VERSION");
+        if (!std::getline(file, source))
+            return true;
+    }
+    while (!source.empty() && isspace(uint8_t(source.back())))
+        source.pop_back();
+    if (source.empty() || source == AR_SOURCE_VERSION)
+        return true;
+
+    LOGF_WARNING("this build is of version {}, and the source here is version {}: build it again to get the update", AR_SOURCE_VERSION, source);
+    const char* mode = getenv("RECOMPLAUNCHER_MODE");
+    if (mode != nullptr && std::string_view(mode) == "bigpicture")
+        return true;
+    std::wstring how = getenv("RECOMPLAUNCHER") != nullptr ?
+        L"To build it, choose your SSX disc image again on the game's page in Recomp Launcher: that runs the build (about 10 to 30 minutes)." :
+        L"To build it, run Setup.bat in the project's folder and press Build.";
+    std::wstring text = L"SSX Recompiled was updated to version " + std::wstring(source.begin(), source.end()) +
+        L", but the game hasn't been built again since: this build is version " AR_WIDEN(AR_SOURCE_VERSION) L".\n\n" + how +
+        L"\n\nPlay this build for now?";
+    return MessageBoxW(nullptr, text.c_str(), L"SSX Recompiled", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1) == IDYES;
+}
 
 static void PrintUsage()
 {
@@ -64,6 +112,14 @@ int main(int argc, char* argv[])
     float mouseSensitivity = 1.0f;
     bool invertMouse = false;
     bool gpuSurvey = false;
+    bool displayGiven = false;
+
+    // The log goes to AR_LOG_FILE too when that's set (Recomp Launcher shows the newest log with a crash report).
+    if (const char* logFile = getenv("AR_LOG_FILE"); logFile != nullptr && *logFile != '\0')
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(logFile).parent_path(), ec);
+    }
 
     for (int i = 1; i < argc; i++)
     {
@@ -93,6 +149,7 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--display" && i + 1 < argc)
         {
+            displayGiven = true;
             std::string_view mode = argv[++i];
             gpu::g_videoSettings.mode = mode == "fullscreen" ? gpu::DisplayMode::Fullscreen :
                 mode == "borderless" ? gpu::DisplayMode::Borderless : gpu::DisplayMode::Windowed;
@@ -158,6 +215,14 @@ int main(int argc, char* argv[])
         return 1;
     }
     kbm::SetMouseOptions(mouseSensitivity, invertMouse);
+
+    // Started from Recomp Launcher's Big Picture mode (its full screen view for a controller): full screen, unless the
+    // display mode was chosen.
+    if (const char* mode = getenv("RECOMPLAUNCHER_MODE"); !displayGiven && mode != nullptr && std::string_view(mode) == "bigpicture")
+        gpu::g_videoSettings.mode = gpu::DisplayMode::Borderless;
+
+    if (!getenv("AR_MAKE_ICON") && !PlayOlderBuild())
+        return EXIT_OLD_BUILD;
 
     if (gpuSurvey)
         gpu::EnableSurvey(userPath / "shaders");

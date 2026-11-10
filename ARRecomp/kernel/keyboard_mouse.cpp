@@ -120,6 +120,15 @@ namespace kbm
         for (const KeyName& entry : KEY_NAMES)
             if (_stricmp(entry.name, name.c_str()) == 0)
                 return entry.key;
+        // Other names for some keys, as Recomp Launcher's key binding editor writes them.
+        static constexpr KeyName ALIASES[] = {
+            { VK_RETURN, "Return" }, { VK_LSHIFT, "Shift" }, { VK_LCONTROL, "Ctrl" }, { VK_LCONTROL, "Control" },
+            { VK_LBUTTON, "Mouse Left" }, { VK_RBUTTON, "Mouse Right" }, { VK_MBUTTON, "Mouse Middle" }, { VK_XBUTTON1, "Mouse 4" },
+            { VK_XBUTTON2, "Mouse 5" },
+        };
+        for (const KeyName& entry : ALIASES)
+            if (_stricmp(entry.name, name.c_str()) == 0)
+                return entry.key;
         if (name.rfind("0x", 0) == 0)
             return std::clamp(int(strtol(name.c_str() + 2, nullptr, 16)), 0, 255);
         return -1;

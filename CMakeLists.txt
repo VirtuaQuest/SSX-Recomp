@@ -16,9 +16,30 @@ if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR "The recompiled code requires Clang (clang-cl on Windows).")
 endif()
 
-# XenonRecomp provides the recompiler, XenonUtils (XEX loading) and shared third party libraries.
-set(XENONRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../XenonRecomp" CACHE PATH "Path to the XenonRecomp checkout")
+# XenonRecomp provides the recompiler, XenonUtils (XEX loading) and shared third party libraries: XENONRECOMP_ROOT, a
+# checkout next to this folder (where it's worked on), or the copy in thirdparty/XenonRecomp (the submodule, and what a
+# release carries).
+if (NOT XENONRECOMP_ROOT AND DEFINED ENV{XENONRECOMP_ROOT})
+    set(XENONRECOMP_ROOT "$ENV{XENONRECOMP_ROOT}")
+endif()
+if (NOT XENONRECOMP_ROOT)
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../XenonRecomp/XenonUtils/ppc_context.h")
+        set(XENONRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../XenonRecomp")
+    else()
+        set(XENONRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenonRecomp")
+    endif()
+endif()
+set(XENONRECOMP_ROOT "${XENONRECOMP_ROOT}" CACHE PATH "Path to the XenonRecomp checkout" FORCE)
+if (NOT EXISTS "${XENONRECOMP_ROOT}/XenonUtils/ppc_context.h")
+    message(FATAL_ERROR "XenonRecomp was not found (XENONRECOMP_ROOT: '${XENONRECOMP_ROOT}'). Run git submodule update --init "
+        "--recursive, or clone the xenon-ssx branch next to this folder as XenonRecomp.")
+endif()
 add_subdirectory(${XENONRECOMP_ROOT} XenonRecomp EXCLUDE_FROM_ALL)
+
+# The source's version (VERSION). A build knows which one it was made from, so an update to the source that hasn't been
+# built yet is noticed when the game starts.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" AR_SOURCE_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
 add_library(o1heap STATIC "thirdparty/o1heap/o1heap.c")
 target_include_directories(o1heap PUBLIC "thirdparty/o1heap")

@@ -1,0 +1,4 @@
+[submodule "thirdparty/XenonRecomp"]
+	path = thirdparty/XenonRecomp
+	url = https://github.com/VirtuaQuest/SSX-Recomp.git
+	branch = xenon-ssx
