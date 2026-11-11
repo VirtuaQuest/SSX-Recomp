@@ -2,7 +2,7 @@
   "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
   "format": 1,
   "name": "SSX Recompiled",
-  "repo": "VirtuaQuest/SSX-resled",
+  "repo": "VirtuaQuest/SSX-Recomp",
   "requires": ["settings.args", "settings.choices", "settings.ini", "settings.bindings", "settings.groups", "exit_codes"],
   "game": {
     "kind": "iso_or_folder",

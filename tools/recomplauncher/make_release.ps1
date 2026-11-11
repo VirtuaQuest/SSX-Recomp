@@ -1,14 +1,14 @@
-﻿# Makes the release zip that Recomp Launcher installs: this project's source at HEAD, with XenonRecomp and its libraries
+# Makes the release zip that Recomp Launcher installs: this project's source at HEAD, with XenonRecomp and its libraries
 # (at the commits the submodules name) in thirdparty\XenonRecomp, and recomplauncher.json at the top. Only files in git go
 # in, so nothing of the game can: the player's own copy is only read on their PC, by tools\recomplauncher\prepare.cmd.
-# Usage: powershell -ExecutionPolicy Bypass -File tools\recomplauncher\make_release.ps1   ->  out\release\SSX-resled-v<VERSION>-Windows-x64.zip
+# Usage: powershell -ExecutionPolicy Bypass -File tools\recomplauncher\make_release.ps1   ->  out\release\SSX-Recomp-v<VERSION>-Windows-x64.zip
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $root
 
 if (git status --porcelain --untracked-files=no) { throw 'There are uncommitted changes: the release is made from HEAD, so commit them first.' }
 $version = (Get-Content VERSION -TotalCount 1).Trim()
-$name = "SSX-resled-v$version-Windows-x64"
+$name = "SSX-Recomp-v$version-Windows-x64"
 $out = Join-Path $root 'out\release'
 $stage = Join-Path $out 'stage'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
@@ -53,7 +53,7 @@ function Export-Submodules([string[]]$checkouts, [string]$commit, [string]$into)
     }
 }
 
-Write-Output "SSX-resled $version at $(git rev-parse --short HEAD)"
+Write-Output "SSX-Recomp $version at $(git rev-parse --short HEAD)"
 Export-Tree $root 'HEAD' $stage
 Export-Submodules @($root) (git rev-parse HEAD) $stage
 

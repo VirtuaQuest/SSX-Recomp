@@ -63,9 +63,9 @@ The log (`AR_LOG_FILE`, `logs/ssx.log`) keeps the three runs before it beside it
 
 1. Raise `VERSION` (the game's update check compares it) and commit.
 2. `powershell -ExecutionPolicy Bypass -File tools\recomplauncher\make_release.ps1` writes
-   `out\release\SSX-resled-v<version>-Windows-x64.zip` (and its `.sha256`). It holds only files from git: this project
+   `out\release\SSX-Recomp-v<version>-Windows-x64.zip` (and its `.sha256`). It holds only files from git: this project
    at HEAD and the submodules at the commits it names. It refuses game files and uncommitted changes.
-3. Make a GitHub release on VirtuaQuest/SSX-resled tagged `v<version>` with the zip. The launcher picks it by
+3. Make a GitHub release on VirtuaQuest/SSX-Recomp tagged `v<version>` with the zip. The launcher picks it by
    "Windows" and "x64" in its name. A pre-release is a beta, which normal players don't get.
 
 To try it the way a player gets it before publishing: in the launcher, Settings > Developers > Developer tools, then
@@ -73,7 +73,7 @@ To try it the way a player gets it before publishing: in the launcher, Settings 
 
 ## Getting listed
 
-Submit the repo at [recomplauncher.com/submit](https://recomplauncher.com/submit?platform=pc) as `VirtuaQuest/SSX-resled`,
+Submit the repo at [recomplauncher.com/submit](https://recomplauncher.com/submit?platform=pc) as `VirtuaQuest/SSX-Recomp`,
 and say that `recomplauncher.json` is in the release and covers all three levels (Easy Setup, settings, and the setup
 step; no `dumps`, since the Redump values weren't checked). A free developer account at
 [recompstore.com/hub](https://recompstore.com/hub) (sign in with GitHub) claims the page. Once it's listed, point the
