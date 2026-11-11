@@ -31,13 +31,14 @@ static constexpr int EXIT_OLD_BUILD = 75;
 #define AR_WIDEN_(text) L##text
 #define AR_WIDEN(text) AR_WIDEN_(text)
 
-// A build made from an older version of the source than the one it sits in (out/build/ARRecomp inside the project): the
-// source was updated (by Recomp Launcher, or git) and not built since, so this build doesn't have the update's changes.
-// It still works as the version it is. The player is told, and can play it anyway; in Recomp Launcher's Big Picture
-// mode, where there may be no mouse to answer, it just plays. AR_NO_VERSION_CHECK turns this off.
+// Started by Recomp Launcher, from a build made from an older version of the source than the one it sits in
+// (out/build/ARRecomp inside the project): the launcher installed an update and it hasn't been built since, so this
+// build doesn't have the update's changes. It still works as the version it is. The player is told, and can play it
+// anyway; in Big Picture mode, where there may be no mouse to answer, it just plays. Started any other way, nothing
+// changes. AR_NO_VERSION_CHECK turns this off.
 static bool PlayOlderBuild()
 {
-    if (getenv("AR_NO_VERSION_CHECK"))
+    if (getenv("RECOMPLAUNCHER") == nullptr || getenv("AR_NO_VERSION_CHECK"))
         return true;
     wchar_t exe[MAX_PATH * 2];
     if (GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe))) == 0)
@@ -61,9 +62,7 @@ static bool PlayOlderBuild()
     const char* mode = getenv("RECOMPLAUNCHER_MODE");
     if (mode != nullptr && std::string_view(mode) == "bigpicture")
         return true;
-    std::wstring how = getenv("RECOMPLAUNCHER") != nullptr ?
-        L"To build it, choose your SSX disc image again on the game's page in Recomp Launcher: that runs the build (about 10 to 30 minutes)." :
-        L"To build it, run Setup.bat in the project's folder and press Build.";
+    std::wstring how = L"To build it, choose your SSX disc image again on the game's page in Recomp Launcher: that runs the build (about 10 to 30 minutes).";
     std::wstring text = L"SSX Recompiled was updated to version " + std::wstring(source.begin(), source.end()) +
         L", but the game hasn't been built again since: this build is version " AR_WIDEN(AR_SOURCE_VERSION) L".\n\n" + how +
         L"\n\nPlay this build for now?";
@@ -114,11 +113,18 @@ int main(int argc, char* argv[])
     bool gpuSurvey = false;
     bool displayGiven = false;
 
-    // The log goes to AR_LOG_FILE too when that's set (Recomp Launcher shows the newest log with a crash report).
+    // The log goes to AR_LOG_FILE too when that's set (Recomp Launcher shows the newest log with a crash report). The
+    // last three runs' logs stay beside it, as <name>-1.log (the one before) to <name>-3.log.
     if (const char* logFile = getenv("AR_LOG_FILE"); logFile != nullptr && *logFile != '\0')
     {
         std::error_code ec;
-        std::filesystem::create_directories(std::filesystem::path(logFile).parent_path(), ec);
+        std::filesystem::path path = logFile;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        auto previous = [&](int n) { return path.parent_path() / (path.stem().string() + "-" + std::to_string(n) + path.extension().string()); };
+        std::filesystem::remove(previous(3), ec);
+        for (int n = 2; n >= 1; n--)
+            std::filesystem::rename(previous(n), previous(n + 1), ec);
+        std::filesystem::rename(path, previous(1), ec);
     }
 
     for (int i = 1; i < argc; i++)
