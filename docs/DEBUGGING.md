@@ -16,8 +16,10 @@ a run from `run/`, for example `AR_TRACE_FRAME=2900 ../out/build/ARRecomp/ARReco
 | `--trace`, `--gpu-survey`, `--headless`, `--dump-threads N` | Tracing, shader survey, no window, guest thread dump after N seconds |
 | `--write-key-bindings` | Writes `user/key_bindings.ini` with the defaults if there's none, then exits |
 
-`AR_LOG_FILE=<path>` writes the log there as well as to the console (Recomp Launcher sets it). A build older than the
-`VERSION` file of the source it's in asks before playing, and exits with 75 on No; `AR_NO_VERSION_CHECK=1` skips that.
+`AR_LOG_FILE=<path>` writes the log there as well as to the console (Recomp Launcher sets it), with the last three
+runs' logs kept beside it (`<name>-1.log` to `-3.log`). Started by Recomp Launcher (`RECOMPLAUNCHER` set), a build older
+than the `VERSION` file of the source it's in asks before playing, and exits with 75 on No; `AR_NO_VERSION_CHECK=1`
+skips that.
 `RECOMPLAUNCHER_MODE=bigpicture` starts borderless when there's no `--display`.
 
 The build without a window: `tools\recomplauncher\prepare.cmd --game <iso>` (FFmpeg if missing, then

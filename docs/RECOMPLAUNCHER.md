@@ -31,11 +31,14 @@ launcher's key names, such as "Mouse Left" and "Return", as well as its own). In
 
 ### Updates
 
-An update unpacks the new source over the folder, and the build there is still of the old version. When the game
-starts it compares the version it was built from with `VERSION` in the folder, and says so if they differ: Yes plays
-the old build, No quits with exit code 75, which the launcher explains. Choosing the disc again on the game's page
-runs the setup step, which builds the new version (only what changed is compiled again). In Big Picture mode the old
-build just plays. `AR_NO_VERSION_CHECK=1` turns the check off.
+An update unpacks the new source over the folder, and the build there is still of the old version. When the launcher
+starts the game (`RECOMPLAUNCHER` is set), it compares the version it was built from with `VERSION` in the folder, and
+says so if they differ: Yes plays the old build, No quits with exit code 75, which the launcher explains. Choosing the
+disc again on the game's page runs the setup step, which builds the new version (only what changed is compiled
+again). In Big Picture mode the old build just plays. Started any other way, the game doesn't check.
+`AR_NO_VERSION_CHECK=1` turns the check off.
+
+The log (`AR_LOG_FILE`, `logs/ssx.log`) keeps the three runs before it beside it, as `ssx-1.log` to `ssx-3.log`.
 
 ## What the PC needs
 
@@ -70,8 +73,12 @@ To try it the way a player gets it before publishing: in the launcher, Settings 
 
 ## Getting listed
 
-Submit the repo on [recomplauncher.com](https://recomplauncher.com) (Submit a Game) as `VirtuaQuest/SSX-resled`, and say
-that `recomplauncher.json` is in the release (maintained by its developer). The catalog's own profile for the game
+Submit the repo at [recomplauncher.com/submit](https://recomplauncher.com/submit?platform=pc) as `VirtuaQuest/SSX-resled`,
+and say that `recomplauncher.json` is in the release and covers all three levels (Easy Setup, settings, and the setup
+step; no `dumps`, since the Redump values weren't checked). A free developer account at
+[recompstore.com/hub](https://recompstore.com/hub) (sign in with GitHub) claims the page. Once it's listed, point the
+README's badge at `https://recomplauncher.com/game/<its id>` (the id is in https://recomplauncher.com/pc-catalog-web.json,
+by `repo`). Another SSX (2012) recomp is already listed (AmarilloNL/ssx-recomp), so say that this is a separate one. The catalog's own profile for the game
 only needs what the file can't say:
 
 ```json

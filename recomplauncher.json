@@ -12,7 +12,7 @@
   "prepare": {
     "program": ["tools/recomplauncher/prepare.cmd"],
     "args": ["--game", "{game}"],
-    "label": "Building SSX on this PC from your disc: 10 to 30 minutes, once",
+    "label": "Building SSX on this PC from your disc: 10 to 30 minutes, once. FFmpeg (the audio decoder) is downloaded from GitHub if it isn't there",
     "timeout": 7200
   },
   "start": {

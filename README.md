@@ -1,5 +1,10 @@
 # SSX Recompiled
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
+**How to play:** you need your own Xbox 360 copy of SSX (2012), the USA disc, as a disc image (`.iso`) or a folder of its
+files. Recomp Launcher builds the game from it for you (see below), or build it yourself with `Setup.bat`.
+
 A native PC port of SSX (Xbox 360, 2012) by static recompilation. This project contains no game code, art or audio. You
 build the game on your own PC from your own copy.
 
